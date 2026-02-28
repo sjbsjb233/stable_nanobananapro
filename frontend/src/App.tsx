@@ -1979,11 +1979,11 @@ function useDashboardData() {
   const settings = useSettingsStore((s) => s.settings);
   const jobs = useJobsStore((s) => s.jobs);
 
-  const [loading, setLoading] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
   const [stats, setStats] = useState<DashboardStat | null>(null);
   const [admin, setAdmin] = useState<{ summary?: BillingSummary; google?: GoogleRemaining } | null>(null);
 
-  const refresh = async () => {
+  const refresh = async ({ manual = false }: { manual?: boolean } = {}) => {
     const today = new Date().toISOString().slice(0, 10);
 
     // cache read (best effort)
@@ -1992,7 +1992,7 @@ function useDashboardData() {
       setStats(cache.stats);
     }
 
-    setLoading(true);
+    setRefreshing(true);
     try {
       const list = [...jobs]
         .filter((j) => !j.deleted)
@@ -2046,20 +2046,25 @@ function useDashboardData() {
         setAdmin(null);
       }
 
-      push({ kind: "success", title: "Dashboard 已刷新" });
+      if (manual) {
+        push({ kind: "success", title: "Dashboard 已刷新" });
+      }
     } catch (e: any) {
-      push({ kind: "error", title: "刷新失败", message: e?.error?.message || "请检查网络/后端地址" });
+      if (manual) {
+        push({ kind: "error", title: "刷新失败", message: e?.error?.message || "请检查网络/后端地址" });
+      }
     } finally {
-      setLoading(false);
+      setRefreshing(false);
     }
   };
 
   useEffect(() => {
-    refresh();
+    refresh({ manual: false });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [settings.baseUrl, settings.adminModeEnabled, settings.adminKey]);
 
-  return { loading, stats, admin, refresh };
+  const loading = refreshing && !stats;
+  return { loading, refreshing, stats, admin, refresh };
 }
 
 function KpiCard({
@@ -2089,8 +2094,7 @@ function KpiCard({
 }
 
 function DashboardPage() {
-  const { loading, stats, admin, refresh } = useDashboardData();
-  const { transition } = useMotionConfig();
+  const { loading, refreshing, stats, admin, refresh } = useDashboardData();
   const nav = useNavigate();
 
   const cards = (
@@ -2125,15 +2129,16 @@ function DashboardPage() {
         title="Dashboard"
         subtitle="本地历史驱动：前端读取浏览器保存的 job 列表，再逐个拉取真实详情用于统计。"
         right={
-          <Button onClick={refresh} variant="secondary">
-            <motion.span
-              animate={loading ? { rotate: 360 } : { rotate: 0 }}
-              transition={loading ? { repeat: Infinity, duration: 1, ease: "linear" } : transition}
-              className="inline-block"
-            >
-              ⟳
-            </motion.span>
+          <Button onClick={() => refresh({ manual: true })} variant="secondary" disabled={refreshing}>
             刷新
+            {refreshing ? (
+              <motion.span
+                animate={{ rotate: 360 }}
+                transition={{ repeat: Infinity, duration: 0.9, ease: "linear" }}
+                className="inline-block h-3.5 w-3.5 rounded-full border-2 border-zinc-400 border-t-transparent dark:border-zinc-400 dark:border-t-transparent"
+                aria-hidden
+              />
+            ) : null}
           </Button>
         }
       />
