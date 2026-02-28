@@ -112,6 +112,9 @@ type JobRecord = {
   last_seen_at?: string;
   pinned?: boolean;
   tags?: string[];
+  batch_id?: string;
+  batch_size?: number;
+  batch_index?: number;
   deleted?: boolean;
 };
 
@@ -359,6 +362,19 @@ function formatDurationMs(ms?: number | null) {
   const m = Math.floor(sec / 60);
   const s = Math.round(sec % 60);
   return `${m}m ${s}s`;
+}
+
+function formatLatencyAdaptive(ms?: number | null) {
+  if (typeof ms !== "number" || !Number.isFinite(ms) || ms < 0) return "-";
+  if (ms < 1000) return `${Math.round(ms)}ms`;
+  const sec = ms / 1000;
+  if (sec < 60) return `${sec >= 10 ? sec.toFixed(1) : sec.toFixed(2)}s`;
+  const min = sec / 60;
+  return `${min >= 10 ? min.toFixed(1) : min.toFixed(2)}min`;
+}
+
+function createBatchId() {
+  return `batch_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
 }
 
 function extractRunDurationMs(meta?: JobMeta | null, rec?: JobRecord | null) {
@@ -2090,14 +2106,14 @@ function DashboardPage() {
       <KpiCard title="今日费用" value={stats ? currency(stats.today_total_cost_usd) : "-"} loading={loading} />
       <KpiCard
         title="平均耗时"
-        value={stats ? `${Math.round(stats.today_avg_latency_ms)}ms` : "-"}
-        sub={stats ? `P95 ${Math.round(stats.today_p95_latency_ms)}ms` : undefined}
+        value={stats ? formatLatencyAdaptive(stats.today_avg_latency_ms) : "-"}
+        sub={stats ? `P95 ${formatLatencyAdaptive(stats.today_p95_latency_ms)}` : undefined}
         loading={loading}
       />
       <KpiCard
         title="最近 10 次"
         value={stats ? `${Math.round(stats.recent10_success_rate * 100)}%` : "-"}
-        sub={stats ? `均耗时 ${Math.round(stats.recent10_avg_latency_ms)}ms` : undefined}
+        sub={stats ? `均耗时 ${formatLatencyAdaptive(stats.recent10_avg_latency_ms)}` : undefined}
         loading={loading}
       />
     </div>
@@ -2599,6 +2615,7 @@ function CreateJobPage() {
 
   const [loading, setLoading] = useState(false);
   const hydratedModelRef = useRef<ModelId | null>(null);
+  const lastPasteAtRef = useRef<number>(0);
   const MAX_REF_FILES = 14;
 
   const currentModel = useMemo(() => {
@@ -2642,8 +2659,24 @@ function CreateJobPage() {
       const merged = [...fromFiles, ...fromItems];
       if (!merged.length) return;
 
+      evt.preventDefault();
       const now = Date.now();
-      const normalized = merged.map((file, idx) => {
+      if (now - lastPasteAtRef.current < 300) {
+        return;
+      }
+      lastPasteAtRef.current = now;
+
+      const seen = new Set<string>();
+      const deduped = merged.filter((file) => {
+        const key = `${file.name}:${file.size}:${file.type}:${file.lastModified}`;
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      });
+      const picked = deduped.slice(0, 1);
+      if (!picked.length) return;
+
+      const normalized = picked.map((file, idx) => {
         if (file.name) return file;
         const ext = file.type.includes("jpeg") ? "jpg" : file.type.includes("webp") ? "webp" : "png";
         return new File([file], `clipboard_${now}_${idx}.${ext}`, {
@@ -2652,7 +2685,6 @@ function CreateJobPage() {
         });
       });
 
-      evt.preventDefault();
       setFiles((prev) => mergeReferenceFiles(prev, normalized, MAX_REF_FILES));
       push({ kind: "success", title: "已从剪贴板加入参考图", message: `${normalized.length} 张` });
     };
@@ -2768,6 +2800,7 @@ function CreateJobPage() {
       };
 
       const targetCount = clamp(Math.round(jobCount), 1, 12);
+      const batchId = targetCount > 1 ? createBatchId() : undefined;
       const created: Array<{ job_id: string; job_access_token?: string }> = [];
       let firstErr: string | null = null;
 
@@ -2816,6 +2849,9 @@ function CreateJobPage() {
           last_seen_at: isoNow(),
           pinned: false,
           tags: [],
+          batch_id: batchId,
+          batch_size: targetCount > 1 ? targetCount : undefined,
+          batch_index: batchId ? i + 1 : undefined,
         };
         useJobsStore.getState().upsertJob(rec);
       }
@@ -3175,6 +3211,12 @@ type SortKey = "latest" | "cost" | "latency";
 
 type DateRange = "today" | "7d" | "custom" | "all";
 
+type HistoryBatchGroup = {
+  key: string;
+  batchId: string | null;
+  items: JobRecord[];
+};
+
 function HistoryPage() {
   const { push } = useToast();
   const client = useApiClient();
@@ -3314,6 +3356,38 @@ function HistoryPage() {
     const start = (safePage - 1) * pageSize;
     return filtered.slice(start, start + pageSize);
   }, [filtered, safePage, pageSize]);
+  const groupedPagedItems = useMemo<HistoryBatchGroup[]>(() => {
+    const grouped = new Map<string, HistoryBatchGroup>();
+    for (const rec of pagedItems) {
+      const batchId = rec.batch_id && (rec.batch_size || 0) > 1 ? rec.batch_id : null;
+      const key = batchId ? `batch:${batchId}` : `single:${rec.job_id}`;
+      const found = grouped.get(key);
+      if (found) {
+        found.items.push(rec);
+      } else {
+        grouped.set(key, { key, batchId, items: [rec] });
+      }
+    }
+    return Array.from(grouped.values()).map((group) => ({
+      ...group,
+      items: [...group.items].sort((a, b) => {
+        const ai = typeof a.batch_index === "number" ? a.batch_index : Number.MAX_SAFE_INTEGER;
+        const bi = typeof b.batch_index === "number" ? b.batch_index : Number.MAX_SAFE_INTEGER;
+        if (ai !== bi) return ai - bi;
+        return (new Date(a.created_at).getTime() || 0) - (new Date(b.created_at).getTime() || 0);
+      }),
+    }));
+  }, [pagedItems]);
+  const batchedGroupCount = useMemo(
+    () => groupedPagedItems.filter((g) => g.batchId && g.items.length > 1).length,
+    [groupedPagedItems]
+  );
+  const batchedJobCount = useMemo(
+    () => groupedPagedItems
+      .filter((g) => g.batchId && g.items.length > 1)
+      .reduce((sum, g) => sum + g.items.length, 0),
+    [groupedPagedItems]
+  );
 
   useEffect(() => {
     if (page !== safePage) setPage(safePage);
@@ -3422,7 +3496,7 @@ function HistoryPage() {
     <PageContainer>
       <PageTitle
         title="History"
-        subtitle="只读浏览器本地历史（localStorage）。可筛选/搜索/置顶/打标签/删除。"
+        subtitle="只读浏览器本地历史（localStorage）。支持按同批次创建任务聚合展示，便于快速识别同一套 Prompt 的多 job。"
         right={
           <div className="flex items-center gap-2">
             <div className="flex items-center gap-2 rounded-2xl border border-zinc-200 bg-white/60 px-3 py-2 text-sm dark:border-white/10 dark:bg-zinc-900/40">
@@ -3568,6 +3642,9 @@ function HistoryPage() {
                 <span className="rounded-full border border-zinc-200 bg-white/60 px-2 py-1 dark:border-white/10 dark:bg-zinc-900/40">
                   平均耗时(近10成功) {formatDurationMs(recentSuccessAvgDurationMs)}
                 </span>
+                <span className="rounded-full border border-sky-200 bg-sky-50/80 px-2 py-1 text-sky-700 dark:border-sky-800/60 dark:bg-sky-950/40 dark:text-sky-200">
+                  同批生成 {batchedGroupCount} 组 / {batchedJobCount} 条
+                </span>
                 <span className="rounded-full border border-zinc-200 bg-white/60 px-2 py-1 dark:border-white/10 dark:bg-zinc-900/40">
                   当前 {pageFrom}-{pageTo}
                 </span>
@@ -3607,7 +3684,7 @@ function HistoryPage() {
               </div>
               <Divider />
               <JobList
-                items={pagedItems}
+                groups={groupedPagedItems}
                 selectedId={selectedJobId}
                 onSelect={selectJob}
                 onDeleteLocal={onDeleteLocal}
@@ -3636,7 +3713,7 @@ function HistoryPage() {
 }
 
 function JobList({
-  items,
+  groups,
   selectedId,
   onSelect,
   onDeleteLocal,
@@ -3646,7 +3723,7 @@ function JobList({
   progressNowMs,
   avgDurationMs,
 }: {
-  items: JobRecord[];
+  groups: HistoryBatchGroup[];
   selectedId: string | null;
   onSelect: (id: string) => void;
   onDeleteLocal: (id: string) => void;
@@ -3656,134 +3733,173 @@ function JobList({
   progressNowMs: number;
   avgDurationMs: number;
 }) {
-  if (!items.length) return <EmptyHint text="没有匹配的记录" />;
+  if (!groups.length) return <EmptyHint text="没有匹配的记录" />;
+
+  const renderJobCard = (j: JobRecord) => {
+    const active = j.job_id === selectedId;
+    const progress = computeFakeProgressPercent(j, progressNowMs, avgDurationMs);
+    const runDuration = formatDurationMs(j.run_duration_ms);
+    const isRunning = (j.status_cache || "UNKNOWN") === "RUNNING";
+    const isQueued = (j.status_cache || "UNKNOWN") === "QUEUED";
+    return (
+      <div
+        key={j.job_id}
+        onClick={() => onSelect(j.job_id)}
+        onKeyDown={(e) => {
+          if (e.key === "Enter" || e.key === " ") {
+            e.preventDefault();
+            onSelect(j.job_id);
+          }
+        }}
+        role="button"
+        tabIndex={0}
+        className={cn(
+          "w-full rounded-2xl border p-3 text-left transition",
+          active
+            ? "border-zinc-900 bg-zinc-900 text-white shadow-sm dark:border-white dark:bg-white dark:text-zinc-900"
+            : "border-zinc-200 bg-white/50 hover:-translate-y-0.5 hover:shadow-sm dark:border-white/10 dark:bg-zinc-950/30"
+        )}
+      >
+        <div className="flex items-start justify-between gap-3">
+          <div className="min-w-0">
+            <div className="truncate text-sm font-bold">{j.prompt_preview || shortId(j.job_id)}</div>
+            <div className={cn("mt-1 text-xs", active ? "text-white/80 dark:text-zinc-700" : "text-zinc-600 dark:text-zinc-300")}>
+              {formatLocal(j.created_at)}
+            </div>
+          </div>
+          <div className="flex flex-col items-end gap-2">
+            {active ? (
+              <span className="inline-flex items-center gap-2 rounded-full bg-white/15 px-2 py-1 text-xs font-bold text-white dark:bg-zinc-900/10 dark:text-zinc-900">
+                <span className="h-2 w-2 rounded-full bg-white/70 dark:bg-zinc-900" />
+                {j.status_cache || "UNKNOWN"}
+              </span>
+            ) : (
+              <Badge status={j.status_cache || "UNKNOWN"} />
+            )}
+            {j.pinned ? (
+              <span className={cn("text-[10px] font-bold", active ? "text-white/80" : "text-amber-600 dark:text-amber-200")}>
+                PINNED
+              </span>
+            ) : null}
+          </div>
+        </div>
+
+        <div className={cn("mt-2", active ? "text-white/85" : "text-zinc-600 dark:text-zinc-300")}>
+          <div className="flex items-center justify-between text-[11px]">
+            <span>耗时：{runDuration}</span>
+            {progress !== null ? (
+              <span>
+                {isQueued ? "排队中" : isRunning ? "运行中" : "进度"} {progress}%
+              </span>
+            ) : null}
+          </div>
+          {progress !== null ? (
+            <div className="mt-1 h-1.5 w-full overflow-hidden rounded-full bg-black/10 dark:bg-white/10">
+              <div
+                className={cn(
+                  "h-full transition-[width] duration-500",
+                  progress >= 100
+                    ? "bg-emerald-500"
+                    : isRunning
+                      ? "bg-sky-500"
+                      : isQueued
+                        ? "bg-amber-500"
+                        : "bg-zinc-500"
+                )}
+                style={{ width: `${clamp(progress, 0, 100)}%` }}
+              />
+            </div>
+          ) : null}
+        </div>
+
+        <div className={cn("mt-2 flex flex-wrap gap-2 text-xs", active ? "text-white/85" : "text-zinc-600 dark:text-zinc-300")}>
+          {j.batch_size && j.batch_size > 1 ? (
+            <span className="rounded-full border border-sky-300/70 bg-sky-500/20 px-2 py-0.5 text-sky-700 dark:border-sky-700/50 dark:bg-sky-500/20 dark:text-sky-200">
+              同批次 #{j.batch_index || "?"}/{j.batch_size}
+            </span>
+          ) : null}
+          {j.model_cache ? <span className="rounded-full border border-white/10 bg-white/10 px-2 py-0.5">{j.model_cache}</span> : null}
+          {j.params_cache?.image_size ? <span className="rounded-full border border-white/10 bg-white/10 px-2 py-0.5">{j.params_cache.image_size}</span> : null}
+          {j.params_cache?.aspect_ratio ? <span className="rounded-full border border-white/10 bg-white/10 px-2 py-0.5">{j.params_cache.aspect_ratio}</span> : null}
+          {j.tags?.slice(0, 2).map((t) => (
+            <span key={t} className="rounded-full border border-white/10 bg-white/10 px-2 py-0.5">
+              #{t}
+            </span>
+          ))}
+          {j.tags && j.tags.length > 2 ? (
+            <span className="rounded-full border border-white/10 bg-white/10 px-2 py-0.5">+{j.tags.length - 2}</span>
+          ) : null}
+        </div>
+
+        <div className={cn("mt-3 flex flex-wrap gap-2", active ? "" : "")} onClick={(e) => e.stopPropagation()}>
+          <Button
+            variant={active ? "secondary" : "ghost"}
+            className="!px-2 !py-1 text-xs"
+            onClick={() => onTogglePin(j.job_id, !j.pinned)}
+          >
+            {j.pinned ? "取消置顶" : "置顶"}
+          </Button>
+          <Button
+            variant={active ? "secondary" : "ghost"}
+            className="!px-2 !py-1 text-xs"
+            onClick={() => onAddTag(j.job_id)}
+          >
+            + Tag
+          </Button>
+          <Button
+            variant={active ? "secondary" : "ghost"}
+            className="!px-2 !py-1 text-xs"
+            onClick={() => onAddToPicker(j.job_id)}
+          >
+            加入挑选
+          </Button>
+          <Button
+            variant="danger"
+            className="!px-2 !py-1 text-xs"
+            onClick={() => {
+              if (confirm("仅删除本地记录？")) onDeleteLocal(j.job_id);
+            }}
+          >
+            删除本地
+          </Button>
+        </div>
+      </div>
+    );
+  };
 
   return (
-    <div className="space-y-2">
-      {items.map((j) => {
-        const active = j.job_id === selectedId;
-        const progress = computeFakeProgressPercent(j, progressNowMs, avgDurationMs);
-        const runDuration = formatDurationMs(j.run_duration_ms);
-        const isRunning = (j.status_cache || "UNKNOWN") === "RUNNING";
-        const isQueued = (j.status_cache || "UNKNOWN") === "QUEUED";
+    <div className="space-y-3">
+      {groups.map((group) => {
+        const batchEnabled = Boolean(group.batchId && group.items.length > 1);
+        const first = group.items[0];
+        const totalInBatch = first?.batch_size && first.batch_size > 1 ? first.batch_size : group.items.length;
         return (
           <div
-            key={j.job_id}
-            onClick={() => onSelect(j.job_id)}
-            onKeyDown={(e) => {
-              if (e.key === "Enter" || e.key === " ") {
-                e.preventDefault();
-                onSelect(j.job_id);
-              }
-            }}
-            role="button"
-            tabIndex={0}
+            key={group.key}
             className={cn(
-              "w-full rounded-2xl border p-3 text-left transition",
-              active
-                ? "border-zinc-900 bg-zinc-900 text-white shadow-sm dark:border-white dark:bg-white dark:text-zinc-900"
-                : "border-zinc-200 bg-white/50 hover:-translate-y-0.5 hover:shadow-sm dark:border-white/10 dark:bg-zinc-950/30"
+              batchEnabled
+                ? "rounded-2xl border border-sky-200 bg-gradient-to-br from-sky-50 via-cyan-50/70 to-white p-2 dark:border-sky-800/50 dark:from-sky-950/40 dark:via-cyan-950/20 dark:to-zinc-950/40"
+                : ""
             )}
           >
-            <div className="flex items-start justify-between gap-3">
-              <div className="min-w-0">
-                <div className="truncate text-sm font-bold">{j.prompt_preview || shortId(j.job_id)}</div>
-                <div className={cn("mt-1 text-xs", active ? "text-white/80 dark:text-zinc-700" : "text-zinc-600 dark:text-zinc-300")}>
-                  {formatLocal(j.created_at)}
-                </div>
-              </div>
-              <div className="flex flex-col items-end gap-2">
-                {active ? (
-                  <span className="inline-flex items-center gap-2 rounded-full bg-white/15 px-2 py-1 text-xs font-bold text-white dark:bg-zinc-900/10 dark:text-zinc-900">
-                    <span className="h-2 w-2 rounded-full bg-white/70 dark:bg-zinc-900" />
-                    {j.status_cache || "UNKNOWN"}
-                  </span>
-                ) : (
-                  <Badge status={j.status_cache || "UNKNOWN"} />
-                )}
-                {j.pinned ? (
-                  <span className={cn("text-[10px] font-bold", active ? "text-white/80" : "text-amber-600 dark:text-amber-200")}>
-                    PINNED
-                  </span>
-                ) : null}
-              </div>
-            </div>
-
-            <div className={cn("mt-2", active ? "text-white/85" : "text-zinc-600 dark:text-zinc-300")}>
-              <div className="flex items-center justify-between text-[11px]">
-                <span>耗时：{runDuration}</span>
-                {progress !== null ? (
-                  <span>
-                    {isQueued ? "排队中" : isRunning ? "运行中" : "进度"} {progress}%
-                  </span>
-                ) : null}
-              </div>
-              {progress !== null ? (
-                <div className="mt-1 h-1.5 w-full overflow-hidden rounded-full bg-black/10 dark:bg-white/10">
-                  <div
-                    className={cn(
-                      "h-full transition-[width] duration-500",
-                      progress >= 100
-                        ? "bg-emerald-500"
-                        : isRunning
-                          ? "bg-sky-500"
-                          : isQueued
-                            ? "bg-amber-500"
-                            : "bg-zinc-500"
-                    )}
-                    style={{ width: `${clamp(progress, 0, 100)}%` }}
-                  />
-                </div>
-              ) : null}
-            </div>
-
-            <div className={cn("mt-2 flex flex-wrap gap-2 text-xs", active ? "text-white/85" : "text-zinc-600 dark:text-zinc-300")}>
-              {j.model_cache ? <span className="rounded-full border border-white/10 bg-white/10 px-2 py-0.5">{j.model_cache}</span> : null}
-              {j.params_cache?.image_size ? <span className="rounded-full border border-white/10 bg-white/10 px-2 py-0.5">{j.params_cache.image_size}</span> : null}
-              {j.params_cache?.aspect_ratio ? <span className="rounded-full border border-white/10 bg-white/10 px-2 py-0.5">{j.params_cache.aspect_ratio}</span> : null}
-              {j.tags?.slice(0, 2).map((t) => (
-                <span key={t} className="rounded-full border border-white/10 bg-white/10 px-2 py-0.5">
-                  #{t}
+            {batchEnabled ? (
+              <div className="mb-2 flex flex-wrap items-center gap-2 px-1">
+                <span className="rounded-full bg-sky-600 px-2 py-1 text-[10px] font-bold text-white dark:bg-sky-500 dark:text-sky-950">
+                  同一批 Prompt 生成
                 </span>
-              ))}
-              {j.tags && j.tags.length > 2 ? (
-                <span className="rounded-full border border-white/10 bg-white/10 px-2 py-0.5">+{j.tags.length - 2}</span>
-              ) : null}
-            </div>
-
-            <div className={cn("mt-3 flex flex-wrap gap-2", active ? "" : "")}
-              onClick={(e) => e.stopPropagation()}
-            >
-              <Button
-                variant={active ? "secondary" : "ghost"}
-                className="!px-2 !py-1 text-xs"
-                onClick={() => onTogglePin(j.job_id, !j.pinned)}
-              >
-                {j.pinned ? "取消置顶" : "置顶"}
-              </Button>
-              <Button
-                variant={active ? "secondary" : "ghost"}
-                className="!px-2 !py-1 text-xs"
-                onClick={() => onAddTag(j.job_id)}
-              >
-                + Tag
-              </Button>
-              <Button
-                variant={active ? "secondary" : "ghost"}
-                className="!px-2 !py-1 text-xs"
-                onClick={() => onAddToPicker(j.job_id)}
-              >
-                加入挑选
-              </Button>
-              <Button
-                variant="danger"
-                className="!px-2 !py-1 text-xs"
-                onClick={() => {
-                  if (confirm("仅删除本地记录？")) onDeleteLocal(j.job_id);
-                }}
-              >
-                删除本地
-              </Button>
+                <span className="rounded-full border border-sky-300/70 bg-white/70 px-2 py-0.5 text-[11px] font-semibold text-sky-700 dark:border-sky-700/40 dark:bg-sky-950/20 dark:text-sky-200">
+                  当前页 {group.items.length}/{totalInBatch} jobs
+                </span>
+                <span className="rounded-full border border-zinc-200 bg-white/70 px-2 py-0.5 text-[11px] text-zinc-600 dark:border-white/10 dark:bg-zinc-900/50 dark:text-zinc-300">
+                  批次 {shortId(group.batchId!, 5)}
+                </span>
+                <span className="rounded-full border border-zinc-200 bg-white/70 px-2 py-0.5 text-[11px] text-zinc-600 dark:border-white/10 dark:bg-zinc-900/50 dark:text-zinc-300">
+                  {formatLocal(first?.created_at)}
+                </span>
+              </div>
+            ) : null}
+            <div className={cn("space-y-2", batchEnabled ? "border-l-2 border-sky-200/80 pl-2 dark:border-sky-800/50" : "")}>
+              {group.items.map((j) => renderJobCard(j))}
             </div>
           </div>
         );
