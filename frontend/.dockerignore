@@ -3,3 +3,11 @@ dist
 npm-debug.log*
 .npm-cache
 *.tsbuildinfo
+.DS_Store
+.env
+.env.*
+videos/
+video/
+tmp/
+screenshots/
+scripts/
