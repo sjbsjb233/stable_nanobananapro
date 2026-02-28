@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 from datetime import datetime, timezone
 from typing import Any, AsyncIterator
 
@@ -26,6 +27,7 @@ from .model_catalog import (
     normalize_params_for_model,
 )
 from .rate_limiter import job_read_rate_limit
+from .logging_setup import get_logger, setup_logging
 from .schemas import (
     BillingSummaryModelItem,
     CreateJobRequest,
@@ -43,6 +45,7 @@ from .schemas import (
 from .security import validate_image_id, validate_job_id
 from .storage import storage
 
+logger = get_logger("api")
 app = FastAPI(title="Nano Banana API", version=settings.app_version)
 cors_origins = get_cors_origins()
 allow_credentials = settings.cors_allow_credentials
@@ -67,13 +70,42 @@ app.add_middleware(
 
 @app.on_event("startup")
 def _startup() -> None:
+    setup_logging()
     ensure_data_dirs()
+    logger.info("Backend startup: version=%s data_dir=%s", settings.app_version, settings.data_dir)
     job_manager.start()
 
 
 @app.on_event("shutdown")
 def _shutdown() -> None:
     job_manager.stop()
+    logger.info("Backend shutdown complete")
+
+
+@app.middleware("http")
+async def request_logging_middleware(request: Request, call_next):
+    started = time.perf_counter()
+    try:
+        response = await call_next(request)
+    except Exception:
+        elapsed_ms = int((time.perf_counter() - started) * 1000)
+        logger.exception(
+            "Unhandled exception: method=%s path=%s elapsed_ms=%s",
+            request.method,
+            request.url.path,
+            elapsed_ms,
+        )
+        raise
+
+    elapsed_ms = int((time.perf_counter() - started) * 1000)
+    logger.info(
+        "Request: method=%s path=%s status=%s elapsed_ms=%s",
+        request.method,
+        request.url.path,
+        response.status_code,
+        elapsed_ms,
+    )
+    return response
 
 
 def _error_json(status_code: int, code: ErrorCode, message: str, details: dict[str, Any] | None = None) -> JSONResponse:
@@ -90,6 +122,7 @@ def _error_json(status_code: int, code: ErrorCode, message: str, details: dict[s
 
 @app.exception_handler(StarletteHTTPException)
 async def http_exception_handler(_: Request, exc: StarletteHTTPException) -> JSONResponse:
+    logger.warning("HTTP exception: status=%s detail=%s", exc.status_code, exc.detail)
     if isinstance(exc.detail, dict) and "error" in exc.detail:
         return JSONResponse(status_code=exc.status_code, content=exc.detail)
     return _error_json(exc.status_code, ErrorCode.INVALID_INPUT, str(exc.detail))
@@ -97,6 +130,7 @@ async def http_exception_handler(_: Request, exc: StarletteHTTPException) -> JSO
 
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(_: Request, exc: RequestValidationError) -> JSONResponse:
+    logger.warning("Validation error: %s", exc.errors())
     return _error_json(
         status.HTTP_400_BAD_REQUEST,
         ErrorCode.INVALID_INPUT,

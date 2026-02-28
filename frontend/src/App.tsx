@@ -25,6 +25,7 @@ import {
   Legend,
 } from "recharts";
 import { create } from "zustand";
+import { logDebug, logError, logInfo, logWarn } from "./logger";
 
 // =========================================================
 // Nano Banana Pro - Single file demo (React + Tailwind + TS)
@@ -1179,6 +1180,8 @@ class ApiClient {
     init: RequestInit & { jobToken?: string; isAdmin?: boolean } = {}
   ): Promise<T> {
     const url = this.buildUrl(path);
+    const startedAt = performance.now();
+    const method = (init.method || "GET").toUpperCase();
     const headers: Record<string, string> = {
       Accept: "application/json",
       ...(init.headers as any),
@@ -1198,15 +1201,36 @@ class ApiClient {
     try {
       resp = await fetch(url, { ...init, headers });
     } catch (e: any) {
+      logError("api", "network request failed", {
+        method,
+        path,
+        url,
+        message: e?.message || "Network error",
+      });
       const err: ApiError = { error: { code: "NETWORK_ERROR", message: e?.message || "Network error" } };
       throw err;
     }
 
     const contentType = resp.headers.get("content-type") || "";
+    const elapsedMs = Math.round(performance.now() - startedAt);
+    const logPayload = {
+      method,
+      path,
+      status: resp.status,
+      elapsedMs,
+    };
 
     if (!resp.ok) {
+      logWarn("api", "request failed", logPayload);
       if (contentType.includes("application/json")) {
         const j = (await resp.json().catch(() => null)) as ApiError | null;
+        if (j?.error?.code || j?.error?.message) {
+          logWarn("api", "backend returned error payload", {
+            ...logPayload,
+            errorCode: j.error?.code,
+            errorMessage: j.error?.message,
+          });
+        }
         throw (
           j || {
             error: { code: String(resp.status), message: resp.statusText || "Request failed" },
@@ -1216,6 +1240,7 @@ class ApiClient {
       throw { error: { code: String(resp.status), message: resp.statusText || "Request failed" } };
     }
 
+    logInfo("api", "request succeeded", logPayload);
     if (contentType.includes("application/json")) {
       return (await resp.json()) as T;
     }
@@ -1295,13 +1320,23 @@ class ApiClient {
   // image download as blob
   getImageBlob(job_id: string, image_id: string, jobToken?: string, signal?: AbortSignal) {
     const url = this.buildUrl(`/jobs/${encodeURIComponent(job_id)}/images/${encodeURIComponent(image_id)}`);
+    const startedAt = performance.now();
     const headers: Record<string, string> = {};
     if (this.jobAuthMode === "TOKEN" && jobToken) headers["X-Job-Token"] = jobToken;
     return fetch(url, { method: "GET", headers, signal }).then(async (r) => {
       if (!r.ok) {
+        logWarn("api", "image download failed", {
+          path: `/jobs/${job_id}/images/${image_id}`,
+          status: r.status,
+        });
         const err: ApiError = { error: { code: String(r.status), message: r.statusText || "Image download failed" } };
         throw err;
       }
+      logDebug("api", "image downloaded", {
+        path: `/jobs/${job_id}/images/${image_id}`,
+        status: r.status,
+        elapsedMs: Math.round(performance.now() - startedAt),
+      });
       return r.blob();
     });
   }
@@ -1358,6 +1393,7 @@ function useModelCatalog() {
       })
       .catch(() => {
         if (stopped) return;
+        logWarn("models", "failed to load model catalog, fallback applied");
         setCatalog(FALLBACK_MODEL_CATALOG);
       });
 

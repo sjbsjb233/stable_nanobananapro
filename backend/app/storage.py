@@ -8,6 +8,9 @@ from pathlib import Path
 from typing import Any
 
 from .config import settings
+from .logging_setup import get_logger
+
+logger = get_logger("storage")
 
 
 class JobStorage:
@@ -44,6 +47,7 @@ class JobStorage:
             log_file.parent.mkdir(parents=True, exist_ok=True)
             with log_file.open("a", encoding="utf-8") as f:
                 f.write(line)
+        logger.info("Job event: job_id=%s message=%s", job_id, message)
 
     def save_request(self, job_id: str, payload: dict[str, Any]) -> None:
         self.write_json(self.job_dir(job_id) / "request.json", payload)

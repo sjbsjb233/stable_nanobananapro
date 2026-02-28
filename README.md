@@ -55,6 +55,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 ```bash
 cd frontend
 npm install
+cp .env.example .env
 npm run dev
 ```
 
@@ -62,6 +63,13 @@ npm run dev
 
 - 默认后端地址会自动使用 `http://<当前主机>:8000`
 - 也可通过环境变量覆盖：`VITE_API_BASE_URL=http://127.0.0.1:8000`
+- 前端日志默认保留 3 天，可在 `frontend/.env` 调整：
+  - `VITE_LOG_LEVEL=INFO`
+  - `VITE_LOG_RETENTION_DAYS=3`
+  - `VITE_LOG_MAX_ENTRIES=1200`
+- 浏览器调试查看日志：
+  - `window.__NBP_LOGGER__?.get(200)` 查看最近 200 条
+  - `window.__NBP_LOGGER__?.clear()` 清空前端日志
 
 ## Docker Compose（前后端一起）
 
@@ -69,8 +77,48 @@ npm run dev
 docker compose up --build
 ```
 
-- 前端：`http://localhost:5173`
-- 后端：`http://localhost:8000`
+- 前端：`http://localhost:5178`
+- 后端：`http://localhost:8032`
+
+## 开发端发版（Mac / Apple Silicon）
+
+目标是让开发机只负责 `build + push`，服务端只负责 `pull + up`。
+
+1. 初始化 buildx（首次或 Docker 重置后）
+
+```bash
+chmod +x scripts/init-buildx.sh release.sh
+./scripts/init-buildx.sh
+```
+
+2. 构建并推送 linux/amd64 镜像（默认 tag=当前 commit short hash）
+
+```bash
+./release.sh
+```
+
+也可以手动指定版本 tag：
+
+```bash
+./release.sh 2026-02-28_01
+```
+
+默认镜像名：
+
+- `docker.io/sjbsjb233/stable-nanobananapro-backend:<TAG>`
+- `docker.io/sjbsjb233/stable-nanobananapro-frontend:<TAG>`
+
+可通过环境变量覆盖（示例）：
+
+```bash
+NAMESPACE=sjbsjb233 APP_NAME=stable PLATFORM=linux/amd64 ./release.sh
+```
+
+脚本默认会同时推送 `<TAG>` 和 `latest`，如只推送 `<TAG>`：
+
+```bash
+PUSH_LATEST=0 ./release.sh
+```
 
 ## 创建 Job 示例
 
@@ -132,7 +180,16 @@ data/
         image_0.png
       logs/
         job.log
+  logs/
+    app.log
+    app.log.YYYY-MM-DD
 ```
+
+后端日志默认按天轮转，保留 3 天（自动删除更老文件）。可在 `backend/.env` 调整：
+
+- `LOG_DIR=./data/logs`
+- `LOG_LEVEL=INFO`
+- `LOG_RETENTION_DAYS=3`
 
 ## 测试
 

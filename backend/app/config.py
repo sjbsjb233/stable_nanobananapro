@@ -43,6 +43,9 @@ class Settings(BaseSettings):
     job_ttl_days: int = Field(default=30, alias="JOB_TTL_DAYS")
 
     idempotency_ttl_sec: int = Field(default=24 * 3600, alias="IDEMPOTENCY_TTL_SEC")
+    log_dir: Path = Field(default=Path("./data/logs"), alias="LOG_DIR")
+    log_level: str = Field(default="INFO", alias="LOG_LEVEL")
+    log_retention_days: int = Field(default=3, alias="LOG_RETENTION_DAYS")
 
     google_reported_spend_usd: float | None = Field(default=None, alias="GOOGLE_REPORTED_SPEND_USD")
     google_reported_remaining_usd: float | None = Field(default=None, alias="GOOGLE_REPORTED_REMAINING_USD")
@@ -67,3 +70,4 @@ def get_cors_origins() -> list[str]:
 def ensure_data_dirs() -> None:
     jobs_dir = settings.data_dir / "jobs"
     jobs_dir.mkdir(parents=True, exist_ok=True)
+    settings.log_dir.mkdir(parents=True, exist_ok=True)
