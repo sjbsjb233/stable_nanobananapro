@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import logging
 import time
+from datetime import datetime
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 
 from .config import settings
+from .time_utils import APP_TZ
 
 _LOGGER_NAME = "nbp"
 _INITIALIZED = False
@@ -14,6 +16,10 @@ _INITIALIZED = False
 def _safe_level(raw: str) -> int:
     value = (raw or "INFO").strip().upper()
     return getattr(logging, value, logging.INFO)
+
+
+def _to_app_tz(epoch_seconds: float) -> time.struct_time:
+    return datetime.fromtimestamp(epoch_seconds, tz=APP_TZ).timetuple()
 
 
 def setup_logging() -> logging.Logger:
@@ -27,10 +33,10 @@ def setup_logging() -> logging.Logger:
 
     level = _safe_level(settings.log_level)
     fmt = logging.Formatter(
-        fmt="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-        datefmt="%Y-%m-%dT%H:%M:%SZ",
+        fmt="%(asctime)s+08:00 | %(levelname)s | %(name)s | %(message)s",
+        datefmt="%Y-%m-%dT%H:%M:%S",
     )
-    fmt.converter = time.gmtime
+    fmt.converter = _to_app_tz
 
     file_handler = TimedRotatingFileHandler(
         filename=str(log_dir / "app.log"),
@@ -38,7 +44,7 @@ def setup_logging() -> logging.Logger:
         interval=1,
         backupCount=max(1, int(settings.log_retention_days)),
         encoding="utf-8",
-        utc=True,
+        utc=False,
     )
     file_handler.setFormatter(fmt)
     file_handler.setLevel(level)

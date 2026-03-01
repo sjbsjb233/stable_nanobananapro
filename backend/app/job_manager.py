@@ -7,7 +7,7 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +22,7 @@ from .model_catalog import MODE_TEXT_AND_IMAGE, get_model_spec, normalize_params
 from .schemas import CreateJobRequest, ErrorCode, JobParams, JobStatus
 from .security import hash_token, new_job_access_token, new_job_id, validate_job_id, verify_token
 from .storage import storage
+from .time_utils import APP_TZ, now_local
 
 logger = get_logger("job_manager")
 
@@ -77,7 +78,7 @@ class JobManager:
                 self._queue.task_done()
 
     def _utcnow(self) -> datetime:
-        return datetime.now(timezone.utc)
+        return now_local()
 
     def _parse_iso_dt(self, value: Any) -> datetime | None:
         if not value:
@@ -87,8 +88,8 @@ class JobManager:
         except (TypeError, ValueError):
             return None
         if dt.tzinfo is None:
-            return dt.replace(tzinfo=timezone.utc)
-        return dt.astimezone(timezone.utc)
+            return dt.replace(tzinfo=APP_TZ)
+        return dt.astimezone(APP_TZ)
 
     def _hydrate_running_timing(self, meta: dict[str, Any], started_at: datetime) -> None:
         timing = meta.get("timing") if isinstance(meta.get("timing"), dict) else {}

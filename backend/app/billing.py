@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from .config import settings
+from .time_utils import now_local
 
 
 @dataclass
@@ -105,7 +106,7 @@ def estimate_job_cost(
 
 
 def current_month_period(now: datetime | None = None) -> dict[str, str]:
-    now = now or datetime.now(timezone.utc)
+    now = now or now_local()
     start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
 
     if now.month == 12:

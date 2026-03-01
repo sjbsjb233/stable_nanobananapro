@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import time
-from datetime import datetime, timezone
 from typing import Any, AsyncIterator
 
 from fastapi import Depends, FastAPI, Header, Request, Response, status
@@ -44,10 +43,11 @@ from .schemas import (
 )
 from .security import validate_image_id, validate_job_id
 from .storage import storage
+from .time_utils import now_local
 
 logger = get_logger("api")
 app = FastAPI(title="Nano Banana API", version=settings.app_version)
-APP_DEPLOYED_AT = datetime.now(timezone.utc)
+APP_DEPLOYED_AT = now_local()
 cors_origins = get_cors_origins()
 allow_credentials = settings.cors_allow_credentials
 if "*" in cors_origins:
@@ -147,7 +147,7 @@ async def validation_exception_handler(_: Request, exc: RequestValidationError) 
 
 @app.get(f"{settings.api_prefix}/health", response_model=HealthResponse)
 async def health() -> HealthResponse:
-    return HealthResponse(time=datetime.now(timezone.utc), version=settings.app_version, deployed_at=APP_DEPLOYED_AT)
+    return HealthResponse(time=now_local(), version=settings.app_version, deployed_at=APP_DEPLOYED_AT)
 
 
 def _parse_job_params(raw: dict[str, Any]) -> JobParams:
@@ -442,7 +442,7 @@ def _billing_summary_payload() -> dict[str, Any]:
         "remaining_usd": round(max(0.0, budget - spent), 6),
         "period": current_month_period(),
         "by_model": [BillingSummaryModelItem(**{**v, "spent_usd": round(v["spent_usd"], 6)}).model_dump() for v in by_model.values()],
-        "last_updated_at": datetime.now(timezone.utc).isoformat(),
+        "last_updated_at": now_local().isoformat(),
         "notes": "Estimated from job-level usage + official pricing.",
     }
     return payload
@@ -486,7 +486,7 @@ async def billing_google_remaining(
             google_spent_usd=settings.google_reported_spend_usd,
             source="GCP Billing Export (BigQuery)",
             notes="Data may be delayed depending on export schedule.",
-            as_of=datetime.now(timezone.utc),
+            as_of=now_local(),
         )
         return payload.model_dump()
 

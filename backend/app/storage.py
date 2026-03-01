@@ -3,12 +3,12 @@ from __future__ import annotations
 import json
 import shutil
 import threading
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from .config import settings
 from .logging_setup import get_logger
+from .time_utils import now_local
 
 logger = get_logger("storage")
 
@@ -41,7 +41,7 @@ class JobStorage:
         return json.loads(path.read_text(encoding="utf-8"))
 
     def write_job_log(self, job_id: str, message: str) -> None:
-        line = f"[{datetime.now(timezone.utc).isoformat()}] {message}\n"
+        line = f"[{now_local().isoformat()}] {message}\n"
         log_file = self.job_dir(job_id) / "logs" / "job.log"
         with self._lock:
             log_file.parent.mkdir(parents=True, exist_ok=True)
