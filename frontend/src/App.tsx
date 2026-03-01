@@ -195,9 +195,11 @@ type JobResult = {
 };
 
 type JobError = {
+  code?: string;
   type?: string;
   message?: string;
   debug_id?: string;
+  details?: Record<string, any>;
   [k: string]: any;
 };
 
@@ -4209,6 +4211,10 @@ function JobDetail({ rec, onUpdateToken }: { rec: JobRecord; onUpdateToken: (tok
           <div className="text-sm font-bold text-rose-700 dark:text-rose-200">失败信息</div>
           <div className="mt-2 text-xs text-zinc-700 dark:text-zinc-200">
             <div>
+              <span className="font-semibold">code：</span>
+              {meta?.error?.code || "-"}
+            </div>
+            <div className="mt-1">
               <span className="font-semibold">type：</span>
               {meta?.error?.type || "-"}
             </div>
@@ -4216,6 +4222,14 @@ function JobDetail({ rec, onUpdateToken }: { rec: JobRecord; onUpdateToken: (tok
               <span className="font-semibold">message：</span>
               {meta?.error?.message || "-"}
             </div>
+            {meta?.error?.details && Object.keys(meta.error.details).length > 0 ? (
+              <div className="mt-1">
+                <span className="font-semibold">details：</span>
+                <pre className="mt-1 max-h-32 overflow-auto rounded-xl bg-black/90 p-2 text-[11px] text-white">
+                  {JSON.stringify(meta.error.details, null, 2)}
+                </pre>
+              </div>
+            ) : null}
             {meta?.error?.debug_id ? (
               <div className="mt-1">
                 <span className="font-semibold">debug_id：</span>

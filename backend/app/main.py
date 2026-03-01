@@ -47,6 +47,7 @@ from .storage import storage
 
 logger = get_logger("api")
 app = FastAPI(title="Nano Banana API", version=settings.app_version)
+APP_DEPLOYED_AT = datetime.now(timezone.utc)
 cors_origins = get_cors_origins()
 allow_credentials = settings.cors_allow_credentials
 if "*" in cors_origins:
@@ -72,7 +73,12 @@ app.add_middleware(
 def _startup() -> None:
     setup_logging()
     ensure_data_dirs()
-    logger.info("Backend startup: version=%s data_dir=%s", settings.app_version, settings.data_dir)
+    logger.info(
+        "Backend startup: version=%s deployed_at=%s data_dir=%s",
+        settings.app_version,
+        APP_DEPLOYED_AT.isoformat(),
+        settings.data_dir,
+    )
     job_manager.start()
 
 
@@ -141,7 +147,7 @@ async def validation_exception_handler(_: Request, exc: RequestValidationError) 
 
 @app.get(f"{settings.api_prefix}/health", response_model=HealthResponse)
 async def health() -> HealthResponse:
-    return HealthResponse(time=datetime.now(timezone.utc), version=settings.app_version)
+    return HealthResponse(time=datetime.now(timezone.utc), version=settings.app_version, deployed_at=APP_DEPLOYED_AT)
 
 
 def _parse_job_params(raw: dict[str, Any]) -> JobParams:

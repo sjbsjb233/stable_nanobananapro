@@ -17,10 +17,13 @@ from .billing import estimate_job_cost, normalize_usage
 from .config import settings
 from .errors import api_error
 from .gemini_client import GeminiError, ReferenceImage, gemini_client
+from .logging_setup import get_logger
 from .model_catalog import MODE_TEXT_AND_IMAGE, get_model_spec, normalize_params_for_model
 from .schemas import CreateJobRequest, ErrorCode, JobParams, JobStatus
 from .security import hash_token, new_job_access_token, new_job_id, validate_job_id, verify_token
 from .storage import storage
+
+logger = get_logger("job_manager")
 
 
 @dataclass
@@ -67,6 +70,9 @@ class JobManager:
 
             try:
                 self._run_job(job_id)
+            except Exception as exc:
+                logger.exception("Unhandled worker exception: job_id=%s", job_id)
+                self._finalize_unhandled_exception(job_id, exc)
             finally:
                 self._queue.task_done()
 
@@ -396,7 +402,20 @@ class JobManager:
 
         for attempt in range(attempts):
             try:
-                output = gemini_client.generate_image(
+                storage.write_job_log(job_id, f"Attempt {attempt + 1}/{attempts} started")
+                logger.info(
+                    "Gemini run start: job_id=%s attempt=%s/%s model=%s mode=%s timeout_sec=%s",
+                    job_id,
+                    attempt + 1,
+                    attempts,
+                    meta.get("model", settings.default_model),
+                    meta["mode"],
+                    params.get("timeout_sec"),
+                )
+                output = self._generate_image_with_watchdog(
+                    job_id=job_id,
+                    attempt=attempt + 1,
+                    attempts=attempts,
                     prompt=request_data["prompt"],
                     model=meta.get("model", settings.default_model),
                     mode=meta["mode"],
@@ -408,11 +427,94 @@ class JobManager:
             except GeminiError as exc:
                 last_error = exc
                 storage.write_job_log(job_id, f"Attempt {attempt + 1}/{attempts} failed: {exc.code} - {exc.message}")
+                logger.warning(
+                    "Gemini run failed: job_id=%s attempt=%s/%s code=%s retryable=%s message=%s",
+                    job_id,
+                    attempt + 1,
+                    attempts,
+                    exc.code,
+                    exc.retryable,
+                    exc.message,
+                )
                 if not exc.retryable or attempt == attempts - 1:
                     break
                 time.sleep(0.8)
 
         self._finalize_failure(job_id, meta, last_error)
+
+    def _generate_image_with_watchdog(
+        self,
+        *,
+        job_id: str,
+        attempt: int,
+        attempts: int,
+        prompt: str,
+        model: str,
+        mode: str,
+        params: dict[str, Any],
+        reference_images: list[ReferenceImage],
+    ) -> dict[str, Any]:
+        watchdog_timeout_sec = max(
+            int(params.get("timeout_sec", settings.job_timeout_sec_default)) + int(settings.job_watchdog_grace_sec),
+            1,
+        )
+        result_queue: queue.Queue[tuple[str, Any]] = queue.Queue(maxsize=1)
+
+        def _target() -> None:
+            try:
+                output = gemini_client.generate_image(
+                    prompt=prompt,
+                    model=model,
+                    mode=mode,
+                    params=params,
+                    reference_images=reference_images,
+                )
+                result_queue.put(("ok", output))
+            except Exception as exc:  # noqa: BLE001
+                result_queue.put(("err", exc))
+
+        thread = threading.Thread(
+            target=_target,
+            name=f"gemini-call-{job_id[:8]}-{attempt}",
+            daemon=True,
+        )
+        thread.start()
+
+        try:
+            kind, payload = result_queue.get(timeout=watchdog_timeout_sec)
+        except queue.Empty as exc:
+            raise GeminiError(
+                code="WORKER_WATCHDOG_TIMEOUT",
+                message=(
+                    "Worker watchdog timeout while waiting Gemini response "
+                    f"(attempt {attempt}/{attempts}, watchdog={watchdog_timeout_sec}s)"
+                ),
+                retryable=True,
+                payload={
+                    "job_id": job_id,
+                    "attempt": attempt,
+                    "attempts": attempts,
+                    "watchdog_timeout_sec": watchdog_timeout_sec,
+                    "configured_timeout_sec": int(params.get("timeout_sec", settings.job_timeout_sec_default)),
+                },
+            ) from exc
+
+        if kind == "ok":
+            return payload
+        if isinstance(payload, GeminiError):
+            raise payload
+        raise GeminiError(
+            code="UPSTREAM_UNCAUGHT_EXCEPTION",
+            message=f"Unhandled exception while calling Gemini: {type(payload).__name__}: {payload}",
+            retryable=True,
+            payload={
+                "job_id": job_id,
+                "attempt": attempt,
+                "attempts": attempts,
+                "exception_type": type(payload).__name__,
+                "exception": str(payload),
+            },
+        ) from payload
 
     def _finalize_success(self, job_id: str, meta: dict[str, Any], output: dict[str, Any]) -> None:
         image_metas: list[dict[str, Any]] = []
@@ -476,7 +578,7 @@ class JobManager:
         storage.write_job_log(job_id, "Job succeeded")
 
     def _error_code_to_meta(self, code: str) -> tuple[str, bool]:
-        if code == "UPSTREAM_TIMEOUT":
+        if code in {"UPSTREAM_TIMEOUT", "WORKER_WATCHDOG_TIMEOUT"}:
             return ErrorCode.UPSTREAM_TIMEOUT.value, True
         if code == "UPSTREAM_RATE_LIMIT":
             return ErrorCode.UPSTREAM_RATE_LIMIT.value, True
@@ -487,6 +589,7 @@ class JobManager:
     def _finalize_failure(self, job_id: str, meta: dict[str, Any], err: GeminiError | None) -> None:
         err = err or GeminiError(code="UNKNOWN", message="Unknown failure", retryable=False)
         error_type, retryable = self._error_code_to_meta(err.code)
+        debug_id = str(uuid.uuid4())
         usage = {
             "prompt_token_count": 0,
             "cached_content_token_count": 0,
@@ -525,13 +628,46 @@ class JobManager:
             "safety_ratings": [],
         }
         meta["error"] = {
+            "code": err.code,
             "type": error_type,
             "message": err.message,
             "retryable": retryable,
-            "debug_id": str(uuid.uuid4()),
+            "debug_id": debug_id,
+            "details": err.payload or {},
         }
         storage.save_meta(job_id, meta)
-        storage.write_job_log(job_id, f"Job failed: {error_type} - {err.message}")
+        storage.write_job_log(job_id, f"Job failed: {error_type} - {err.message} (debug_id={debug_id})")
+        logger.error(
+            "Job failed: job_id=%s type=%s code=%s retryable=%s debug_id=%s message=%s details=%s",
+            job_id,
+            error_type,
+            err.code,
+            retryable,
+            debug_id,
+            err.message,
+            err.payload or {},
+        )
+
+    def _finalize_unhandled_exception(self, job_id: str, exc: Exception) -> None:
+        try:
+            meta = storage.load_meta(job_id)
+        except Exception:
+            logger.exception("Failed to load meta while handling worker exception: job_id=%s", job_id)
+            return
+
+        if meta.get("status") not in {JobStatus.QUEUED, JobStatus.RUNNING}:
+            return
+
+        wrapped = GeminiError(
+            code="WORKER_UNHANDLED_EXCEPTION",
+            message=f"Unhandled worker exception: {type(exc).__name__}: {exc}",
+            retryable=False,
+            payload={"exception_type": type(exc).__name__, "exception": str(exc)},
+        )
+        try:
+            self._finalize_failure(job_id, meta, wrapped)
+        except Exception:
+            logger.exception("Failed to finalize unhandled worker exception: job_id=%s", job_id)
 
     def _to_png(self, raw: bytes) -> tuple[bytes, int, int]:
         with Image.open(io.BytesIO(raw)) as img:

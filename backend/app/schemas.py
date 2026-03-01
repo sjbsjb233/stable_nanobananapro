@@ -147,10 +147,12 @@ class JobResult(BaseModel):
 
 
 class JobError(BaseModel):
+    code: str | None = None
     type: str
     message: str
     retryable: bool
     debug_id: str
+    details: dict[str, Any] = Field(default_factory=dict)
 
 
 class JobMeta(BaseModel):
@@ -182,6 +184,7 @@ class HealthResponse(BaseModel):
     status: Literal["ok"] = "ok"
     time: datetime
     version: str
+    deployed_at: datetime
 
 
 class BillingSummaryModelItem(BaseModel):

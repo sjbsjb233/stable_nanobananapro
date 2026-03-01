@@ -11,5 +11,7 @@ frontend/dist/
 frontend/tmp/
 frontend/video/
 frontend/videos/
-srv/
-srv_server/
+srv/stable/compose/.env
+srv/stable/config/backend.prod.env
+srv/stable/data
+srv_server/config/backend.env.example

@@ -8,7 +8,10 @@ from typing import Any
 import httpx
 
 from .config import settings
+from .logging_setup import get_logger
 from .model_catalog import MODE_TEXT_AND_IMAGE, get_model_spec
+
+logger = get_logger("gemini_client")
 
 
 class GeminiError(Exception):
@@ -80,6 +83,14 @@ class GeminiClient:
         timeout = params["timeout_sec"]
         url = f"{self.base_url}/models/{model}:generateContent"
         start = time.perf_counter()
+        logger.info(
+            "Gemini request: model=%s mode=%s timeout_sec=%s has_proxy=%s ref_images=%s",
+            model,
+            mode,
+            timeout,
+            bool(settings.gemini_http_proxy),
+            len(reference_images),
+        )
 
         try:
             client_kwargs: dict[str, Any] = {
@@ -90,22 +101,57 @@ class GeminiClient:
             with httpx.Client(**client_kwargs) as client:
                 resp = client.post(url, params={"key": settings.gemini_api_key}, json=payload)
         except httpx.TimeoutException as exc:
+            logger.warning("Gemini timeout: model=%s timeout_sec=%s error=%s", model, timeout, exc)
             raise GeminiError(code="UPSTREAM_TIMEOUT", message="Gemini upstream timeout", retryable=True) from exc
         except httpx.HTTPError as exc:
+            logger.warning("Gemini HTTP error: model=%s error=%s", model, exc)
             raise GeminiError(code="UPSTREAM_HTTP", message=f"Gemini HTTP error: {exc}", retryable=True) from exc
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Gemini unexpected client exception: model=%s", model)
+            raise GeminiError(
+                code="UPSTREAM_CLIENT_EXCEPTION",
+                message=f"Unexpected Gemini client error: {type(exc).__name__}: {exc}",
+                retryable=True,
+                payload={"exception_type": type(exc).__name__, "exception": str(exc)},
+            ) from exc
 
         latency_ms = int((time.perf_counter() - start) * 1000)
+        logger.info("Gemini response: model=%s status=%s latency_ms=%s", model, resp.status_code, latency_ms)
+
+        def _safe_json_response() -> dict[str, Any]:
+            try:
+                data = resp.json()
+                return data if isinstance(data, dict) else {"raw": data}
+            except Exception:
+                snippet = (resp.text or "")[:1000]
+                logger.warning(
+                    "Gemini non-JSON response: model=%s status=%s snippet=%s",
+                    model,
+                    resp.status_code,
+                    snippet,
+                )
+                return {"raw_text_snippet": snippet}
 
         if resp.status_code == 429:
-            raise GeminiError(code="UPSTREAM_RATE_LIMIT", message="Gemini rate limited", retryable=True, payload=resp.json())
+            raise GeminiError(
+                code="UPSTREAM_RATE_LIMIT",
+                message="Gemini rate limited",
+                retryable=True,
+                payload=_safe_json_response(),
+            )
         if resp.status_code >= 500:
-            raise GeminiError(code="UPSTREAM_SERVER_ERROR", message="Gemini upstream server error", retryable=True, payload=resp.json())
+            raise GeminiError(
+                code="UPSTREAM_SERVER_ERROR",
+                message=f"Gemini upstream server error: HTTP {resp.status_code}",
+                retryable=True,
+                payload=_safe_json_response(),
+            )
         if resp.status_code >= 400:
-            body = resp.json()
+            body = _safe_json_response()
             message = body.get("error", {}).get("message", f"Gemini request failed: HTTP {resp.status_code}")
             raise GeminiError(code="UPSTREAM_BAD_REQUEST", message=message, retryable=False, payload=body)
 
-        data = resp.json()
+        data = _safe_json_response()
 
         candidates = data.get("candidates", [])
         image_parts: list[dict[str, Any]] = []

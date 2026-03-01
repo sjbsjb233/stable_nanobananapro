@@ -30,6 +30,7 @@ class Settings(BaseSettings):
     job_timeout_sec_default: int = Field(default=120, alias="JOB_TIMEOUT_SEC_DEFAULT")
     job_timeout_sec_min: int = Field(default=15, alias="JOB_TIMEOUT_SEC_MIN")
     job_timeout_sec_max: int = Field(default=600, alias="JOB_TIMEOUT_SEC_MAX")
+    job_watchdog_grace_sec: int = Field(default=20, alias="JOB_WATCHDOG_GRACE_SEC")
 
     job_auth_mode: Literal["TOKEN", "ID_ONLY"] = Field(default="TOKEN", alias="JOB_AUTH_MODE")
 
