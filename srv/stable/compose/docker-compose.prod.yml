@@ -1,0 +1,21 @@
+services:
+  backend:
+    image: ${REGISTRY}/stable-backend:${TAG}
+    env_file:
+      - ../config/backend.prod.env
+    ports:
+      - "8000:8000"
+    volumes:
+      - ../data:/app/data
+    restart: unless-stopped
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    pull_policy: never
+
+  frontend:
+    image: ${REGISTRY}/stable-frontend:${TAG}
+    ports:
+      - "5178:80"
+    depends_on:
+      - backend
+    restart: unless-stopped
+    pull_policy: never
