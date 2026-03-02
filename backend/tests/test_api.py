@@ -85,6 +85,45 @@ def test_job_lifecycle(monkeypatch):
         resp = client.get(f"/v1/jobs/{job_id}/response", headers={"X-Job-Token": token})
         assert resp.status_code == 200
 
+        batch = client.post(
+            "/v1/jobs/batch-meta",
+            json={
+                "jobs": [
+                    {"job_id": job_id, "job_access_token": token},
+                    {"job_id": "f" * 32, "job_access_token": "wrong-token"},
+                ],
+                "fields": ["status", "timing", "billing"],
+            },
+        )
+        assert batch.status_code == 200
+        batch_body = batch.json()
+        assert batch_body["requested"] == 2
+        assert batch_body["ok"] == 1
+        assert batch_body["items"][0]["job_id"] == job_id
+        assert "status" in batch_body["items"][0]["meta"]
+        assert "f" * 32 in batch_body["not_found"]
+
+        active = client.post(
+            "/v1/jobs/active",
+            json={"jobs": [{"job_id": job_id, "job_access_token": token}]},
+        )
+        assert active.status_code == 200
+        active_body = active.json()
+        assert active_body["requested"] == 1
+        assert active_body["active_count"] == 0
+        assert active_body["settled_count"] == 1
+
+        summary_api = client.post(
+            "/v1/dashboard/summary",
+            json={"jobs": [{"job_id": job_id, "job_access_token": token}], "limit": 50},
+        )
+        assert summary_api.status_code == 200
+        summary_body = summary_api.json()
+        assert summary_body["requested"] == 1
+        assert summary_body["ok"] == 1
+        assert isinstance(summary_body.get("stats"), dict)
+        assert "today_count" in summary_body["stats"]
+
         img = client.get(f"/v1/jobs/{job_id}/images/image_0", headers={"X-Job-Token": token})
         assert img.status_code == 200
         assert img.headers["content-type"].startswith("image/")

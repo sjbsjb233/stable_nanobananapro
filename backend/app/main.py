@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import json
+import math
 import time
+from datetime import datetime, timedelta
 from typing import Any, AsyncIterator
 
 from fastapi import Depends, FastAPI, Header, Request, Response, status
+from fastapi import HTTPException
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.middleware.cors import CORSMiddleware
@@ -28,9 +31,12 @@ from .model_catalog import (
 from .rate_limiter import job_read_rate_limit
 from .logging_setup import get_logger, setup_logging
 from .schemas import (
+    ActiveJobsRequest,
+    BatchMetaRequest,
     BillingSummaryModelItem,
     CreateJobRequest,
     CreateJobResponse,
+    DashboardSummaryRequest,
     ErrorCode,
     ErrorResponse,
     GoogleRemainingConfiguredResponse,
@@ -287,6 +293,253 @@ async def _parse_create_request(request: Request) -> tuple[CreateJobRequest, lis
     return _validate_and_normalize_request(req), refs
 
 
+def _normalize_job_refs(raw_refs: list[Any], *, limit: int) -> list[tuple[str, str | None]]:
+    refs: list[tuple[str, str | None]] = []
+    seen: set[str] = set()
+    for item in raw_refs:
+        if len(refs) >= limit:
+            break
+        job_id = str(getattr(item, "job_id", "") or "").strip()
+        if not job_id or job_id in seen:
+            continue
+        token = getattr(item, "job_access_token", None)
+        token_value = str(token).strip() if isinstance(token, str) else None
+        refs.append((job_id, token_value or None))
+        seen.add(job_id)
+    return refs
+
+
+def _as_int(value: Any, default: int = 0) -> int:
+    try:
+        n = int(value)
+    except Exception:
+        return default
+    return n
+
+
+def _as_float(value: Any, default: float = 0.0) -> float:
+    try:
+        n = float(value)
+    except Exception:
+        return default
+    if not math.isfinite(n):
+        return default
+    return n
+
+
+def _parse_iso(value: Any) -> datetime | None:
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(value))
+    except Exception:
+        return None
+    if dt.tzinfo is None:
+        local_tz = now_local().tzinfo
+        if local_tz is not None:
+            dt = dt.replace(tzinfo=local_tz)
+    return dt
+
+
+def _status_snapshot(meta: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "job_id": meta.get("job_id"),
+        "status": meta.get("status"),
+        "model": meta.get("model"),
+        "updated_at": meta.get("updated_at"),
+        "timing": meta.get("timing") if isinstance(meta.get("timing"), dict) else {},
+        "error": meta.get("error") if isinstance(meta.get("error"), dict) else None,
+    }
+
+
+def _meta_with_fields(meta: dict[str, Any], fields: set[str] | None) -> dict[str, Any]:
+    if not fields:
+        return meta
+    view: dict[str, Any] = {}
+    for key in fields:
+        if key in meta:
+            view[key] = meta[key]
+    if "job_id" not in view and "job_id" in meta:
+        view["job_id"] = meta["job_id"]
+    return view
+
+
+def _extract_latency_ms(meta: dict[str, Any]) -> int | None:
+    timing = meta.get("timing") if isinstance(meta.get("timing"), dict) else {}
+    run_duration = timing.get("run_duration_ms")
+    if isinstance(run_duration, (int, float)) and math.isfinite(run_duration) and run_duration >= 0:
+        return int(run_duration)
+    response = meta.get("response") if isinstance(meta.get("response"), dict) else {}
+    latency = response.get("latency_ms")
+    if isinstance(latency, (int, float)) and math.isfinite(latency) and latency >= 0:
+        return int(latency)
+    return None
+
+
+def _percentile(values: list[int], p: float) -> float:
+    if not values:
+        return 0.0
+    arr = sorted(values)
+    idx = (p / 100.0) * (len(arr) - 1)
+    lo = int(math.floor(idx))
+    hi = int(math.ceil(idx))
+    if lo == hi:
+        return float(arr[lo])
+    w = idx - lo
+    return float(arr[lo] * (1 - w) + arr[hi] * w)
+
+
+def _safe_mean(values: list[int] | list[float]) -> float:
+    if not values:
+        return 0.0
+    return float(sum(values) / len(values))
+
+
+def _compute_dashboard_stats(metas: list[dict[str, Any]]) -> dict[str, Any]:
+    now = now_local()
+    today = now.date()
+    cutoff = now - timedelta(days=7)
+
+    def sort_ts(meta: dict[str, Any]) -> float:
+        dt = _parse_iso(meta.get("created_at")) or _parse_iso(meta.get("updated_at"))
+        return dt.timestamp() if dt else 0.0
+
+    sorted_metas = sorted(metas, key=sort_ts, reverse=True)
+    today_jobs: list[dict[str, Any]] = []
+    for meta in sorted_metas:
+        created = _parse_iso(meta.get("created_at"))
+        if created and created.date() == today:
+            today_jobs.append(meta)
+
+    recent_jobs = sorted_metas[:10]
+
+    def status_of(meta: dict[str, Any]) -> str:
+        return str(meta.get("status") or "UNKNOWN")
+
+    today_count = len(today_jobs)
+    today_success = sum(1 for m in today_jobs if status_of(m) == "SUCCEEDED")
+    today_failed = sum(1 for m in today_jobs if status_of(m) == "FAILED")
+    today_success_rate = (today_success / today_count) if today_count else 0.0
+
+    today_total_tokens = sum(
+        _as_int((m.get("usage") or {}).get("total_token_count"), 0)
+        for m in today_jobs
+    )
+    today_total_cost_usd = sum(
+        _as_float((m.get("billing") or {}).get("estimated_cost_usd"), 0.0)
+        for m in today_jobs
+    )
+
+    today_latencies = [v for v in (_extract_latency_ms(m) for m in today_jobs) if isinstance(v, int)]
+    today_avg_latency_ms = _safe_mean(today_latencies)
+    today_p95_latency_ms = _percentile(today_latencies, 95)
+
+    recent_success = sum(1 for m in recent_jobs if status_of(m) == "SUCCEEDED")
+    recent10_success_rate = (recent_success / len(recent_jobs)) if recent_jobs else 0.0
+
+    recent_lat = [v for v in (_extract_latency_ms(m) for m in recent_jobs) if isinstance(v, int)]
+    recent10_avg_latency_ms = _safe_mean(recent_lat)
+
+    recent_cost = [
+        _as_float((m.get("billing") or {}).get("estimated_cost_usd"), float("nan"))
+        for m in recent_jobs
+    ]
+    recent_cost = [v for v in recent_cost if math.isfinite(v) and v >= 0]
+    recent10_avg_cost_usd = _safe_mean(recent_cost)
+
+    recent_img_cost = [
+        _as_float((m.get("billing") or {}).get("image_output_cost_usd"), float("nan"))
+        for m in recent_jobs
+    ]
+    recent_img_cost = [v for v in recent_img_cost if math.isfinite(v) and v >= 0]
+    recent10_avg_image_cost_usd = _safe_mean(recent_img_cost)
+
+    failure_count: dict[str, int] = {}
+    for meta in sorted_metas[:30]:
+        created = _parse_iso(meta.get("created_at"))
+        if not created or created < cutoff:
+            continue
+        if status_of(meta) != "FAILED":
+            continue
+        error = meta.get("error") if isinstance(meta.get("error"), dict) else {}
+        name = str(error.get("type") or "UNKNOWN_ERROR")
+        failure_count[name] = failure_count.get(name, 0) + 1
+    failure_top = [
+        {"name": name, "value": value}
+        for name, value in sorted(failure_count.items(), key=lambda x: x[1], reverse=True)[:5]
+    ]
+
+    def _dist(key: str) -> list[dict[str, Any]]:
+        counts: dict[str, int] = {}
+        for meta in sorted_metas[:200]:
+            params = meta.get("params") if isinstance(meta.get("params"), dict) else {}
+            value = params.get(key)
+            if value is None:
+                continue
+            name = str(value)
+            if not name:
+                continue
+            counts[name] = counts.get(name, 0) + 1
+        return [
+            {"name": name, "value": value}
+            for name, value in sorted(counts.items(), key=lambda x: x[1], reverse=True)
+        ]
+
+    image_size_dist = _dist("image_size")
+    aspect_ratio_dist = _dist("aspect_ratio")
+
+    temp_counts: dict[str, int] = {}
+    for meta in sorted_metas[:200]:
+        params = meta.get("params") if isinstance(meta.get("params"), dict) else {}
+        temp = params.get("temperature")
+        if not isinstance(temp, (int, float)) or not math.isfinite(temp):
+            continue
+        if temp < 0.3:
+            bucket = "<0.3"
+        elif temp < 0.7:
+            bucket = "0.3~0.7"
+        elif temp < 1.0:
+            bucket = "0.7~1.0"
+        else:
+            bucket = ">=1.0"
+        temp_counts[bucket] = temp_counts.get(bucket, 0) + 1
+    temperature_dist = [{"name": k, "value": v} for k, v in temp_counts.items()]
+
+    bucket_tokens: dict[str, int] = {}
+    bucket_cost: dict[str, float] = {}
+    for meta in today_jobs:
+        created = _parse_iso(meta.get("created_at"))
+        if not created:
+            continue
+        h = f"{created.hour:02d}:00"
+        bucket_tokens[h] = bucket_tokens.get(h, 0) + _as_int((meta.get("usage") or {}).get("total_token_count"), 0)
+        bucket_cost[h] = bucket_cost.get(h, 0.0) + _as_float((meta.get("billing") or {}).get("estimated_cost_usd"), 0.0)
+    hours = [f"{idx:02d}:00" for idx in range(24)]
+    trend_tokens = [{"t": h, "tokens": bucket_tokens.get(h, 0)} for h in hours]
+    trend_cost = [{"t": h, "cost": bucket_cost.get(h, 0.0)} for h in hours]
+
+    return {
+        "today_count": today_count,
+        "today_success": today_success,
+        "today_failed": today_failed,
+        "today_success_rate": today_success_rate,
+        "today_total_tokens": today_total_tokens,
+        "today_total_cost_usd": today_total_cost_usd,
+        "today_avg_latency_ms": today_avg_latency_ms,
+        "today_p95_latency_ms": today_p95_latency_ms,
+        "recent10_success_rate": recent10_success_rate,
+        "recent10_avg_latency_ms": recent10_avg_latency_ms,
+        "recent10_avg_cost_usd": recent10_avg_cost_usd,
+        "recent10_avg_image_cost_usd": recent10_avg_image_cost_usd,
+        "failure_top": failure_top,
+        "image_size_dist": image_size_dist,
+        "aspect_ratio_dist": aspect_ratio_dist,
+        "temperature_dist": temperature_dist,
+        "trend_tokens": trend_tokens,
+        "trend_cost": trend_cost,
+    }
+
+
 @app.get(f"{settings.api_prefix}/models", response_model=ModelsResponse)
 async def list_models() -> ModelsResponse:
     default_model = settings.default_model.strip()
@@ -297,6 +550,145 @@ async def list_models() -> ModelsResponse:
         models=[ModelCapability(**model_capability_payload(spec)) for spec in list_model_specs()],
     )
     return payload
+
+
+@app.post(f"{settings.api_prefix}/jobs/batch-meta")
+async def jobs_batch_meta(payload: BatchMetaRequest, request: Request) -> dict[str, Any]:
+    job_read_rate_limit(request)
+    refs = _normalize_job_refs(payload.jobs, limit=500)
+
+    allowed_fields = {
+        "job_id",
+        "created_at",
+        "updated_at",
+        "status",
+        "model",
+        "mode",
+        "params",
+        "timing",
+        "usage",
+        "billing",
+        "result",
+        "response",
+        "error",
+        "auth",
+    }
+    fields = None
+    if payload.fields:
+        fields = {x for x in payload.fields if x in allowed_fields}
+
+    items: list[dict[str, Any]] = []
+    forbidden: list[str] = []
+    not_found: list[str] = []
+    failed: list[dict[str, str]] = []
+
+    for job_id, token in refs:
+        try:
+            meta = job_manager.get_meta(job_id, token)
+        except HTTPException as exc:
+            if exc.status_code == 403:
+                forbidden.append(job_id)
+            elif exc.status_code == 404:
+                not_found.append(job_id)
+            else:
+                failed.append({"job_id": job_id, "message": str(exc.detail)})
+            continue
+        items.append({"job_id": job_id, "meta": _meta_with_fields(meta, fields)})
+
+    return {
+        "items": items,
+        "forbidden": forbidden,
+        "not_found": not_found,
+        "failed": failed,
+        "requested": len(refs),
+        "ok": len(items),
+    }
+
+
+@app.post(f"{settings.api_prefix}/jobs/active")
+async def jobs_active_snapshot(payload: ActiveJobsRequest, request: Request) -> dict[str, Any]:
+    job_read_rate_limit(request)
+    refs = _normalize_job_refs(payload.jobs, limit=500)
+
+    active: list[dict[str, Any]] = []
+    settled: list[dict[str, Any]] = []
+    forbidden: list[str] = []
+    not_found: list[str] = []
+    failed: list[dict[str, str]] = []
+
+    for job_id, token in refs:
+        try:
+            meta = job_manager.get_meta(job_id, token)
+        except HTTPException as exc:
+            if exc.status_code == 403:
+                forbidden.append(job_id)
+            elif exc.status_code == 404:
+                not_found.append(job_id)
+            else:
+                failed.append({"job_id": job_id, "message": str(exc.detail)})
+            continue
+
+        snap = _status_snapshot(meta)
+        status_ = str(meta.get("status") or "UNKNOWN")
+        if status_ in {"RUNNING", "QUEUED"}:
+            active.append(snap)
+        else:
+            settled.append(snap)
+
+    def _sort_key(item: dict[str, Any]) -> float:
+        dt = _parse_iso(item.get("updated_at"))
+        return dt.timestamp() if dt else 0.0
+
+    active = sorted(active, key=_sort_key, reverse=True)[: payload.limit]
+    settled = sorted(settled, key=_sort_key, reverse=True)[: payload.limit]
+
+    return {
+        "active": active,
+        "settled": settled,
+        "forbidden": forbidden,
+        "not_found": not_found,
+        "failed": failed,
+        "requested": len(refs),
+        "active_count": len(active),
+        "settled_count": len(settled),
+    }
+
+
+@app.post(f"{settings.api_prefix}/dashboard/summary")
+async def dashboard_summary(payload: DashboardSummaryRequest, request: Request) -> dict[str, Any]:
+    job_read_rate_limit(request)
+    refs = _normalize_job_refs(payload.jobs, limit=payload.limit)
+
+    metas: list[dict[str, Any]] = []
+    updates: list[dict[str, Any]] = []
+    forbidden: list[str] = []
+    not_found: list[str] = []
+    failed: list[dict[str, str]] = []
+
+    for job_id, token in refs:
+        try:
+            meta = job_manager.get_meta(job_id, token)
+        except HTTPException as exc:
+            if exc.status_code == 403:
+                forbidden.append(job_id)
+            elif exc.status_code == 404:
+                not_found.append(job_id)
+            else:
+                failed.append({"job_id": job_id, "message": str(exc.detail)})
+            continue
+        metas.append(meta)
+        updates.append(_status_snapshot(meta))
+
+    stats = _compute_dashboard_stats(metas)
+    return {
+        "stats": stats,
+        "updates": updates,
+        "forbidden": forbidden,
+        "not_found": not_found,
+        "failed": failed,
+        "requested": len(refs),
+        "ok": len(metas),
+    }
 
 
 @app.post(f"{settings.api_prefix}/jobs", response_model=CreateJobResponse, status_code=status.HTTP_201_CREATED)

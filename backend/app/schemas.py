@@ -239,3 +239,23 @@ class ModelCapability(BaseModel):
 class ModelsResponse(BaseModel):
     default_model: ModelId
     models: list[ModelCapability]
+
+
+class JobAccessRef(BaseModel):
+    job_id: str
+    job_access_token: str | None = None
+
+
+class BatchMetaRequest(BaseModel):
+    jobs: list[JobAccessRef] = Field(default_factory=list)
+    fields: list[str] | None = None
+
+
+class ActiveJobsRequest(BaseModel):
+    jobs: list[JobAccessRef] = Field(default_factory=list)
+    limit: int = Field(default=100, ge=1, le=500)
+
+
+class DashboardSummaryRequest(BaseModel):
+    jobs: list[JobAccessRef] = Field(default_factory=list)
+    limit: int = Field(default=200, ge=1, le=500)

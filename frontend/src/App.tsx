@@ -228,6 +228,50 @@ type JobMeta = {
   [k: string]: any;
 };
 
+type JobAccessRef = {
+  job_id: string;
+  job_access_token?: string;
+};
+
+type JobStatusSnapshot = {
+  job_id: string;
+  status?: JobStatus;
+  model?: ModelId;
+  updated_at?: string;
+  timing?: JobMeta["timing"];
+  error?: JobError | null;
+};
+
+type BatchMetaResponse = {
+  items: Array<{ job_id: string; meta: JobMeta }>;
+  forbidden: string[];
+  not_found: string[];
+  failed: Array<{ job_id: string; message: string }>;
+  requested: number;
+  ok: number;
+};
+
+type ActiveJobsResponse = {
+  active: JobStatusSnapshot[];
+  settled: JobStatusSnapshot[];
+  forbidden: string[];
+  not_found: string[];
+  failed: Array<{ job_id: string; message: string }>;
+  requested: number;
+  active_count: number;
+  settled_count: number;
+};
+
+type DashboardSummaryResponse = {
+  stats: DashboardStat;
+  updates: JobStatusSnapshot[];
+  forbidden: string[];
+  not_found: string[];
+  failed: Array<{ job_id: string; message: string }>;
+  requested: number;
+  ok: number;
+};
+
 type ModelCapability = {
   model_id: ModelId;
   label: string;
@@ -1301,6 +1345,33 @@ class ApiClient {
     });
   }
 
+  batchMeta(jobs: JobAccessRef[], fields?: string[], signal?: AbortSignal) {
+    return this.request<BatchMetaResponse>("/jobs/batch-meta", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ jobs, fields }),
+      signal,
+    });
+  }
+
+  activeJobs(jobs: JobAccessRef[], limit = 100, signal?: AbortSignal) {
+    return this.request<ActiveJobsResponse>("/jobs/active", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ jobs, limit }),
+      signal,
+    });
+  }
+
+  dashboardSummary(jobs: JobAccessRef[], limit = 200, signal?: AbortSignal) {
+    return this.request<DashboardSummaryResponse>("/dashboard/summary", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ jobs, limit }),
+      signal,
+    });
+  }
+
   getJobRequest(job_id: string, jobToken?: string, signal?: AbortSignal) {
     return this.request<any>(`/jobs/${encodeURIComponent(job_id)}/request`, {
       method: "GET",
@@ -2001,33 +2072,87 @@ function useDashboardData() {
         .sort((a, b) => (new Date(b.created_at).getTime() || 0) - (new Date(a.created_at).getTime() || 0));
 
       // limit number of fetches for v1
-      const MAX = list.length > 200 ? 50 : Math.min(200, list.length);
+      const MAX = list.length > 200 ? 50 : Math.max(1, Math.min(200, list.length));
       const subset = list.slice(0, MAX);
 
-      const metas = await mapLimit(subset, clamp(settings.polling.concurrency || 5, 1, 12), async (rec) => {
-        try {
-          const meta = await client.getJob(rec.job_id, rec.job_access_token);
-          // update cache fields
-          useJobsStore.getState().updateJob(rec.job_id, {
-            status_cache: (meta.status || rec.status_cache || "UNKNOWN") as JobStatus,
-            last_seen_at: isoNow(),
-            ...jobTimingPatch(meta),
-          });
-          return meta;
-        } catch (e: any) {
-          // do not fail the page
-          return null;
-        }
-      });
+      const refs: JobAccessRef[] = subset.map((rec) => ({
+        job_id: rec.job_id,
+        job_access_token: rec.job_access_token,
+      }));
 
-      // align metas array with sorted list indexing in computeDashboard
-      // computeDashboard expects metas aligned with sorted jobs (same indices)
-      const alignedMetas: Array<JobMeta | null> = [];
-      for (let i = 0; i < list.length; i++) {
-        alignedMetas.push(i < subset.length ? metas[i] : null);
+      let computed: DashboardStat | null = null;
+
+      try {
+        const summary = await client.dashboardSummary(refs, MAX);
+        if (summary?.stats) {
+          computed = summary.stats;
+        }
+        (summary?.updates || []).forEach((u) => {
+          useJobsStore.getState().updateJob(u.job_id, {
+            status_cache: (u.status || "UNKNOWN") as JobStatus,
+            model_cache: (u.model as ModelId) || undefined,
+            last_seen_at: isoNow(),
+            ...jobTimingPatch({ job_id: u.job_id, timing: u.timing || {} } as JobMeta),
+          });
+        });
+      } catch {
+        // backward compatibility: old backend without summary endpoint
       }
 
-      const computed = computeDashboard(list, alignedMetas);
+      if (!computed) {
+        let metas: Array<JobMeta | null> | null = null;
+        try {
+          const batch = await client.batchMeta(refs, [
+            "job_id",
+            "status",
+            "model",
+            "created_at",
+            "updated_at",
+            "params",
+            "timing",
+            "usage",
+            "billing",
+            "response",
+            "error",
+          ]);
+          const byId = new Map<string, JobMeta>();
+          (batch.items || []).forEach((it) => {
+            byId.set(it.job_id, it.meta);
+            useJobsStore.getState().updateJob(it.job_id, {
+              status_cache: (it.meta?.status || "UNKNOWN") as JobStatus,
+              model_cache: (it.meta?.model as ModelId) || undefined,
+              last_seen_at: isoNow(),
+              ...jobTimingPatch(it.meta),
+            });
+          });
+          metas = subset.map((rec) => byId.get(rec.job_id) || null);
+        } catch {
+          // old backend fallback
+        }
+
+        if (!metas) {
+          metas = await mapLimit(subset, clamp(settings.polling.concurrency || 5, 1, 12), async (rec) => {
+            try {
+              const meta = await client.getJob(rec.job_id, rec.job_access_token);
+              useJobsStore.getState().updateJob(rec.job_id, {
+                status_cache: (meta.status || rec.status_cache || "UNKNOWN") as JobStatus,
+                last_seen_at: isoNow(),
+                ...jobTimingPatch(meta),
+              });
+              return meta;
+            } catch (e: any) {
+              return null;
+            }
+          });
+        }
+
+        const alignedMetas: Array<JobMeta | null> = [];
+        for (let i = 0; i < list.length; i++) {
+          alignedMetas.push(i < subset.length ? metas[i] : null);
+        }
+        computed = computeDashboard(list, alignedMetas);
+      }
+
       setStats(computed);
       storageSet(
         KEY_DASH_CACHE,
@@ -3363,6 +3488,12 @@ function HistoryPage() {
     const start = (safePage - 1) * pageSize;
     return filtered.slice(start, start + pageSize);
   }, [filtered, safePage, pageSize]);
+  const autoRefreshTargets = useMemo(() => {
+    if (hasActiveJobs) {
+      return filtered.filter((j) => isActiveJobStatus(j.status_cache || "UNKNOWN")).slice(0, 50);
+    }
+    return pagedItems.slice(0, Math.max(15, Math.min(pageSize, 50)));
+  }, [hasActiveJobs, filtered, pagedItems, pageSize]);
   const groupedPagedItems = useMemo<HistoryBatchGroup[]>(() => {
     const grouped = new Map<string, HistoryBatchGroup>();
     for (const rec of pagedItems) {
@@ -3427,14 +3558,54 @@ function HistoryPage() {
     setManualAutoRefresh(next);
   };
 
-  // Auto refresh visible jobs status
+  // Auto refresh statuses with batch API.
   useEffect(() => {
     if (!autoRefresh) return;
 
     const controller = new AbortController();
     const tick = async () => {
-      const visible = pagedItems.slice(0, Math.max(15, Math.min(pageSize, 50)));
-      await mapLimit(visible, clamp(settings.polling.concurrency || 5, 1, 12), async (rec) => {
+      if (!autoRefreshTargets.length) return;
+
+      const refs: JobAccessRef[] = autoRefreshTargets.map((rec) => ({
+        job_id: rec.job_id,
+        job_access_token: rec.job_access_token,
+      }));
+
+      const applySnap = (snap: JobStatusSnapshot) => {
+        const rec = autoRefreshTargets.find((x) => x.job_id === snap.job_id);
+        updateJob(snap.job_id, {
+          status_cache: (snap.status || rec?.status_cache || "UNKNOWN") as JobStatus,
+          model_cache: (snap.model as ModelId) || rec?.model_cache,
+          last_seen_at: isoNow(),
+          ...jobTimingPatch({ job_id: snap.job_id, timing: snap.timing || {} } as JobMeta),
+        });
+      };
+
+      try {
+        const payload = await client.activeJobs(refs, 100, controller.signal);
+        (payload.active || []).forEach(applySnap);
+        (payload.settled || []).forEach(applySnap);
+        return;
+      } catch {
+        // backward compatibility: old backend without active batch endpoint
+      }
+
+      try {
+        const batch = await client.batchMeta(refs, ["job_id", "status", "model", "timing"], controller.signal);
+        (batch.items || []).forEach((it) => {
+          applySnap({
+            job_id: it.job_id,
+            status: it.meta?.status,
+            model: it.meta?.model,
+            timing: it.meta?.timing,
+          });
+        });
+        return;
+      } catch {
+        // backward compatibility: old backend without batch endpoint
+      }
+
+      await mapLimit(autoRefreshTargets, clamp(settings.polling.concurrency || 5, 1, 12), async (rec) => {
         try {
           const meta = await client.getJob(rec.job_id, rec.job_access_token, controller.signal);
           updateJob(rec.job_id, {
@@ -3456,7 +3627,7 @@ function HistoryPage() {
       clearInterval(t);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [autoRefresh, pagedItems, pageSize, settings.baseUrl, settings.polling.intervalMs, settings.polling.concurrency]);
+  }, [autoRefresh, autoRefreshTargets, settings.baseUrl, settings.polling.intervalMs, settings.polling.concurrency]);
 
   const selectJob = (id: string) => {
     setSearchParams((prev) => {
