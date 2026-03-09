@@ -73,6 +73,11 @@ test.describe.serial("Batch page", () => {
     await page.getByPlaceholder("Q2-Deck / Chapter-03 / Storyboard-A").fill("Spec Deck");
     await page.getByText("?").first().hover();
     await expect(page.getByText("历史记录会用它来标记同一批次")).toBeVisible();
+    await page.getByRole("button", { name: /Submit Batch \(1\)/ }).click();
+    await expect(page.getByText("global_prompt 不能为空")).toBeVisible();
+    await page
+      .getByPlaceholder("例如：cinematic editorial lighting, crisp composition, premium presentation quality")
+      .fill("default global prompt");
 
     await sectionSelect(page, 1, 1).selectOption("16:9");
     await sectionSelect(page, 1, 2).selectOption({ label: "2K" });
@@ -82,10 +87,10 @@ test.describe.serial("Batch page", () => {
     await expect(sectionSlider(page, 1, 0)).toHaveValue("3");
 
     await page.getByRole("button", { name: "Add Section" }).click();
-    await expect(sectionSelect(page, 2, 1)).toHaveValue("16:9");
-    await expect(sectionSelect(page, 2, 2)).toHaveValue("2K");
-    await expect(sectionSelect(page, 2, 3)).toHaveValue("EXISTING");
-    await expect(sectionSlider(page, 2, 0)).toHaveValue("3");
+    await expect(sectionSelect(page, 2, 1)).toHaveValue("1:1");
+    await expect(sectionSelect(page, 2, 2)).toHaveValue("1K");
+    await expect(sectionSelect(page, 2, 3)).toHaveValue("AUTO_BATCH");
+    await expect(sectionSlider(page, 2, 0)).toHaveValue("1");
   });
 
   test("supports existing session search, reverse chronological order, multiselect, and instant creation", async ({ page }) => {
@@ -132,8 +137,9 @@ test.describe.serial("Batch page", () => {
     await page.getByRole("button", { name: "Add Section" }).click();
     await fillSectionBasics(page, 2, {
       title: "Closing",
-      prompt: "final frame",
+      prompt: "",
     });
+    await setSectionJobCount(page, 2, 3);
 
     await expect(page.getByText("Prompt Preview").first()).toBeVisible();
     await expect(page.locator("pre").first()).toContainText("global look PW Batch");
@@ -141,8 +147,8 @@ test.describe.serial("Batch page", () => {
     await expect(page.getByText("PW Batch-P1-Intro")).toBeVisible();
     await expect(page.getByText("PW Batch-P2-Closing")).toBeVisible();
 
-    await page.getByRole("button", { name: /Submit Batch \(2\)/ }).click();
-    await expect(page.getByText("Batch queued 2/2")).toBeVisible({ timeout: 120000 });
+    await page.getByRole("button", { name: /Submit Batch \(4\)/ }).click();
+    await expect(page.getByText("Batch queued 4/4")).toBeVisible({ timeout: 120000 });
     if (!page.url().includes("/history")) {
       await page.getByRole("link", { name: "History" }).click();
     }
@@ -172,6 +178,18 @@ test.describe.serial("Batch page", () => {
       null,
       { timeout: 90000 }
     );
+    await page.waitForFunction(
+      () => {
+        const sessions = JSON.parse(localStorage.getItem("nbp_picker_sessions_v1") || "[]");
+        const intro = sessions.find((item) => item.name === "PW Batch-P1-Intro");
+        const closing = sessions.find((item) => item.name === "PW Batch-P2-Closing");
+        const introHasImage = (intro?.items || []).some((entry) => Boolean(entry.image_id));
+        const closingStillPending = (closing?.items || []).some((entry) => !entry.image_id);
+        return introHasImage && closingStillPending;
+      },
+      null,
+      { timeout: 90000 }
+    );
     const sessionsAfter = await page.evaluate(() => JSON.parse(localStorage.getItem("nbp_picker_sessions_v1") || "[]"));
     const hydrated = sessionsAfter.filter((item) => item.name.startsWith("PW Batch-P"));
     expect(
@@ -184,6 +202,9 @@ test.describe.serial("Batch page", () => {
     await clearLocalData(page);
 
     await page.getByPlaceholder("Q2-Deck / Chapter-03 / Storyboard-A").fill("User Guard");
+    await page
+      .getByPlaceholder("例如：cinematic editorial lighting, crisp composition, premium presentation quality")
+      .fill("shared global prompt");
     await fillSectionBasics(page, 1, {
       title: "Guard",
       prompt: "guard prompt",
@@ -201,6 +222,9 @@ test.describe.serial("Batch page", () => {
     });
 
     await page.getByPlaceholder("Q2-Deck / Chapter-03 / Storyboard-A").fill("User Batch");
+    await page
+      .getByPlaceholder("例如：cinematic editorial lighting, crisp composition, premium presentation quality")
+      .fill("shared global prompt");
     await fillSectionBasics(page, 1, {
       title: "Quota",
       prompt: "quota prompt",

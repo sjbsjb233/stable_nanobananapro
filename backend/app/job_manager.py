@@ -52,6 +52,91 @@ class JobManager:
             t.start()
             self._workers.append(t)
 
+    def fail_incomplete_jobs_on_startup(self) -> int:
+        recovered = 0
+        for summary in storage.iter_job_meta():
+            job_id = str(summary.get("job_id") or "")
+            previous_status = str(summary.get("status") or "")
+            if not job_id or previous_status not in {JobStatus.QUEUED.value, JobStatus.RUNNING.value}:
+                continue
+            try:
+                meta = storage.load_meta(job_id)
+            except Exception:
+                logger.exception("Failed to load lingering job during startup recovery: job_id=%s", job_id)
+                continue
+
+            current_status = str(meta.get("status") or "")
+            if current_status not in {JobStatus.QUEUED.value, JobStatus.RUNNING.value}:
+                continue
+
+            finished_at = self._utcnow()
+            debug_id = str(uuid.uuid4())
+            message = (
+                "Job was interrupted by backend restart before completion and has been marked as failed. "
+                "Please retry."
+            )
+            usage = {
+                "prompt_token_count": 0,
+                "cached_content_token_count": 0,
+                "candidates_token_count": 0,
+                "thoughts_token_count": 0,
+                "total_token_count": 0,
+            }
+            billing = estimate_job_cost(
+                usage=usage,
+                image_size=str((meta.get("params") or {}).get("image_size") or "1K"),
+                image_count=0,
+                image_token_count=None,
+            )
+            response_payload = {
+                "latency_ms": 0,
+                "finish_reason": "OTHER",
+                "safety_ratings": [],
+                "raw_summary": {
+                    "parts_count": 0,
+                    "has_inline_image": False,
+                },
+                "upstream_error": {
+                    "reason": "BACKEND_RESTART_RECOVERY",
+                    "previous_status": current_status,
+                },
+            }
+            storage.save_response(job_id, response_payload)
+
+            self._hydrate_finished_timing(meta, finished_at, 0)
+            meta["status"] = JobStatus.FAILED
+            meta["updated_at"] = finished_at.isoformat()
+            meta["result"] = {"images": []}
+            meta["usage"] = usage
+            meta["billing"] = billing
+            meta["response"] = {
+                "latency_ms": 0,
+                "finish_reason": "OTHER",
+                "safety_ratings": [],
+            }
+            meta["error"] = {
+                "code": "BACKEND_RESTART_RECOVERY",
+                "type": "SYSTEM_RESTART",
+                "message": message,
+                "retryable": True,
+                "debug_id": debug_id,
+                "details": {
+                    "previous_status": current_status,
+                    "recovery_action": "MARK_AS_FAILED_ON_STARTUP",
+                },
+            }
+            storage.save_meta(job_id, meta)
+            storage.write_job_log(job_id, f"Job recovered as failed after backend restart (previous_status={current_status})")
+
+            owner = meta.get("owner") if isinstance(meta.get("owner"), dict) else {}
+            if owner.get("user_id"):
+                user_store.record_job_failure(str(owner["user_id"]))
+            recovered += 1
+
+        if recovered:
+            logger.warning("Recovered lingering jobs on startup: count=%s", recovered)
+        return recovered
+
     def stop(self) -> None:
         self._stop_event.set()
         for _ in self._workers:

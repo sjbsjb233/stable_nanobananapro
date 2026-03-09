@@ -1090,7 +1090,7 @@ function createBatchSectionDraft(args: {
     collection_mode: source?.collection_mode || args.defaultCollectionMode,
     collection_name: "",
     existing_session_ids: [],
-    inherit_previous_settings: Boolean(source),
+    inherit_previous_settings: false,
     enabled: true,
   };
 }
@@ -4351,6 +4351,23 @@ function BatchCreatePage() {
     );
   };
 
+  const makeDefaultSection = (seed?: Partial<BatchSection>) => ({
+    ...createBatchSectionDraft({
+      fallbackModel: globalModel,
+      settings,
+      defaultCollectionMode: defaultCollectionStrategy,
+    }),
+    section_model: globalModel,
+    section_aspect_ratio: globalAspect,
+    section_image_size: globalSize,
+    section_temperature: globalTemperature,
+    section_job_count: globalJobCount,
+    collection_mode: defaultCollectionStrategy,
+    inherit_previous_settings: false,
+    ...(seed || {}),
+    id: createDraftId("sec"),
+  });
+
   const toggleSelectedSection = (sectionId: string, checked: boolean) => {
     setSelectedSectionIds((prev) => {
       if (checked) return Array.from(new Set([sectionId, ...prev]));
@@ -4378,19 +4395,9 @@ function BatchCreatePage() {
 
   const addSection = (seed?: Partial<BatchSection>) => {
     setSections((prev) => {
-      const previous = prev[prev.length - 1] || null;
       return [
         ...prev,
-        {
-          ...createBatchSectionDraft({
-            fallbackModel: globalModel,
-            settings,
-            defaultCollectionMode: defaultCollectionStrategy,
-            previous,
-          }),
-          ...(seed || {}),
-          id: createDraftId("sec"),
-        },
+        makeDefaultSection(seed),
       ];
     });
   };
@@ -4429,11 +4436,7 @@ function BatchCreatePage() {
       return next.length
         ? next
         : [
-            createBatchSectionDraft({
-              fallbackModel: globalModel,
-              settings,
-              defaultCollectionMode: defaultCollectionStrategy,
-            }),
+            makeDefaultSection(),
           ];
     });
     setSelectedSectionIds([]);
@@ -4526,6 +4529,7 @@ function BatchCreatePage() {
 
   const validateBatch = () => {
     if (!batchName.trim()) return "batch_name 不能为空";
+    if (!globalPrompt.trim()) return "global_prompt 不能为空";
     if (!sections.length) return "至少需要 1 个分区";
     if (globalFiles.length > MAX_REF_FILES) return `全局参考图最多 ${MAX_REF_FILES} 张`;
     if (globalFiles.some((file) => !file.type.startsWith("image/"))) return "全局参考图必须是 image/*";
@@ -4536,7 +4540,6 @@ function BatchCreatePage() {
     if (totalPlannedJobs > 100) return "批量提交总任务数暂时需控制在 100 以内";
     for (const item of plannedSections) {
       const section = item.section;
-      if (!section.section_prompt.trim()) return `第 ${item.displayIndex} 分区的 prompt 不能为空`;
       if (section.section_reference_images.length > MAX_REF_FILES) {
         return `第 ${item.displayIndex} 分区参考图最多 ${MAX_REF_FILES} 张`;
       }
@@ -4827,11 +4830,7 @@ function BatchCreatePage() {
                   setGlobalPrompt("");
                   setGlobalFiles([]);
                   setSections([
-                    createBatchSectionDraft({
-                      fallbackModel: globalModel,
-                      settings,
-                      defaultCollectionMode: defaultCollectionStrategy,
-                    }),
+                    makeDefaultSection(),
                   ]);
                   setSelectedSectionIds([]);
                   push({ kind: "info", title: "已重置批量草稿" });
@@ -5116,11 +5115,7 @@ function BatchCreatePage() {
                             return next.length
                               ? next
                               : [
-                                  createBatchSectionDraft({
-                                    fallbackModel: globalModel,
-                                    settings,
-                                    defaultCollectionMode: defaultCollectionStrategy,
-                                  }),
+                                  makeDefaultSection(),
                                 ];
                           });
                           setSelectedSectionIds((prev) => prev.filter((id) => id !== section.id));
@@ -6239,6 +6234,7 @@ function PickerSessionJobSync() {
               }))
             );
           });
+          hydratedJobsRef.current[entry.job_id] = true;
         } else {
           entry.placeholders.forEach(({ session_id, key }) => {
             patchSession(session_id, (session) => ({
@@ -6251,7 +6247,6 @@ function PickerSessionJobSync() {
             }));
           });
         }
-        hydratedJobsRef.current[entry.job_id] = true;
       } catch {
         // keep placeholder and retry later
       } finally {
@@ -6451,6 +6446,17 @@ function PendingSessionDirectHydrator() {
                     status: "SUCCEEDED" as JobStatus,
                   }))
                 );
+              });
+            } else {
+              entry.placeholders.forEach(({ session_id, key }) => {
+                patchSession(session_id, (session) => ({
+                  ...session,
+                  items: session.items.map((item) =>
+                    pickerItemKey(item) === key
+                      ? { ...item, status: "SUCCEEDED", notes: item.notes || "结果已完成，等待图片清单同步" }
+                      : item
+                  ),
+                }));
               });
             }
             return;

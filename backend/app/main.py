@@ -99,11 +99,13 @@ def _startup() -> None:
     setup_logging()
     ensure_data_dirs()
     user_store.ensure_initialized()
+    recovered_jobs = job_manager.fail_incomplete_jobs_on_startup()
     logger.info(
-        "Backend startup: version=%s deployed_at=%s data_dir=%s",
+        "Backend startup: version=%s deployed_at=%s data_dir=%s recovered_jobs=%s",
         settings.app_version,
         APP_DEPLOYED_AT.isoformat(),
         settings.data_dir,
+        recovered_jobs,
     )
     job_manager.start()
 

@@ -10,6 +10,7 @@ from fastapi.testclient import TestClient
 
 from app.config import settings
 from app.gemini_client import GeminiError
+from app.job_manager import job_manager
 from app.main import app
 from app.rate_limiter import InMemoryRateLimiter
 from app.storage import storage
@@ -494,6 +495,99 @@ def test_running_concurrency_limit_queues_excess_jobs(client: TestClient, monkey
 
     assert final_statuses == ["SUCCEEDED", "SUCCEEDED", "SUCCEEDED"]
     assert max_active_calls == 1
+
+
+def test_startup_recovery_marks_lingering_jobs_failed(client: TestClient) -> None:
+    login(client)
+    admin = user_store.get_user_by_username("admin")
+    assert admin is not None
+
+    created_at = "2026-03-09T10:00:00+08:00"
+    queued_job_id = "a" * 32
+    running_job_id = "b" * 32
+
+    for job_id, status, started_at in (
+        (queued_job_id, "QUEUED", None),
+        (running_job_id, "RUNNING", "2026-03-09T10:00:05+08:00"),
+    ):
+        storage.create_job_dirs(job_id)
+        storage.save_request(
+            job_id,
+            {
+                "prompt": f"recover {job_id}",
+                "reference_images": [],
+            },
+        )
+        storage.save_meta(
+            job_id,
+            {
+                "job_id": job_id,
+                "created_at": created_at,
+                "updated_at": started_at or created_at,
+                "status": status,
+                "model": settings.default_model,
+                "mode": "IMAGE_ONLY",
+                "params": {
+                    "aspect_ratio": "1:1",
+                    "image_size": "1K",
+                    "thinking_level": None,
+                    "temperature": 0.7,
+                    "timeout_sec": 60,
+                    "max_retries": 1,
+                },
+                "result": {"images": []},
+                "usage": {
+                    "prompt_token_count": 0,
+                    "cached_content_token_count": 0,
+                    "candidates_token_count": 0,
+                    "thoughts_token_count": 0,
+                    "total_token_count": 0,
+                },
+                "billing": {
+                    "currency": "USD",
+                    "estimated_cost_usd": 0.0,
+                    "breakdown": {
+                        "text_input_cost_usd": 0.0,
+                        "text_output_cost_usd": 0.0,
+                        "image_output_cost_usd": 0.0,
+                    },
+                    "pricing_version": "2026-01-12",
+                    "pricing_notes": "computed from official pricing table",
+                },
+                "error": None,
+                "owner": {
+                    "user_id": admin["user_id"],
+                    "username": admin["username"],
+                    "role": admin["role"],
+                },
+                "timing": {
+                    "queued_at": created_at,
+                    "started_at": started_at,
+                    "finished_at": None,
+                    "queue_wait_ms": None,
+                    "run_duration_ms": None,
+                },
+            },
+        )
+
+    recovered = job_manager.fail_incomplete_jobs_on_startup()
+    assert recovered == 2
+
+    queued_meta_resp = client.get(f"/v1/jobs/{queued_job_id}")
+    running_meta_resp = client.get(f"/v1/jobs/{running_job_id}")
+    assert queued_meta_resp.status_code == 200
+    assert running_meta_resp.status_code == 200
+
+    queued_meta = queued_meta_resp.json()
+    running_meta = running_meta_resp.json()
+    for meta, previous_status in ((queued_meta, "QUEUED"), (running_meta, "RUNNING")):
+        assert meta["status"] == "FAILED"
+        assert meta["error"]["code"] == "BACKEND_RESTART_RECOVERY"
+        assert meta["error"]["type"] == "SYSTEM_RESTART"
+        assert "backend restart" in meta["error"]["message"]
+        assert meta["error"]["details"]["previous_status"] == previous_status
+        assert meta["error"]["details"]["recovery_action"] == "MARK_AS_FAILED_ON_STARTUP"
+        assert meta["timing"]["finished_at"] is not None
 
 
 def test_created_jobs_consume_quota_and_trigger_daily_turnstile(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
