@@ -712,6 +712,59 @@ function cn(...xs: Array<string | false | null | undefined>) {
   return xs.filter(Boolean).join(" ");
 }
 
+const ADMIN_USERNAME_PATTERN = /^[a-zA-Z0-9_.-]{3,32}$/;
+
+function toValidationFieldLabel(path: string) {
+  switch (path) {
+    case "username":
+      return "用户名";
+    case "password":
+      return "密码";
+    case "role":
+      return "角色";
+    case "enabled":
+      return "启用状态";
+    case "policy_overrides.daily_image_limit":
+      return "daily_image_limit";
+    case "policy_overrides.concurrent_jobs_limit":
+      return "concurrent_jobs_limit";
+    case "policy_overrides.turnstile_job_count_threshold":
+      return "turnstile_job_count_threshold";
+    case "policy_overrides.turnstile_daily_usage_threshold":
+      return "turnstile_daily_usage_threshold";
+    case "policy_overrides.daily_image_access_limit":
+      return "daily_image_access_limit";
+    case "policy_overrides.image_access_turnstile_bonus_quota":
+      return "image_access_turnstile_bonus_quota";
+    case "policy_overrides.daily_image_access_hard_limit":
+      return "daily_image_access_hard_limit";
+    default:
+      return path || "字段";
+  }
+}
+
+function formatValidationIssues(details: any) {
+  const issues = Array.isArray(details?.issues) ? details.issues : [];
+  if (!issues.length) return null;
+  const messages = issues
+    .map((issue: any) => {
+      const path = Array.isArray(issue?.loc)
+        ? issue.loc.filter((part: unknown) => part !== "body").map(String).join(".")
+        : "";
+      const label = toValidationFieldLabel(path);
+      const message = String(issue?.msg || issue?.message || "输入不合法");
+      return `${label}: ${message}`;
+    })
+    .filter(Boolean);
+  return messages.length ? messages.join("；") : null;
+}
+
+function getApiErrorMessage(error: any, fallback: string) {
+  const validationMessage = formatValidationIssues(error?.error?.details);
+  if (validationMessage) return validationMessage;
+  return error?.error?.message || fallback;
+}
+
 // concurrency-limited map
 async function mapLimit<T, R>(items: T[], limit: number, fn: (t: T, i: number) => Promise<R>) {
   const out: R[] = new Array(items.length);
@@ -768,14 +821,14 @@ const DEFAULT_PARAMS_TEMPLATE: DefaultParams = {
   aspect_ratio: "1:1",
   image_size: "1K",
   thinking_level: null,
-  temperature: 0.7,
-  timeout_sec: 120,
-  max_retries: 1,
+  temperature: 1,
+  timeout_sec: 400,
+  max_retries: 0,
 };
 
 const DEFAULT_SETTINGS: SettingsV1 = {
   baseUrl: RUNTIME_BASE_URL || ENV_BASE_URL || FALLBACK_BASE_URL,
-  defaultModel: "gemini-3-pro-image-preview",
+  defaultModel: "gemini-3.1-flash-image-preview",
   jobAuthMode: "TOKEN",
   adminModeEnabled: false,
   adminKey: "",
@@ -796,7 +849,7 @@ const DEFAULT_SETTINGS: SettingsV1 = {
 };
 
 const FALLBACK_MODEL_CATALOG: ModelsPayload = {
-  default_model: "gemini-3-pro-image-preview",
+  default_model: "gemini-3.1-flash-image-preview",
   models: [
     {
       model_id: "gemini-3.1-flash-image-preview",
@@ -809,7 +862,7 @@ const FALLBACK_MODEL_CATALOG: ModelsPayload = {
       supported_aspect_ratios: ["1:1", "1:4", "1:8", "2:3", "3:2", "3:4", "4:1", "4:3", "4:5", "5:4", "8:1", "9:16", "16:9", "21:9"],
       supported_image_sizes: ["512", "1K", "2K", "4K"],
       supported_thinking_levels: ["Minimal", "High"],
-      default_params: { aspect_ratio: "1:1", image_size: "1K", thinking_level: "High", temperature: 0.7, timeout_sec: 120, max_retries: 1 },
+      default_params: { aspect_ratio: "1:1", image_size: "1K", thinking_level: "High", temperature: 1, timeout_sec: 400, max_retries: 0 },
     },
     {
       model_id: "gemini-2.5-flash-image",
@@ -822,7 +875,7 @@ const FALLBACK_MODEL_CATALOG: ModelsPayload = {
       supported_aspect_ratios: ["1:1", "1:4", "1:8", "2:3", "3:2", "3:4", "4:1", "4:3", "4:5", "5:4", "8:1", "9:16", "16:9", "21:9"],
       supported_image_sizes: [],
       supported_thinking_levels: [],
-      default_params: { aspect_ratio: "1:1", image_size: "AUTO", thinking_level: null, temperature: 0.7, timeout_sec: 120, max_retries: 1 },
+      default_params: { aspect_ratio: "1:1", image_size: "AUTO", thinking_level: null, temperature: 1, timeout_sec: 400, max_retries: 0 },
     },
     {
       model_id: "gemini-3-pro-image-preview",
@@ -835,7 +888,7 @@ const FALLBACK_MODEL_CATALOG: ModelsPayload = {
       supported_aspect_ratios: ["1:1", "1:4", "1:8", "2:3", "3:2", "3:4", "4:1", "4:3", "4:5", "5:4", "8:1", "9:16", "16:9", "21:9"],
       supported_image_sizes: ["1K", "2K", "4K"],
       supported_thinking_levels: [],
-      default_params: { aspect_ratio: "1:1", image_size: "1K", thinking_level: null, temperature: 0.7, timeout_sec: 120, max_retries: 1 },
+      default_params: { aspect_ratio: "1:1", image_size: "1K", thinking_level: null, temperature: 1, timeout_sec: 400, max_retries: 0 },
     },
   ],
 };
@@ -2328,6 +2381,70 @@ function TurnstilePromptModal({
   );
 }
 
+function HelpTip({ text }: { text: string }) {
+  return (
+    <span className="group relative inline-flex align-middle">
+      <span className="inline-flex h-4 w-4 cursor-help items-center justify-center rounded-full border border-zinc-300 bg-white text-[10px] font-bold text-zinc-500 shadow-sm dark:border-white/15 dark:bg-zinc-900 dark:text-zinc-300">
+        ?
+      </span>
+      <span className="pointer-events-none absolute left-1/2 top-[calc(100%+8px)] z-20 hidden w-56 -translate-x-1/2 rounded-2xl border border-zinc-200 bg-white px-3 py-2 text-[11px] font-medium leading-5 text-zinc-700 shadow-xl group-hover:block dark:border-white/10 dark:bg-zinc-950 dark:text-zinc-200">
+        {text}
+      </span>
+    </span>
+  );
+}
+
+function ModelRecommendationModal({
+  open,
+  targetLabel,
+  onPreferBest,
+  onKeepCurrent,
+  onClose,
+}: {
+  open: boolean;
+  targetLabel: string;
+  onPreferBest: () => void;
+  onKeepCurrent: () => void;
+  onClose: () => void;
+}) {
+  if (!open) return null;
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-zinc-950/55 px-4 backdrop-blur-sm">
+      <Card className="w-full max-w-xl border-amber-200 bg-[linear-gradient(180deg,rgba(255,251,235,0.98),rgba(255,255,255,0.98))] p-0 shadow-2xl dark:border-amber-400/20 dark:bg-[linear-gradient(180deg,rgba(39,39,42,0.98),rgba(9,9,11,0.98))]" hover={false}>
+        <div className="border-b border-amber-200/80 px-6 py-5 dark:border-amber-400/10">
+          <div className="text-[11px] font-black uppercase tracking-[0.24em] text-amber-700 dark:text-amber-300">Model Recommendation</div>
+          <div className="mt-2 text-2xl font-black text-zinc-950 dark:text-white">Nano Banana 2 更值得优先使用</div>
+          <div className="mt-2 text-sm leading-6 text-zinc-700 dark:text-zinc-300">
+            对普通用户来说，<span className="font-bold text-zinc-950 dark:text-white">Nano Banana 2</span> 通常比 Nano Banana Pro 和 Nano Banana 更均衡，
+            在效果、稳定性和默认体验上更推荐作为首选模型。
+          </div>
+        </div>
+        <div className="grid gap-3 px-6 py-5 md:grid-cols-[1.3fr_0.9fr]">
+          <div className="rounded-2xl border border-emerald-200 bg-emerald-50/80 p-4 dark:border-emerald-400/15 dark:bg-emerald-500/10">
+            <div className="text-xs font-black uppercase tracking-[0.2em] text-emerald-700 dark:text-emerald-300">Recommended</div>
+            <div className="mt-2 text-lg font-black text-zinc-950 dark:text-white">继续使用更好的 Nano Banana 2</div>
+            <div className="mt-2 text-sm text-zinc-700 dark:text-zinc-300">保持默认推荐模型，减少不必要的试错成本。</div>
+            <Button variant="primary" className="mt-4 w-full !py-3 text-base font-black" onClick={onPreferBest}>
+              用更好的 Nano Banana 2
+            </Button>
+          </div>
+          <div className="rounded-2xl border border-zinc-200 bg-zinc-50/80 p-4 dark:border-white/10 dark:bg-zinc-900/60">
+            <div className="text-xs font-bold uppercase tracking-[0.18em] text-zinc-500 dark:text-zinc-400">Alternative</div>
+            <div className="mt-2 text-sm font-bold text-zinc-900 dark:text-zinc-100">仍要使用 {targetLabel}</div>
+            <div className="mt-2 text-xs leading-5 text-zinc-600 dark:text-zinc-400">如果你明确知道自己要测试这个模型，也可以继续。</div>
+            <div className="mt-4 flex justify-end gap-2">
+              <Button variant="ghost" className="text-xs" onClick={onClose}>取消</Button>
+              <Button variant="secondary" className="text-xs" onClick={onKeepCurrent}>
+                仍要使用 {targetLabel}
+              </Button>
+            </div>
+          </div>
+        </div>
+      </Card>
+    </div>
+  );
+}
+
 type ImageAccessGuardContextValue = {
   runWithImageAccessTurnstile: <T>(runner: () => Promise<T>) => Promise<T>;
 };
@@ -2434,6 +2551,7 @@ function LoginPage() {
   const navigate = useNavigate();
   const { push } = useToast();
   const setSession = useAuthStore((s) => s.setSession);
+  const settings = useSettingsStore((s) => s.settings);
 
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
@@ -2503,7 +2621,7 @@ function LoginPage() {
         <Card className="border-zinc-900/10 bg-white/88 p-6 shadow-[0_32px_80px_rgba(15,23,42,0.14)] dark:border-white/10 dark:bg-zinc-950/85" hover={false}>
           <div className="text-sm font-semibold uppercase tracking-[0.22em] text-zinc-500 dark:text-zinc-400">Password Login</div>
           <div className="mt-2 text-2xl font-black text-zinc-950 dark:text-white">进入控制台</div>
-          <div className="mt-2 text-sm text-zinc-600 dark:text-zinc-300">当前后端地址：{ENV_BASE_URL || FALLBACK_BASE_URL}</div>
+          <div className="mt-2 text-sm text-zinc-600 dark:text-zinc-300">当前后端地址：{settings.baseUrl}</div>
 
           <div className="mt-6 space-y-4">
             <Field label="username">
@@ -3512,7 +3630,7 @@ function AdminPage() {
       await loadAdminData({ silent: true });
       push({ kind: "success", title: "系统策略已更新" });
     } catch (e: any) {
-      push({ kind: "error", title: "策略更新失败", message: e?.error?.message || "请检查输入" });
+      push({ kind: "error", title: "策略更新失败", message: getApiErrorMessage(e, "请检查输入") });
     } finally {
       setSavingPolicy(false);
     }
@@ -3541,7 +3659,7 @@ function AdminPage() {
       push({ kind: "success", title: `已更新 ${updated.username}` });
       await loadAdminData({ silent: true });
     } catch (e: any) {
-      push({ kind: "error", title: "用户更新失败", message: e?.error?.message || "请检查输入" });
+      push({ kind: "error", title: "用户更新失败", message: getApiErrorMessage(e, "请检查输入") });
     } finally {
       setSavingUser(false);
     }
@@ -3563,15 +3681,33 @@ function AdminPage() {
   };
 
   const createUser = async () => {
-    if (!newUsername.trim() || !newPassword.trim()) {
+    const username = newUsername.trim().toLowerCase();
+    const password = newPassword.trim();
+    if (!username || !password) {
       push({ kind: "error", title: "请填写新账号用户名与密码" });
+      return;
+    }
+    if (!ADMIN_USERNAME_PATTERN.test(username)) {
+      push({
+        kind: "error",
+        title: "创建用户失败",
+        message: "用户名必须为 3-32 位，只能包含字母、数字、下划线、点和短横线",
+      });
+      return;
+    }
+    if (password.length < 8 || password.length > 128) {
+      push({
+        kind: "error",
+        title: "创建用户失败",
+        message: "密码长度必须为 8-128 位",
+      });
       return;
     }
     setCreatingUser(true);
     try {
       await client.adminCreateUser({
-        username: newUsername.trim(),
-        password: newPassword.trim(),
+        username,
+        password,
         role: newRole,
         enabled: newEnabled,
         policy_overrides: {
@@ -3598,7 +3734,7 @@ function AdminPage() {
       await loadAdminData({ silent: true });
       push({ kind: "success", title: "新用户已创建" });
     } catch (e: any) {
-      push({ kind: "error", title: "创建用户失败", message: e?.error?.message || "请检查输入" });
+      push({ kind: "error", title: "创建用户失败", message: getApiErrorMessage(e, "请检查输入") });
     } finally {
       setCreatingUser(false);
     }
@@ -3869,9 +4005,16 @@ function CreateJobPage() {
   const [generationTurnstileKey, setGenerationTurnstileKey] = useState(0);
   const [verifyingGenerationTurnstile, setVerifyingGenerationTurnstile] = useState(false);
   const [pendingGenerationTargetCount, setPendingGenerationTargetCount] = useState<number | null>(null);
+  const [modelRecommendationOpen, setModelRecommendationOpen] = useState(false);
+  const [pendingModelChoice, setPendingModelChoice] = useState<ModelId | null>(null);
   const hydratedModelRef = useRef<ModelId | null>(null);
   const lastPasteAtRef = useRef<number>(0);
   const MAX_REF_FILES = 14;
+  const recommendedModelId: ModelId = "gemini-3.1-flash-image-preview";
+  const discouragedModels = useMemo<ModelId[]>(
+    () => ["gemini-3-pro-image-preview", "gemini-2.5-flash-image"],
+    []
+  );
 
   const currentModel = useMemo(() => {
     return (
@@ -3880,6 +4023,25 @@ function CreateJobPage() {
       catalog.models[0]
     );
   }, [catalog, model]);
+  const pendingModelMeta = useMemo(
+    () => catalog.models.find((m) => m.model_id === pendingModelChoice) || null,
+    [catalog.models, pendingModelChoice]
+  );
+
+  const applyModelChoice = (nextModel: ModelId) => {
+    setModel(nextModel);
+    hydratedModelRef.current = null;
+  };
+
+  const handleModelChange = (nextModel: ModelId) => {
+    if (!nextModel || nextModel === model) return;
+    if (!isAdmin && discouragedModels.includes(nextModel) && nextModel !== recommendedModelId) {
+      setPendingModelChoice(nextModel);
+      setModelRecommendationOpen(true);
+      return;
+    }
+    applyModelChoice(nextModel);
+  };
 
   useEffect(() => {
     if (!currentModel) return;
@@ -4221,6 +4383,27 @@ function CreateJobPage() {
 
   return (
     <>
+      <ModelRecommendationModal
+        open={modelRecommendationOpen}
+        targetLabel={pendingModelMeta?.label || pendingModelChoice || "该模型"}
+        onPreferBest={() => {
+          setModelRecommendationOpen(false);
+          setPendingModelChoice(null);
+          applyModelChoice(recommendedModelId);
+        }}
+        onKeepCurrent={() => {
+          if (pendingModelChoice) {
+            applyModelChoice(pendingModelChoice);
+          }
+          setModelRecommendationOpen(false);
+          setPendingModelChoice(null);
+        }}
+        onClose={() => {
+          setModelRecommendationOpen(false);
+          setPendingModelChoice(null);
+        }}
+      />
+
       <TurnstilePromptModal
         open={generationModalOpen}
         title="需要二次验证"
@@ -4304,7 +4487,7 @@ function CreateJobPage() {
             <Field label="model">
               <Select
                 value={String(model)}
-                onChange={(v) => setModel(v as ModelId)}
+                onChange={(v) => handleModelChange(v as ModelId)}
                 options={catalog.models.map((m) => ({ value: m.model_id, label: `${m.label} (${m.model_id})` }))}
               />
             </Field>
@@ -4344,7 +4527,7 @@ function CreateJobPage() {
               </Field>
             ) : null}
 
-            <Field label={`temperature (${temperature.toFixed(2)})`}>
+            <Field label={<span className="inline-flex items-center gap-1.5">temperature ({temperature.toFixed(2)}) <HelpTip text="控制生成结果的随机性。数值越高，结果越发散；数值越低，结果越稳定、更贴近提示词。" /></span>}>
               <input
                 type="range"
                 min={0}
@@ -4356,7 +4539,7 @@ function CreateJobPage() {
               />
             </Field>
 
-            <Field label={`timeout_sec (${timeoutSec}s)`}>
+            <Field label={<span className="inline-flex items-center gap-1.5">timeout_sec ({timeoutSec}s) <HelpTip text="单次请求允许后端等待上游模型返回结果的最长时间。时间越长，越适合复杂任务，但等待也会更久。" /></span>}>
               <input
                 type="range"
                 min={15}
@@ -4368,7 +4551,7 @@ function CreateJobPage() {
               />
             </Field>
 
-            <Field label={`max_retries (${maxRetries})`}>
+            <Field label={<span className="inline-flex items-center gap-1.5">max_retries ({maxRetries}) <HelpTip text="当上游请求失败时，后端会自动重试的次数。设为 0 表示失败后立即返回，不再自动补试。" /></span>}>
               <input
                 type="range"
                 min={0}
@@ -4441,7 +4624,7 @@ function CreateJobPage() {
   );
 }
 
-function Field({ label, children }: { label: string; children: React.ReactNode }) {
+function Field({ label, children }: { label: React.ReactNode; children: React.ReactNode }) {
   return (
     <div>
       <div className="mb-1 text-xs font-semibold text-zinc-500 dark:text-zinc-400">{label}</div>
@@ -6124,10 +6307,25 @@ function PickerPage() {
   );
   const sessionQuery = searchParams.get("session") || "";
   const jobQuery = searchParams.get("job") || "";
+  const syncSessionParam = (sessionId: string | null) => {
+    const next = new URLSearchParams(searchParams);
+    if (sessionId) {
+      next.set("session", sessionId);
+    } else {
+      next.delete("session");
+    }
+    setSearchParams(next, { replace: true });
+  };
+  const setCurrentSessionAndUrl = (sessionId: string) => {
+    setCurrentSession(sessionId);
+    syncSessionParam(sessionId);
+  };
 
   useEffect(() => {
-    if (!sessions.length) createSession("默认挑选会话");
-  }, [sessions.length, createSession]);
+    if (sessions.length) return;
+    const id = createSession("默认挑选会话");
+    syncSessionParam(id);
+  }, [sessions.length, createSession, searchParams, setSearchParams]);
 
   useEffect(() => {
     imageStateRef.current = imageState;
@@ -6179,11 +6377,10 @@ function PickerPage() {
 
   useEffect(() => {
     if (!currentSessionId) return;
-    if (sessionQuery === currentSessionId) return;
-    const next = new URLSearchParams(searchParams);
-    next.set("session", currentSessionId);
-    setSearchParams(next, { replace: true });
-  }, [currentSessionId, sessionQuery, searchParams, setSearchParams]);
+    if (!sessionQuery || !sessions.some((s) => s.session_id === sessionQuery)) {
+      syncSessionParam(currentSessionId);
+    }
+  }, [currentSessionId, sessionQuery, sessions, searchParams, setSearchParams]);
 
   const jobsById = useMemo(() => {
     const m = new Map<string, JobRecord>();
@@ -6704,7 +6901,7 @@ function PickerPage() {
           <div className="min-w-[220px] flex-1">
             <Select
               value={currentSession.session_id}
-              onChange={setCurrentSession}
+              onChange={setCurrentSessionAndUrl}
               options={sessions.map((s) => ({ value: s.session_id, label: `${s.name} · ${s.items.length} 张` }))}
             />
           </div>
@@ -6713,7 +6910,7 @@ function PickerPage() {
             onClick={() => {
               const name = prompt("新会话名称：", `挑选会话 ${new Date().toLocaleDateString()}`);
               const id = createSession(name || undefined);
-              setCurrentSession(id);
+              syncSessionParam(id);
               push({ kind: "success", title: "已创建会话" });
             }}
           >
@@ -6733,7 +6930,9 @@ function PickerPage() {
             variant="danger"
             onClick={() => {
               if (!confirm("删除当前会话？")) return;
+              const nextSessionId = sessions.find((s) => s.session_id !== currentSession.session_id)?.session_id || null;
               deleteSession(currentSession.session_id);
+              syncSessionParam(nextSessionId);
             }}
             disabled={sessions.length <= 1}
           >

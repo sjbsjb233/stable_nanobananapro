@@ -74,7 +74,7 @@ app.add_middleware(
     allow_origins=[] if allow_origin_regex else cors_origins,
     allow_origin_regex=allow_origin_regex,
     allow_credentials=allow_credentials,
-    allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
+    allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=[
         "Content-Type",
         "Authorization",

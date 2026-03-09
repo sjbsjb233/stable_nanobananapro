@@ -79,6 +79,19 @@ def test_invalid_session_cookie_does_not_crash(client: TestClient) -> None:
     assert me.json()["error"]["code"] == "AUTH_REQUIRED"
 
 
+def test_cors_preflight_allows_patch_for_admin_endpoints(client: TestClient) -> None:
+    resp = client.options(
+        "/v1/admin/policy",
+        headers={
+            "Origin": "http://127.0.0.1:5173",
+            "Access-Control-Request-Method": "PATCH",
+        },
+    )
+    assert resp.status_code == 200
+    allow_methods = resp.headers.get("access-control-allow-methods", "")
+    assert "PATCH" in allow_methods
+
+
 def test_job_lifecycle(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
     def fake_generate_image(prompt, model, mode, params, reference_images):
         return {
