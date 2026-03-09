@@ -114,9 +114,36 @@ type JobRecord = {
   pinned?: boolean;
   tags?: string[];
   batch_id?: string;
+  batch_name?: string;
+  batch_note?: string;
   batch_size?: number;
   batch_index?: number;
+  section_index?: number;
+  section_title?: string;
+  linked_session_ids?: string[];
+  auto_remove_failed_from_picker?: boolean;
   deleted?: boolean;
+};
+
+type BatchCollectionMode = "NONE" | "EXISTING" | "AUTO_NEW" | "AUTO_BATCH";
+
+type BatchSubmitMode = "IMMEDIATE" | "STAGGERED";
+
+type BatchSection = {
+  id: string;
+  section_title: string;
+  section_prompt: string;
+  section_reference_images: File[];
+  section_model: ModelId;
+  section_aspect_ratio: AspectRatio;
+  section_image_size: ImageSize;
+  section_temperature: number;
+  section_job_count: number;
+  collection_mode: BatchCollectionMode;
+  collection_name: string;
+  existing_session_ids: string[];
+  inherit_previous_settings: boolean;
+  enabled: boolean;
 };
 
 type PickerCompareMode = "TWO" | "FOUR" | "FILMSTRIP";
@@ -129,14 +156,16 @@ type PickerItemRef = {
 };
 
 type PickerSessionItem = {
+  item_key?: string;
   job_id: string;
   job_access_token?: string;
-  image_id: string;
+  image_id?: string;
   pool?: "FILMSTRIP" | "PREFERRED";
   label?: string;
   rating?: number;
   picked?: boolean;
   notes?: string;
+  status?: JobStatus;
   added_at: string;
 };
 
@@ -560,6 +589,78 @@ function createBatchId() {
   return `batch_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
 }
 
+function createDraftId(prefix: string) {
+  return `${prefix}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+}
+
+const BATCH_NAME_TEMPLATE_DEFAULT = "{{batch_name}}-P{{page_no}}-{{section_title}}";
+
+const BATCH_COLLECTION_MODE_OPTIONS: Array<{ value: BatchCollectionMode; label: string }> = [
+  { value: "AUTO_BATCH", label: "Auto New Session (Batch Named)" },
+  { value: "AUTO_NEW", label: "Auto New Session" },
+  { value: "EXISTING", label: "Existing Session" },
+  { value: "NONE", label: "No Session" },
+];
+
+const BATCH_SUBMIT_MODE_OPTIONS: Array<{ value: BatchSubmitMode; label: string }> = [
+  { value: "IMMEDIATE", label: "Queue All Now" },
+  { value: "STAGGERED", label: "Queue Per Section" },
+];
+
+function renderTemplate(
+  template: string,
+  vars: {
+    batch_name: string;
+    page_no: string;
+    section_title: string;
+  }
+) {
+  const safeTitle = vars.section_title.trim() || "untitled";
+  return (template || "")
+    .replace(/\{\{\s*batch_name\s*\}\}/gi, vars.batch_name.trim() || "batch")
+    .replace(/\{\{\s*page_no\s*\}\}/gi, vars.page_no)
+    .replace(/\{\{\s*section_title\s*\}\}/gi, safeTitle);
+}
+
+function estimateBatchUnitCost(model: ModelId, size: ImageSize) {
+  const normalizedModel = String(model || "").toLowerCase();
+  const normalizedSize = String(size || "AUTO").toUpperCase();
+  const modelBase = normalizedModel.includes("3-pro")
+    ? 0.065
+    : normalizedModel.includes("3.1-flash-image-preview")
+      ? 0.035
+      : normalizedModel.includes("2.5-flash-image")
+        ? 0.028
+        : 0.032;
+  const sizeFactor =
+    normalizedSize === "512"
+      ? 0.7
+      : normalizedSize === "2K"
+        ? 1.5
+        : normalizedSize === "4K"
+          ? 2.2
+          : 1;
+  return modelBase * sizeFactor;
+}
+
+function batchPromptPreview(
+  globalPrompt: string,
+  sectionPrompt: string,
+  vars: {
+    batch_name: string;
+    page_no: string;
+    section_title: string;
+  },
+  autoInjectPageNo: boolean
+) {
+  const parts = [
+    renderTemplate(sectionPrompt, vars).trim(),
+    renderTemplate(globalPrompt, vars).trim(),
+    autoInjectPageNo ? `Page number: ${vars.page_no}` : "",
+  ].filter(Boolean);
+  return parts.join("\n\n");
+}
+
 function extractRunDurationMs(meta?: JobMeta | null, rec?: JobRecord | null) {
   const fromMeta = meta?.timing?.run_duration_ms;
   if (typeof fromMeta === "number" && Number.isFinite(fromMeta) && fromMeta >= 0) return fromMeta;
@@ -643,18 +744,28 @@ function toPreview(prompt: string, max = 80) {
   return t.slice(0, max) + "…";
 }
 
-function pickerItemKey(item: PickerItemRef) {
-  return `${item.job_id}::${item.image_id}`;
+function pickerPendingItemKey(job_id: string) {
+  return `${job_id}::__pending__`;
+}
+
+function pickerItemKey(item: { job_id: string; image_id?: string; item_key?: string }) {
+  if (item.item_key) return item.item_key;
+  if (item.image_id) return `${item.job_id}::${item.image_id}`;
+  return pickerPendingItemKey(item.job_id);
 }
 
 function pickerItemKeyFrom(job_id: string, image_id: string) {
   return `${job_id}::${image_id}`;
 }
 
+function pickerItemHasImage(item?: { image_id?: string | null } | null): item is { image_id: string } {
+  return Boolean(item?.image_id);
+}
+
 function pickerItemRefFromKey(key?: string | null): PickerItemRef | undefined {
   if (!key || !key.includes("::")) return undefined;
   const [job_id, image_id] = key.split("::");
-  if (!job_id || !image_id) return undefined;
+  if (!job_id || !image_id || image_id === "__pending__") return undefined;
   return { job_id, image_id };
 }
 
@@ -697,6 +808,24 @@ function pickerDisplayName(item: PickerSessionItem, rec?: JobRecord) {
   const base = shortId(item.job_id, 5).replace("…", "-");
   const t = formatCompactLocalTime(rec?.created_at || item.added_at);
   return `${base}-${t}`;
+}
+
+function pickerItemJobStatus(item: PickerSessionItem, rec?: JobRecord): JobStatus {
+  return (rec?.status_cache || item.status || (pickerItemHasImage(item) ? "SUCCEEDED" : "UNKNOWN")) as JobStatus;
+}
+
+function getPickerSessionCounts(session: PickerSession) {
+  return session.items.reduce(
+    (acc, item) => {
+      if ((item.pool || "FILMSTRIP") === "PREFERRED") {
+        acc.preferred += 1;
+      } else {
+        acc.filmstrip += 1;
+      }
+      return acc;
+    },
+    { filmstrip: 0, preferred: 0 }
+  );
 }
 
 async function blobToDataURL(blob: Blob): Promise<string> {
@@ -939,6 +1068,33 @@ function getParamsForModel(settings: SettingsV1, modelId: ModelId, modelDefaults
   });
 }
 
+function createBatchSectionDraft(args: {
+  fallbackModel: ModelId;
+  settings: SettingsV1;
+  defaultCollectionMode: BatchCollectionMode;
+  previous?: BatchSection | null;
+}): BatchSection {
+  const source = args.previous || null;
+  const sourceModel = source?.section_model || args.fallbackModel;
+  const params = getParamsForModel(args.settings, sourceModel);
+  return {
+    id: createDraftId("sec"),
+    section_title: "",
+    section_prompt: "",
+    section_reference_images: [],
+    section_model: source?.section_model || args.fallbackModel,
+    section_aspect_ratio: source?.section_aspect_ratio || params.aspect_ratio,
+    section_image_size: source?.section_image_size || params.image_size,
+    section_temperature: source?.section_temperature ?? params.temperature,
+    section_job_count: source?.section_job_count || 1,
+    collection_mode: source?.collection_mode || args.defaultCollectionMode,
+    collection_name: "",
+    existing_session_ids: [],
+    inherit_previous_settings: Boolean(source),
+    enabled: true,
+  };
+}
+
 // -----------------------------
 // Zustand stores (persisted)
 // -----------------------------
@@ -1116,16 +1272,32 @@ function normalizePickerSession(raw: any): PickerSession {
     items: Array.isArray(raw?.items)
       ? raw.items
           .map((it: any) => {
-            if (!it?.job_id || !it?.image_id) return null;
+            if (!it?.job_id) return null;
+            const image_id = it?.image_id ? String(it.image_id) : undefined;
+            const item_key =
+              typeof it?.item_key === "string" && it.item_key
+                ? String(it.item_key)
+                : image_id
+                  ? undefined
+                  : pickerPendingItemKey(String(it.job_id));
+            if (!image_id && !item_key) return null;
+            const rawStatus = String(it?.status || "");
+            const status = (["QUEUED", "RUNNING", "SUCCEEDED", "FAILED", "UNKNOWN"] as const).includes(rawStatus as any)
+              ? (rawStatus as JobStatus)
+              : image_id
+                ? "SUCCEEDED"
+                : "UNKNOWN";
             return {
+              item_key,
               job_id: String(it.job_id),
               job_access_token: it.job_access_token ? String(it.job_access_token) : undefined,
-              image_id: String(it.image_id),
+              image_id,
               pool: it.pool === "PREFERRED" ? "PREFERRED" : "FILMSTRIP",
               label: it.label ? String(it.label) : undefined,
               rating: typeof it.rating === "number" ? clamp(Math.round(it.rating), 1, 5) : undefined,
               picked: it.picked !== undefined ? Boolean(it.picked) : true,
               notes: it.notes ? String(it.notes) : undefined,
+              status,
               added_at: String(it.added_at || now),
             } as PickerSessionItem;
           })
@@ -1154,7 +1326,11 @@ function normalizePickerSession(raw: any): PickerSession {
 function normalizePickerSessions(raw: any): PickerSession[] {
   const list = Array.isArray(raw) ? raw : [];
   const sessions = list.map((x) => normalizePickerSession(x));
-  return sessions.sort((a, b) => (new Date(b.updated_at).getTime() || 0) - (new Date(a.updated_at).getTime() || 0));
+  return sessions.sort((a, b) => {
+    const createdDelta = (new Date(b.created_at).getTime() || 0) - (new Date(a.created_at).getTime() || 0);
+    if (createdDelta !== 0) return createdDelta;
+    return (new Date(b.updated_at).getTime() || 0) - (new Date(a.updated_at).getTime() || 0);
+  });
 }
 
 function compactPickerSessionsForStorage(sessions: PickerSession[]) {
@@ -1285,6 +1461,8 @@ const usePickerStore = create<PickerStore>((set, get) => {
             ...it,
             pool: it.pool === "PREFERRED" ? "PREFERRED" : "FILMSTRIP",
             picked: it.picked !== undefined ? it.picked : true,
+            status: it.status || (pickerItemHasImage(it) ? "SUCCEEDED" : "UNKNOWN"),
+            item_key: it.item_key || (!pickerItemHasImage(it) ? pickerPendingItemKey(it.job_id) : undefined),
             added_at: it.added_at || isoNow(),
           }))
           .filter((it) => !existing.has(pickerItemKey(it)));
@@ -1301,7 +1479,8 @@ const usePickerStore = create<PickerStore>((set, get) => {
         });
 
         const focus_key = session.focus_key || slots.find(Boolean) || pickerItemKey(normalizedNew[0]);
-        const cover = session.cover || { job_id: normalizedNew[0].job_id, image_id: normalizedNew[0].image_id };
+        const firstImageItem = normalizedNew.find((item) => pickerItemHasImage(item));
+        const cover = session.cover || (firstImageItem ? { job_id: firstImageItem.job_id, image_id: firstImageItem.image_id } : undefined);
         return {
           ...session,
           items: [...session.items, ...normalizedNew],
@@ -2157,6 +2336,7 @@ function TopNav() {
         <div className="flex items-center gap-2">
           <NavButton to="/" label="Dashboard" />
           <NavButton to="/create" label="Create" />
+          <NavButton to="/batch" label="Batch" />
           <NavButton to="/history" label="History" />
           <NavButton to="/picker" label="Picker" />
           {isAdmin ? <NavButton to="/admin" label="Admin" /> : null}
@@ -2217,6 +2397,7 @@ function AnimatedRoutes() {
           <Route path="/login" element={<Navigate to="/" replace />} />
           <Route path="/" element={<DashboardPage />} />
           <Route path="/create" element={<CreateJobPage />} />
+          <Route path="/batch" element={<BatchCreatePage />} />
           <Route path="/history" element={<HistoryPage />} />
           <Route path="/picker" element={<PickerPage />} />
           <Route path="/admin" element={isAdmin ? <AdminPage /> : <Navigate to="/" replace />} />
@@ -2391,6 +2572,100 @@ function HelpTip({ text }: { text: string }) {
         {text}
       </span>
     </span>
+  );
+}
+
+function BatchSessionSelector({
+  pickerSessions,
+  selectedIds,
+  onToggle,
+  onCreateAndSelect,
+}: {
+  pickerSessions: PickerSession[];
+  selectedIds: string[];
+  onToggle: (sessionId: string, checked: boolean) => void;
+  onCreateAndSelect: (name?: string) => void;
+}) {
+  const [search, setSearch] = useState("");
+  const [draftName, setDraftName] = useState("");
+  const selectedIdSet = useMemo(() => new Set(selectedIds), [selectedIds]);
+  const filtered = useMemo(() => {
+    const query = search.trim().toLowerCase();
+    if (!query) return pickerSessions;
+    return pickerSessions.filter((session) => session.name.toLowerCase().includes(query));
+  }, [pickerSessions, search]);
+
+  return (
+    <div className="rounded-2xl border border-zinc-200/80 bg-zinc-50/70 p-3 dark:border-white/10 dark:bg-zinc-950/30">
+      <div className="grid gap-2 xl:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto]">
+        <Input value={search} onChange={setSearch} placeholder="Search session name" />
+        <Input value={draftName} onChange={setDraftName} placeholder="Create session now" />
+        <Button
+          variant="secondary"
+          className="xl:min-w-[92px]"
+          onClick={() => {
+            onCreateAndSelect(draftName.trim() || undefined);
+            setDraftName("");
+          }}
+        >
+          New
+        </Button>
+      </div>
+      <div className="mt-2 flex items-center justify-between text-[11px] text-zinc-500 dark:text-zinc-400">
+        <span>Local sessions {pickerSessions.length}</span>
+        {selectedIds.length ? <span>Selected {selectedIds.length}</span> : null}
+      </div>
+      <div className="mt-3">
+        {filtered.length ? (
+          <div className="flex gap-2 overflow-x-auto pb-1">
+            {filtered.map((session) => {
+              const checked = selectedIdSet.has(session.session_id);
+              const counts = getPickerSessionCounts(session);
+              return (
+                <label
+                  key={session.session_id}
+                  className={cn(
+                    "min-w-[228px] flex-none cursor-pointer rounded-2xl border px-3 py-3 transition",
+                    checked
+                      ? "border-zinc-900 bg-white shadow-sm dark:border-white dark:bg-zinc-950/75"
+                      : "border-zinc-200 bg-white/70 hover:border-zinc-300 dark:border-white/10 dark:bg-zinc-950/45 dark:hover:border-white/20"
+                  )}
+                >
+                  <div className="flex items-start gap-3">
+                    <input
+                      type="checkbox"
+                      className="mt-1 h-4 w-4 rounded border-zinc-300 text-zinc-900 focus:ring-zinc-400"
+                      checked={checked}
+                      onChange={(e) => onToggle(session.session_id, e.target.checked)}
+                    />
+                    <div className="min-w-0 flex-1">
+                      <div className="truncate text-sm font-semibold text-zinc-900 dark:text-zinc-50">{session.name}</div>
+                      <div className="mt-1 truncate text-[11px] text-zinc-500 dark:text-zinc-400">
+                        {formatLocal(session.created_at)}
+                      </div>
+                    </div>
+                  </div>
+                  <div className="mt-3 grid grid-cols-2 gap-2 text-[11px]">
+                    <div className="rounded-xl bg-zinc-50 px-2.5 py-2 dark:bg-zinc-950/60">
+                      <div className="font-semibold text-zinc-900 dark:text-zinc-50">{counts.filmstrip}</div>
+                      <div className="text-zinc-500 dark:text-zinc-400">Filmstrip</div>
+                    </div>
+                    <div className="rounded-xl bg-zinc-50 px-2.5 py-2 dark:bg-zinc-950/60">
+                      <div className="font-semibold text-zinc-900 dark:text-zinc-50">{counts.preferred}</div>
+                      <div className="text-zinc-500 dark:text-zinc-400">Preferred</div>
+                    </div>
+                  </div>
+                </label>
+              );
+            })}
+          </div>
+        ) : (
+          <div className="rounded-2xl border border-dashed border-zinc-200 px-3 py-4 text-center text-xs text-zinc-500 dark:border-white/10 dark:text-zinc-400">
+            No matching session. Create one above.
+          </div>
+        )}
+      </div>
+    </div>
   );
 }
 
@@ -3973,6 +4248,1067 @@ function AdminPage() {
   );
 }
 
+function BatchCreatePage() {
+  const client = useApiClient();
+  const catalog = useModelCatalog();
+  const navigate = useNavigate();
+  const { push } = useToast();
+  const { session, user } = useAuthSession();
+  const setSession = useAuthStore((s) => s.setSession);
+  const settings = useSettingsStore((s) => s.settings);
+  const pickerSessions = usePickerStore((s) => s.sessions);
+  const createPickerSession = usePickerStore((s) => s.createSession);
+  const addPickerItems = usePickerStore((s) => s.addItems);
+
+  const MAX_REF_FILES = 14;
+  const sortedPickerSessions = useMemo(
+    () =>
+      [...pickerSessions].sort(
+        (a, b) => (new Date(b.created_at).getTime() || 0) - (new Date(a.created_at).getTime() || 0)
+      ),
+    [pickerSessions]
+  );
+  const modelMap = useMemo(
+    () => new Map(catalog.models.map((item) => [item.model_id, item])),
+    [catalog.models]
+  );
+  const initialModel = settings.defaultModel || catalog.default_model;
+  const initialParams = getParamsForModel(settings, initialModel, modelMap.get(initialModel)?.default_params);
+
+  const [batchName, setBatchName] = useState("");
+  const [batchNote, setBatchNote] = useState("");
+  const [defaultCollectionStrategy, setDefaultCollectionStrategy] = useState<BatchCollectionMode>("AUTO_BATCH");
+  const [submitMode, setSubmitMode] = useState<BatchSubmitMode>("IMMEDIATE");
+
+  const [globalPrompt, setGlobalPrompt] = useState("");
+  const [globalFiles, setGlobalFiles] = useState<File[]>([]);
+  const [globalModel, setGlobalModel] = useState<ModelId>(initialModel);
+  const [globalAspect, setGlobalAspect] = useState<AspectRatio>(initialParams.aspect_ratio);
+  const [globalSize, setGlobalSize] = useState<ImageSize>(initialParams.image_size);
+  const [globalTemperature, setGlobalTemperature] = useState<number>(initialParams.temperature);
+  const [globalJobCount, setGlobalJobCount] = useState<number>(1);
+  const [namingTemplate, setNamingTemplate] = useState(BATCH_NAME_TEMPLATE_DEFAULT);
+
+  const [submitEnabledOnly, setSubmitEnabledOnly] = useState(true);
+  const [submitStartFrom, setSubmitStartFrom] = useState("1");
+  const [autoInjectPageNo, setAutoInjectPageNo] = useState(true);
+  const [removeFailedFromSession, setRemoveFailedFromSession] = useState(true);
+  const [selectedSectionIds, setSelectedSectionIds] = useState<string[]>([]);
+  const [sections, setSections] = useState<BatchSection[]>(() => [
+    createBatchSectionDraft({
+      fallbackModel: initialModel,
+      settings,
+      defaultCollectionMode: "AUTO_BATCH",
+    }),
+  ]);
+
+  const [loading, setLoading] = useState(false);
+  const [generationModalOpen, setGenerationModalOpen] = useState(false);
+  const [generationTurnstileToken, setGenerationTurnstileToken] = useState<string | null>(null);
+  const [generationTurnstileKey, setGenerationTurnstileKey] = useState(0);
+  const [verifyingGenerationTurnstile, setVerifyingGenerationTurnstile] = useState(false);
+  const [pendingGenerationTargetCount, setPendingGenerationTargetCount] = useState<number | null>(null);
+
+  const globalModelMeta = useMemo(
+    () => modelMap.get(globalModel) || catalog.models[0] || null,
+    [catalog.models, globalModel, modelMap]
+  );
+
+  useEffect(() => {
+    if (!catalog.models.some((item) => item.model_id === globalModel)) {
+      setGlobalModel(catalog.default_model);
+    }
+  }, [catalog.default_model, catalog.models, globalModel]);
+
+  useEffect(() => {
+    if (!globalModelMeta) return;
+    if (!globalModelMeta.supported_aspect_ratios.includes(globalAspect)) {
+      setGlobalAspect((globalModelMeta.default_params.aspect_ratio || globalModelMeta.supported_aspect_ratios[0]) as AspectRatio);
+    }
+    if (globalModelMeta.supports_image_size) {
+      if (!globalModelMeta.supported_image_sizes.includes(globalSize)) {
+        setGlobalSize((globalModelMeta.default_params.image_size || globalModelMeta.supported_image_sizes[0]) as ImageSize);
+      }
+    } else if (globalSize !== "AUTO") {
+      setGlobalSize("AUTO");
+    }
+  }, [globalAspect, globalModelMeta, globalSize]);
+
+  useEffect(() => {
+    setSections((prev) =>
+      prev.map((section) => ({
+        ...section,
+        existing_session_ids: section.existing_session_ids.filter((id) =>
+          sortedPickerSessions.some((session) => session.session_id === id)
+        ),
+      }))
+    );
+  }, [sortedPickerSessions]);
+
+  const updateSection = (sectionId: string, updater: (section: BatchSection, index: number) => BatchSection) => {
+    setSections((prev) =>
+      prev.map((section, index) => (section.id === sectionId ? updater(section, index) : section))
+    );
+  };
+
+  const toggleSelectedSection = (sectionId: string, checked: boolean) => {
+    setSelectedSectionIds((prev) => {
+      if (checked) return Array.from(new Set([sectionId, ...prev]));
+      return prev.filter((id) => id !== sectionId);
+    });
+  };
+
+  const applySectionModel = (sectionId: string, nextModel: ModelId) => {
+    const cap = modelMap.get(nextModel);
+    const defaults = getParamsForModel(settings, nextModel, cap?.default_params);
+    updateSection(sectionId, (section) => ({
+      ...section,
+      section_model: nextModel,
+      section_aspect_ratio: cap?.supported_aspect_ratios.includes(section.section_aspect_ratio)
+        ? section.section_aspect_ratio
+        : defaults.aspect_ratio,
+      section_image_size: cap?.supports_image_size
+        ? cap.supported_image_sizes.includes(section.section_image_size)
+          ? section.section_image_size
+          : defaults.image_size
+        : "AUTO",
+      section_temperature: section.section_temperature ?? defaults.temperature,
+    }));
+  };
+
+  const addSection = (seed?: Partial<BatchSection>) => {
+    setSections((prev) => {
+      const previous = prev[prev.length - 1] || null;
+      return [
+        ...prev,
+        {
+          ...createBatchSectionDraft({
+            fallbackModel: globalModel,
+            settings,
+            defaultCollectionMode: defaultCollectionStrategy,
+            previous,
+          }),
+          ...(seed || {}),
+          id: createDraftId("sec"),
+        },
+      ];
+    });
+  };
+
+  const duplicateSection = (sectionId: string) => {
+    const current = sections.find((section) => section.id === sectionId);
+    if (!current) return;
+    addSection({
+      ...current,
+      section_title: current.section_title ? `${current.section_title} Copy` : "",
+      section_reference_images: [...current.section_reference_images],
+      existing_session_ids: [...current.existing_session_ids],
+      enabled: true,
+    });
+  };
+
+  const duplicateSelectedSections = () => {
+    const targets = sections.filter((section) => selectedSectionIds.includes(section.id));
+    if (!targets.length) return;
+    targets.forEach((section) => {
+      addSection({
+        ...section,
+        section_title: section.section_title ? `${section.section_title} Copy` : "",
+        section_reference_images: [...section.section_reference_images],
+        existing_session_ids: [...section.existing_session_ids],
+        enabled: true,
+      });
+    });
+    push({ kind: "success", title: "已复制所选分区", message: `${targets.length} 个` });
+  };
+
+  const deleteSelectedSections = () => {
+    if (!selectedSectionIds.length) return;
+    setSections((prev) => {
+      const next = prev.filter((section) => !selectedSectionIds.includes(section.id));
+      return next.length
+        ? next
+        : [
+            createBatchSectionDraft({
+              fallbackModel: globalModel,
+              settings,
+              defaultCollectionMode: defaultCollectionStrategy,
+            }),
+          ];
+    });
+    setSelectedSectionIds([]);
+    push({ kind: "info", title: "已删除所选分区" });
+  };
+
+  const copyPreviousSectionParams = (sectionId: string) => {
+    setSections((prev) =>
+      prev.map((section, index) => {
+        if (section.id !== sectionId || index === 0) return section;
+        const previous = prev[index - 1];
+        return {
+          ...section,
+          section_model: previous.section_model,
+          section_aspect_ratio: previous.section_aspect_ratio,
+          section_image_size: previous.section_image_size,
+          section_temperature: previous.section_temperature,
+          section_job_count: previous.section_job_count,
+          collection_mode: previous.collection_mode,
+          inherit_previous_settings: true,
+        };
+      })
+    );
+    push({ kind: "success", title: "已复制上一个分区参数" });
+  };
+
+  const createAndAttachExistingSession = (sectionId: string, name?: string) => {
+    const sessionId = createPickerSession(name);
+    updateSection(sectionId, (section) => ({
+      ...section,
+      collection_mode: "EXISTING",
+      existing_session_ids: Array.from(new Set([sessionId, ...section.existing_session_ids])),
+    }));
+    push({ kind: "success", title: "已创建并选中 session" });
+  };
+
+  const plannedSections = useMemo(() => {
+    const startIndex = clamp(Number(submitStartFrom || "1") || 1, 1, Math.max(1, sections.length));
+    return sections
+      .map((section, index) => ({ section, index, displayIndex: index + 1 }))
+      .filter((item) => item.displayIndex >= startIndex)
+      .filter((item) => (submitEnabledOnly ? item.section.enabled : true));
+  }, [sections, submitEnabledOnly, submitStartFrom]);
+
+  const totalPlannedJobs = useMemo(
+    () =>
+      plannedSections.reduce(
+        (sum, item) => sum + clamp(Math.round(item.section.section_job_count || 0), 0, 12),
+        0
+      ),
+    [plannedSections]
+  );
+
+  const estimatedCost = useMemo(
+    () =>
+      plannedSections.reduce((sum, item) => {
+        const unit = estimateBatchUnitCost(item.section.section_model, item.section.section_image_size);
+        return sum + unit * clamp(Math.round(item.section.section_job_count || 0), 0, 12);
+      }, 0),
+    [plannedSections]
+  );
+
+  const hasFreshGenerationVerification = (candidate: AuthSession | null) => {
+    const ts = candidate?.generation_turnstile_verified_until;
+    if (!ts) return false;
+    const dt = new Date(ts);
+    return Number.isFinite(dt.getTime()) && dt.getTime() > Date.now();
+  };
+
+  const needsGenerationTurnstile = (candidate: AuthSession | null, targetCount: number) => {
+    const currentUser = candidate?.user;
+    const currentUsage = candidate?.usage;
+    if (!currentUser || currentUser.role === "ADMIN") return false;
+    const countThreshold = currentUser.policy.turnstile_job_count_threshold;
+    const dailyThreshold = currentUser.policy.turnstile_daily_usage_threshold;
+    if (typeof countThreshold === "number" && targetCount > countThreshold) {
+      return true;
+    }
+    if (typeof dailyThreshold === "number" && (currentUsage?.quota_consumed_today ?? 0) >= dailyThreshold) {
+      return !hasFreshGenerationVerification(candidate);
+    }
+    return false;
+  };
+
+  const refreshSession = async () => {
+    const nextSession = await client.me();
+    setSession(nextSession);
+    return nextSession;
+  };
+
+  const validateBatch = () => {
+    if (!batchName.trim()) return "batch_name 不能为空";
+    if (!sections.length) return "至少需要 1 个分区";
+    if (globalFiles.length > MAX_REF_FILES) return `全局参考图最多 ${MAX_REF_FILES} 张`;
+    if (globalFiles.some((file) => !file.type.startsWith("image/"))) return "全局参考图必须是 image/*";
+    if (!Number.isFinite(globalJobCount) || globalJobCount < 1 || globalJobCount > 12) {
+      return "全局默认每分区生成数量需在 1~12 之间";
+    }
+    if (!plannedSections.length) return "没有可提交的分区";
+    if (totalPlannedJobs > 100) return "批量提交总任务数暂时需控制在 100 以内";
+    for (const item of plannedSections) {
+      const section = item.section;
+      if (!section.section_prompt.trim()) return `第 ${item.displayIndex} 分区的 prompt 不能为空`;
+      if (section.section_reference_images.length > MAX_REF_FILES) {
+        return `第 ${item.displayIndex} 分区参考图最多 ${MAX_REF_FILES} 张`;
+      }
+      if (section.section_reference_images.some((file) => !file.type.startsWith("image/"))) {
+        return `第 ${item.displayIndex} 分区存在非图片参考图`;
+      }
+      if (!Number.isFinite(section.section_job_count) || section.section_job_count < 1 || section.section_job_count > 12) {
+        return `第 ${item.displayIndex} 分区的 job_count 需在 1~12 之间`;
+      }
+      if (section.collection_mode === "EXISTING" && !section.existing_session_ids.length) {
+        return `第 ${item.displayIndex} 分区选择了 Existing Session，但未勾选任何 session`;
+      }
+    }
+    return null;
+  };
+
+  const attachJobToSessionIds = (
+    sessionIds: string[],
+    job: { job_id: string; job_access_token?: string; created_at?: string; status?: JobStatus }
+  ) => {
+    if (!sessionIds.length) return;
+    sessionIds.forEach((sessionId) => {
+      addPickerItems(sessionId, [
+        {
+          item_key: pickerPendingItemKey(job.job_id),
+          job_id: job.job_id,
+          job_access_token: job.job_access_token,
+          picked: true,
+          status: job.status || "QUEUED",
+          added_at: job.created_at || isoNow(),
+        },
+      ]);
+    });
+  };
+
+  const executeBatchSubmit = async (targetCountOverride?: number, allowTurnstileRecovery = true) => {
+    const err = validateBatch();
+    if (err) {
+      push({ kind: "error", title: "表单校验失败", message: err });
+      return;
+    }
+
+    const totalTargetCount = clamp(targetCountOverride ?? totalPlannedJobs, 1, 100);
+    const batchId = createBatchId();
+    const autoCreatedSessions = new Map<string, string>();
+    let firstError: string | null = null;
+    let createdCount = 0;
+    let plannedOrdinal = 0;
+    let firstJobId: string | null = null;
+
+    const resolveSectionSessions = (section: BatchSection, displayIndex: number) => {
+      if (section.collection_mode === "NONE") return [] as string[];
+      if (section.collection_mode === "EXISTING") return section.existing_session_ids;
+      const cached = autoCreatedSessions.get(section.id);
+      if (cached) return [cached];
+      const vars = {
+        batch_name: batchName.trim(),
+        page_no: String(displayIndex),
+        section_title: section.section_title.trim() || "untitled",
+      };
+      const autoName =
+        section.collection_mode === "AUTO_BATCH"
+          ? renderTemplate(namingTemplate, vars)
+          : section.collection_name.trim() || renderTemplate(namingTemplate, vars);
+      const sessionId = createPickerSession(autoName);
+      autoCreatedSessions.set(section.id, sessionId);
+      return [sessionId];
+    };
+
+    setLoading(true);
+    const abort = new AbortController();
+
+    try {
+      for (let sectionPos = 0; sectionPos < plannedSections.length; sectionPos++) {
+        const item = plannedSections[sectionPos];
+        const section = item.section;
+        const modelMeta = modelMap.get(section.section_model) || modelMap.get(catalog.default_model) || catalog.models[0];
+        if (!modelMeta) {
+          throw { error: { code: "MODEL_NOT_READY", message: "模型目录加载失败，请稍后重试" } };
+        }
+        const fallbackParams = getParamsForModel(settings, section.section_model, modelMeta.default_params);
+        const vars = {
+          batch_name: batchName.trim(),
+          page_no: String(item.displayIndex),
+          section_title: section.section_title.trim() || "untitled",
+        };
+        const finalPrompt = batchPromptPreview(globalPrompt, section.section_prompt, vars, autoInjectPageNo);
+        const params: DefaultParams = {
+          aspect_ratio: section.section_aspect_ratio,
+          image_size: modelMeta.supports_image_size ? section.section_image_size : "AUTO",
+          thinking_level: modelMeta.supports_thinking_level ? fallbackParams.thinking_level : null,
+          temperature: section.section_temperature,
+          timeout_sec: fallbackParams.timeout_sec,
+          max_retries: fallbackParams.max_retries,
+        };
+        const sectionSessionIds = resolveSectionSessions(section, item.displayIndex);
+        const refs = [...globalFiles, ...section.section_reference_images];
+
+        for (let jobIndex = 0; jobIndex < section.section_job_count; jobIndex++) {
+          plannedOrdinal += 1;
+          let resp: any;
+          try {
+            if (refs.length) {
+              const form = new FormData();
+              form.append("prompt", finalPrompt);
+              form.append("model", String(section.section_model));
+              form.append("mode", "IMAGE_ONLY");
+              form.append("params", JSON.stringify(params));
+              refs.forEach((file) => form.append("reference_images", file));
+              resp = await client.createJobMultipart(form, totalTargetCount, abort.signal);
+            } else {
+              resp = await client.createJobJSON(
+                { prompt: finalPrompt, model: section.section_model, mode: "IMAGE_ONLY", params },
+                totalTargetCount,
+                abort.signal
+              );
+            }
+          } catch (e: any) {
+            const code = e?.error?.code;
+            if (code === "TURNSTILE_REQUIRED" || code === "QUOTA_EXCEEDED" || code === "RATE_LIMITED") {
+              throw e;
+            }
+            firstError = firstError || e?.error?.message || "创建失败";
+            continue;
+          }
+
+          const job_id = resp?.job_id;
+          const job_access_token = resp?.job_access_token;
+          if (!job_id) {
+            firstError = firstError || "后端未返回 job_id";
+            continue;
+          }
+
+          createdCount += 1;
+          if (!firstJobId) firstJobId = job_id;
+
+          const rec: JobRecord = {
+            job_id,
+            job_access_token,
+            model_cache: section.section_model,
+            created_at: resp?.created_at || isoNow(),
+            status_cache: (resp?.status as JobStatus) || "QUEUED",
+            prompt_preview: toPreview(finalPrompt),
+            params_cache: {
+              aspect_ratio: params.aspect_ratio,
+              image_size: params.image_size,
+              thinking_level: params.thinking_level,
+              temperature: params.temperature,
+              timeout_sec: params.timeout_sec,
+              max_retries: params.max_retries,
+            },
+            last_seen_at: isoNow(),
+            pinned: false,
+            tags: [],
+            batch_id: batchId,
+            batch_name: batchName.trim(),
+            batch_note: batchNote.trim() || undefined,
+            batch_size: totalTargetCount > 1 ? totalTargetCount : undefined,
+            batch_index: totalTargetCount > 1 ? plannedOrdinal : undefined,
+            section_index: item.displayIndex,
+            section_title: section.section_title.trim() || undefined,
+            linked_session_ids: sectionSessionIds.length ? sectionSessionIds : undefined,
+            auto_remove_failed_from_picker: removeFailedFromSession && sectionSessionIds.length ? true : undefined,
+          };
+          useJobsStore.getState().upsertJob(rec);
+          attachJobToSessionIds(sectionSessionIds, {
+            job_id,
+            job_access_token,
+            created_at: rec.created_at,
+            status: rec.status_cache,
+          });
+        }
+
+        if (submitMode === "STAGGERED" && sectionPos < plannedSections.length - 1) {
+          await new Promise((resolve) => setTimeout(resolve, 350));
+        }
+      }
+
+      if (!createdCount || !firstJobId) {
+        throw { error: { code: "BAD_RESPONSE", message: firstError || "批量提交失败" } };
+      }
+
+      push({
+        kind: createdCount === totalTargetCount ? "success" : "info",
+        title: `Batch queued ${createdCount}/${totalTargetCount}`,
+        message:
+          createdCount === totalTargetCount
+            ? "所有计划任务都已写入队列"
+            : `有 ${totalTargetCount - createdCount} 个任务没有成功提交（${firstError || "请检查后端日志"}）`,
+      });
+      navigate(`/history?job=${encodeURIComponent(firstJobId)}`);
+    } catch (e: any) {
+      if (allowTurnstileRecovery && e?.error?.code === "TURNSTILE_REQUIRED") {
+        setPendingGenerationTargetCount(totalTargetCount);
+        setGenerationTurnstileToken(null);
+        setGenerationTurnstileKey((v) => v + 1);
+        setGenerationModalOpen(true);
+        return;
+      }
+      push({ kind: "error", title: "批量提交失败", message: e?.error?.message || "请检查后端/参数" });
+    } finally {
+      setLoading(false);
+      abort.abort();
+    }
+  };
+
+  const onSubmit = async () => {
+    const err = validateBatch();
+    if (err) {
+      push({ kind: "error", title: "表单校验失败", message: err });
+      return;
+    }
+    const targetCount = clamp(totalPlannedJobs, 1, 100);
+    try {
+      const nextSession = await refreshSession();
+      if (needsGenerationTurnstile(nextSession, targetCount)) {
+        setPendingGenerationTargetCount(targetCount);
+        setGenerationTurnstileToken(null);
+        setGenerationTurnstileKey((v) => v + 1);
+        setGenerationModalOpen(true);
+        return;
+      }
+    } catch (e: any) {
+      push({ kind: "error", title: "状态同步失败", message: e?.error?.message || "无法确认当前账号状态" });
+      return;
+    }
+
+    setPendingGenerationTargetCount(null);
+    await executeBatchSubmit(targetCount);
+  };
+
+  const confirmGenerationTurnstile = async () => {
+    if (!generationTurnstileToken) return;
+    setVerifyingGenerationTurnstile(true);
+    try {
+      const targetCount = clamp(Math.round(pendingGenerationTargetCount ?? totalPlannedJobs), 1, 100);
+      const nextSession = await client.verifyGenerationTurnstile(generationTurnstileToken, targetCount);
+      setSession(nextSession);
+      setGenerationModalOpen(false);
+      setGenerationTurnstileToken(null);
+      setPendingGenerationTargetCount(null);
+      await executeBatchSubmit(targetCount, false);
+    } catch (e: any) {
+      setGenerationTurnstileKey((v) => v + 1);
+      setGenerationTurnstileToken(null);
+      push({ kind: "error", title: "Turnstile 校验失败", message: e?.error?.message || "请重试" });
+    } finally {
+      setVerifyingGenerationTurnstile(false);
+    }
+  };
+
+  return (
+    <>
+      <TurnstilePromptModal
+        open={generationModalOpen}
+        title="需要二次验证"
+        description="当前批量提交触发了普通用户的额外校验策略。完成 Cloudflare Turnstile 后，系统才会继续按计划提交全部任务。"
+        token={generationTurnstileToken}
+        tokenKey={generationTurnstileKey}
+        setToken={setGenerationTurnstileToken}
+        loading={verifyingGenerationTurnstile}
+        confirmLabel="继续批量提交"
+        onClose={() => {
+          if (verifyingGenerationTurnstile) return;
+          setGenerationModalOpen(false);
+          setGenerationTurnstileToken(null);
+          setPendingGenerationTargetCount(null);
+        }}
+        onConfirm={confirmGenerationTurnstile}
+      />
+
+      <PageContainer>
+        <PageTitle
+          title="Batch"
+          subtitle="面向 PPT 配图、分镜和章节插图。固定区放公共条件，Section 区只填每页差异。"
+          right={
+            <div className="flex items-center gap-2">
+              {user ? (
+                <div className="rounded-full border border-zinc-200 bg-white/70 px-3 py-2 text-xs font-semibold text-zinc-600 dark:border-white/10 dark:bg-zinc-900/40 dark:text-zinc-300">
+                  {user.role === "ADMIN" ? "Admin session" : "User session"}
+                </div>
+              ) : null}
+              <Button
+                variant="secondary"
+                onClick={() => {
+                  setBatchName("");
+                  setBatchNote("");
+                  setGlobalPrompt("");
+                  setGlobalFiles([]);
+                  setSections([
+                    createBatchSectionDraft({
+                      fallbackModel: globalModel,
+                      settings,
+                      defaultCollectionMode: defaultCollectionStrategy,
+                    }),
+                  ]);
+                  setSelectedSectionIds([]);
+                  push({ kind: "info", title: "已重置批量草稿" });
+                }}
+              >
+                Reset
+              </Button>
+            </div>
+          }
+        />
+
+        <div className="space-y-3">
+          <Card>
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div>
+                <div className="text-sm font-bold text-zinc-900 dark:text-zinc-50">Batch Info</div>
+                <div className="text-xs text-zinc-600 dark:text-zinc-300">批次名会进入本地历史，便于在 History 中识别同一组图片。</div>
+              </div>
+              <div className="flex flex-wrap gap-2 text-xs">
+                <span className="rounded-full border border-sky-200 bg-sky-50 px-2 py-1 text-sky-700 dark:border-sky-800/60 dark:bg-sky-950/40 dark:text-sky-200">
+                  Planned jobs {totalPlannedJobs}
+                </span>
+                <span className="rounded-full border border-emerald-200 bg-emerald-50 px-2 py-1 text-emerald-700 dark:border-emerald-800/60 dark:bg-emerald-950/40 dark:text-emerald-200">
+                  Est. {currency(estimatedCost)}
+                </span>
+              </div>
+            </div>
+            <div className="mt-3 grid gap-3 lg:grid-cols-2 xl:grid-cols-4">
+              <Field label={<span className="inline-flex items-center gap-1.5">batch_name <HelpTip text="历史记录会用它来标记同一批次。建议用章节名、项目名或本次 PPT 的主题名。" /></span>}>
+                <Input value={batchName} onChange={setBatchName} placeholder="Q2-Deck / Chapter-03 / Storyboard-A" />
+              </Field>
+              <Field label={<span className="inline-flex items-center gap-1.5">batch_note <HelpTip text="可选备注，用于记录本批次的用途、客户、版本或筛图说明。" /></span>}>
+                <Input value={batchNote} onChange={setBatchNote} placeholder="可选备注" />
+              </Field>
+              <Field label={<span className="inline-flex items-center gap-1.5">default_collection_strategy <HelpTip text="新建 section 默认采用的图像集策略。推荐用批次命名自动建 session，后续在 Picker 中更容易区分。" /></span>}>
+                <Select
+                  value={defaultCollectionStrategy}
+                  onChange={(v) => setDefaultCollectionStrategy(v as BatchCollectionMode)}
+                  options={BATCH_COLLECTION_MODE_OPTIONS.map((item) => ({ value: item.value, label: item.label }))}
+                />
+              </Field>
+              <Field label={<span className="inline-flex items-center gap-1.5">submit_mode <HelpTip text="Queue All Now 会连续提交所有任务；Queue Per Section 会在 section 之间短暂停顿，适合降低瞬时排队压力。" /></span>}>
+                <Select
+                  value={submitMode}
+                  onChange={(v) => setSubmitMode(v as BatchSubmitMode)}
+                  options={BATCH_SUBMIT_MODE_OPTIONS.map((item) => ({ value: item.value, label: item.label }))}
+                />
+              </Field>
+            </div>
+          </Card>
+
+          <div className="grid gap-3 xl:grid-cols-[minmax(0,1.15fr)_minmax(320px,0.85fr)]">
+            <Card>
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <div>
+                  <div className="text-sm font-bold text-zinc-900 dark:text-zinc-50">Global Block</div>
+                  <div className="text-xs text-zinc-600 dark:text-zinc-300">全局 prompt 与全局参考图会自动追加到每个 section。</div>
+                </div>
+                <Button
+                  variant="ghost"
+                  onClick={() => {
+                    setSections((prev) =>
+                      prev.map((section) => ({
+                        ...section,
+                        section_model: globalModel,
+                        section_aspect_ratio: globalAspect,
+                        section_image_size: globalSize,
+                        section_temperature: globalTemperature,
+                        section_job_count: globalJobCount,
+                        collection_mode: defaultCollectionStrategy,
+                      }))
+                    );
+                    push({ kind: "success", title: "已把全局默认应用到全部 section" });
+                  }}
+                >
+                  Apply Defaults To All
+                </Button>
+              </div>
+
+              <div className="mt-3 space-y-3">
+                <Field label={<span className="inline-flex items-center gap-1.5">global_prompt <HelpTip text="会追加到每个 section prompt 尾部。适合写通用画风、统一镜头语气、品牌元素等公共约束。" /></span>}>
+                  <TextArea
+                    value={globalPrompt}
+                    onChange={setGlobalPrompt}
+                    rows={5}
+                    placeholder="例如：cinematic editorial lighting, crisp composition, premium presentation quality"
+                  />
+                </Field>
+
+                <Field label={<span className="inline-flex items-center gap-1.5">global_reference_images <HelpTip text="最终送入模型的参考图顺序始终是：先全局参考图，再当前 section 的参考图。适合放品牌主视觉、角色设定或统一风格参考。" /></span>}>
+                  <ImageDropzone files={globalFiles} setFiles={setGlobalFiles} maxFiles={MAX_REF_FILES} />
+                </Field>
+
+                <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
+                  <Field label={<span className="inline-flex items-center gap-1.5">default_model <HelpTip text="新 section 默认模型。已有 section 不会被自动覆盖，除非你点击 Apply Defaults To All。" /></span>}>
+                    <Select
+                      value={String(globalModel)}
+                      onChange={(v) => setGlobalModel(v as ModelId)}
+                      options={catalog.models.map((item) => ({ value: item.model_id, label: `${item.label} (${item.model_id})` }))}
+                    />
+                  </Field>
+                  <Field label={<span className="inline-flex items-center gap-1.5">default_aspect_ratio <HelpTip text="新 section 的默认宽高比。PPT 页通常建议 16:9，竖版章节封面可以用 3:4 或 9:16。" /></span>}>
+                    <Select
+                      value={String(globalAspect)}
+                      onChange={(v) => setGlobalAspect(v as AspectRatio)}
+                      options={(globalModelMeta?.supported_aspect_ratios || ["1:1"]).map((item) => ({ value: item, label: item }))}
+                    />
+                  </Field>
+                  <Field label={<span className="inline-flex items-center gap-1.5">default_image_size <HelpTip text="新 section 的默认尺寸。尺寸越大，成本和耗时通常越高。" /></span>}>
+                    <Select
+                      value={String(globalSize)}
+                      onChange={(v) => setGlobalSize(v as ImageSize)}
+                      options={
+                        globalModelMeta?.supports_image_size
+                          ? (globalModelMeta.supported_image_sizes || []).map((item) => ({ value: item, label: item }))
+                          : [{ value: "AUTO", label: "AUTO" }]
+                      }
+                    />
+                  </Field>
+                  <Field label={<span className="inline-flex items-center gap-1.5">default_temperature ({globalTemperature.toFixed(2)}) <HelpTip text="越低越稳定，越高越发散。做同一套 PPT 页面时，通常不建议拉得过高。" /></span>}>
+                    <input
+                      type="range"
+                      min={0}
+                      max={2}
+                      step={0.05}
+                      value={globalTemperature}
+                      onChange={(e) => setGlobalTemperature(Number(e.target.value))}
+                      className="w-full"
+                    />
+                  </Field>
+                  <Field label={<span className="inline-flex items-center gap-1.5">default_job_count ({globalJobCount}) <HelpTip text="新 section 默认生成几张。提交前会汇总所有启用 section 的 job_count，作为总任务数预估。" /></span>}>
+                    <input
+                      type="range"
+                      min={1}
+                      max={12}
+                      step={1}
+                      value={globalJobCount}
+                      onChange={(e) => setGlobalJobCount(Number(e.target.value))}
+                      className="w-full"
+                    />
+                  </Field>
+                  <Field label={<span className="inline-flex items-center gap-1.5">default_collection_strategy <HelpTip text="新 section 会默认采用这个图像集策略。对需要后续挑图的批次，推荐自动建 session。" /></span>}>
+                    <Select
+                      value={defaultCollectionStrategy}
+                      onChange={(v) => setDefaultCollectionStrategy(v as BatchCollectionMode)}
+                      options={BATCH_COLLECTION_MODE_OPTIONS.map((item) => ({ value: item.value, label: item.label }))}
+                    />
+                  </Field>
+                </div>
+
+                <div className="grid gap-3 lg:grid-cols-[minmax(0,1fr)_320px]">
+                  <Field label={<span className="inline-flex items-center gap-1.5">naming_template <HelpTip text="用于自动建 session 时的命名模板。支持 {{batch_name}}、{{page_no}}、{{section_title}} 三个变量。" /></span>}>
+                    <Input value={namingTemplate} onChange={setNamingTemplate} placeholder={BATCH_NAME_TEMPLATE_DEFAULT} />
+                  </Field>
+                  <Field label={<span className="inline-flex items-center gap-1.5">variables <HelpTip text="这些变量会在提交前被渲染进最终 prompt 和 session 名称里。未填写标题时，section_title 会自动回退成 untitled。" /></span>}>
+                    <div className="flex h-full flex-wrap gap-2 rounded-2xl border border-zinc-200 bg-zinc-50/80 px-3 py-2 text-xs font-semibold text-zinc-700 dark:border-white/10 dark:bg-zinc-950/40 dark:text-zinc-200">
+                      <span className="rounded-full bg-white px-2 py-1 dark:bg-zinc-900">{"{{page_no}}"}</span>
+                      <span className="rounded-full bg-white px-2 py-1 dark:bg-zinc-900">{"{{section_title}}"}</span>
+                      <span className="rounded-full bg-white px-2 py-1 dark:bg-zinc-900">{"{{batch_name}}"}</span>
+                    </div>
+                  </Field>
+                </div>
+              </div>
+            </Card>
+
+            <Card className="h-fit">
+              <div className="text-sm font-bold text-zinc-900 dark:text-zinc-50">Advanced</div>
+              <div className="mt-3 space-y-3">
+                <div className="flex items-center justify-between gap-3 rounded-2xl border border-zinc-200 bg-zinc-50/80 px-3 py-3 dark:border-white/10 dark:bg-zinc-950/40">
+                  <div className="text-sm font-semibold text-zinc-900 dark:text-zinc-50">
+                    只提交启用 section
+                    <span className="ml-1 align-middle"><HelpTip text="关闭后，会忽略 section 的 enabled 开关，直接从第 N 个 section 开始全部提交。" /></span>
+                  </div>
+                  <Switch value={submitEnabledOnly} onChange={setSubmitEnabledOnly} />
+                </div>
+                <Field label={<span className="inline-flex items-center gap-1.5">start_from_section <HelpTip text="从第几个 section 开始提交。适合中途补跑后半段页面。" /></span>}>
+                  <Input value={submitStartFrom} onChange={setSubmitStartFrom} type="number" />
+                </Field>
+                <div className="flex items-center justify-between gap-3 rounded-2xl border border-zinc-200 bg-zinc-50/80 px-3 py-3 dark:border-white/10 dark:bg-zinc-950/40">
+                  <div className="text-sm font-semibold text-zinc-900 dark:text-zinc-50">
+                    自动附加页码变量
+                    <span className="ml-1 align-middle"><HelpTip text="开启后，系统会在每个最终 prompt 尾部再补一行 Page number，方便在分镜或 PPT 多页批量生成时保持页序语义。" /></span>
+                  </div>
+                  <Switch value={autoInjectPageNo} onChange={setAutoInjectPageNo} />
+                </div>
+                <div className="flex items-center justify-between gap-3 rounded-2xl border border-zinc-200 bg-zinc-50/80 px-3 py-3 dark:border-white/10 dark:bg-zinc-950/40">
+                  <div className="text-sm font-semibold text-zinc-900 dark:text-zinc-50">
+                    失败任务自动从 session 移除
+                    <span className="ml-1 align-middle"><HelpTip text="若某任务最终失败，会把它在对应 session 里的 pending 占位条目自动清掉，避免 Picker 里留下失败占位。" /></span>
+                  </div>
+                  <Switch value={removeFailedFromSession} onChange={setRemoveFailedFromSession} />
+                </div>
+                <div className="grid gap-2 sm:grid-cols-2">
+                  <Button variant="secondary" onClick={duplicateSelectedSections} disabled={!selectedSectionIds.length}>
+                    Duplicate Selected
+                  </Button>
+                  <Button variant="danger" onClick={deleteSelectedSections} disabled={!selectedSectionIds.length}>
+                    Delete Selected
+                  </Button>
+                  <Button variant="ghost" onClick={() => addSection()}>
+                    Add Section
+                  </Button>
+                  <Button
+                    variant="ghost"
+                    onClick={() => {
+                      setGlobalFiles([]);
+                      setSections((prev) => prev.map((section) => ({ ...section, section_reference_images: [] })));
+                      push({ kind: "info", title: "已清空所有参考图" });
+                    }}
+                  >
+                    Clear All Refs
+                  </Button>
+                </div>
+                <div className="rounded-2xl border border-zinc-200 bg-white/70 p-3 text-xs text-zinc-600 dark:border-white/10 dark:bg-zinc-900/40 dark:text-zinc-300">
+                  <div>启用 section：{sections.filter((section) => section.enabled).length} / {sections.length}</div>
+                  <div className="mt-1">提交起点：Section {clamp(Number(submitStartFrom || "1") || 1, 1, Math.max(1, sections.length))}</div>
+                  <div className="mt-1">提交模式：{submitMode === "IMMEDIATE" ? "Queue All Now" : "Queue Per Section"}</div>
+                  <div className="mt-1">预估费用：{currency(estimatedCost)}（前端经验估算，仅供参考）</div>
+                </div>
+                <Button variant="primary" className="w-full" disabled={loading || !totalPlannedJobs} onClick={onSubmit}>
+                  {loading ? "Submitting…" : `Submit Batch (${totalPlannedJobs})`}
+                </Button>
+              </div>
+            </Card>
+          </div>
+
+          <div className="space-y-3">
+            {sections.map((section, index) => {
+              const displayIndex = index + 1;
+              const cap = modelMap.get(section.section_model) || globalModelMeta;
+              const previewText = batchPromptPreview(
+                globalPrompt,
+                section.section_prompt,
+                {
+                  batch_name: batchName.trim() || "batch",
+                  page_no: String(displayIndex),
+                  section_title: section.section_title.trim() || "untitled",
+                },
+                autoInjectPageNo
+              );
+              const autoSessionName = renderTemplate(namingTemplate, {
+                batch_name: batchName.trim() || "batch",
+                page_no: String(displayIndex),
+                section_title: section.section_title.trim() || "untitled",
+              });
+              const isSelected = selectedSectionIds.includes(section.id);
+              return (
+                <Card key={section.id} className={cn(!section.enabled && "opacity-70")}>
+                  <div className="flex flex-wrap items-center justify-between gap-3">
+                    <div className="flex items-center gap-3">
+                      <input
+                        type="checkbox"
+                        checked={isSelected}
+                        onChange={(e) => toggleSelectedSection(section.id, e.target.checked)}
+                        className="h-4 w-4 rounded border-zinc-300 text-zinc-900 focus:ring-zinc-400"
+                      />
+                      <div>
+                        <div className="text-sm font-bold text-zinc-900 dark:text-zinc-50">Section {displayIndex}</div>
+                        <div className="text-xs text-zinc-600 dark:text-zinc-300">
+                          {section.section_title.trim() || "Untitled"} · {section.section_job_count} job(s)
+                        </div>
+                      </div>
+                    </div>
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="text-xs font-semibold text-zinc-600 dark:text-zinc-300">Enabled</span>
+                      <Switch
+                        value={section.enabled}
+                        onChange={(value) => updateSection(section.id, (current) => ({ ...current, enabled: value }))}
+                      />
+                      <Button variant="ghost" className="!px-2 !py-1 text-xs" onClick={() => copyPreviousSectionParams(section.id)} disabled={index === 0}>
+                        Copy Prev Settings
+                      </Button>
+                      <Button variant="ghost" className="!px-2 !py-1 text-xs" onClick={() => duplicateSection(section.id)}>
+                        Duplicate
+                      </Button>
+                      <Button
+                        variant="danger"
+                        className="!px-2 !py-1 text-xs"
+                        onClick={() => {
+                          setSections((prev) => {
+                            const next = prev.filter((item) => item.id !== section.id);
+                            return next.length
+                              ? next
+                              : [
+                                  createBatchSectionDraft({
+                                    fallbackModel: globalModel,
+                                    settings,
+                                    defaultCollectionMode: defaultCollectionStrategy,
+                                  }),
+                                ];
+                          });
+                          setSelectedSectionIds((prev) => prev.filter((id) => id !== section.id));
+                        }}
+                      >
+                        Delete
+                      </Button>
+                    </div>
+                  </div>
+
+                  <div className="mt-3 grid gap-3 xl:grid-cols-[minmax(0,1.12fr)_minmax(320px,0.88fr)]">
+                    <div className="space-y-3">
+                      <div className="grid gap-3 md:grid-cols-2">
+                        <Field label={<span className="inline-flex items-center gap-1.5">section_title <HelpTip text="可选标题。会参与 session 自动命名，也可用于 prompt 模板里的 {{section_title}}。" /></span>}>
+                          <Input
+                            value={section.section_title}
+                            onChange={(v) => updateSection(section.id, (current) => ({ ...current, section_title: v }))}
+                            placeholder="Slide title / Chapter title"
+                          />
+                        </Field>
+                        <Field label={<span className="inline-flex items-center gap-1.5">inherit_previous_settings <HelpTip text="打开后会立即拷贝上一个 section 的模型、比例、尺寸、温度、数量和图像集策略；标题、prompt、参考图不会被覆盖。" /></span>}>
+                          <div className="flex h-[42px] items-center justify-between rounded-2xl border border-zinc-200 bg-zinc-50/80 px-3 dark:border-white/10 dark:bg-zinc-950/40">
+                            <span className="text-sm text-zinc-700 dark:text-zinc-200">Follow previous core settings</span>
+                            <Switch
+                              value={section.inherit_previous_settings}
+                              onChange={(value) => {
+                                updateSection(section.id, (current) => ({ ...current, inherit_previous_settings: value }));
+                                if (value && index > 0) {
+                                  copyPreviousSectionParams(section.id);
+                                }
+                              }}
+                            />
+                          </div>
+                        </Field>
+                      </div>
+
+                      <Field label={<span className="inline-flex items-center gap-1.5">section_prompt <HelpTip text="当前页的独立描述。会排在全局 prompt 之前，再拼接全局 prompt 和可选页码信息。" /></span>}>
+                        <TextArea
+                          value={section.section_prompt}
+                          onChange={(v) => updateSection(section.id, (current) => ({ ...current, section_prompt: v }))}
+                          rows={5}
+                          placeholder="描述这一页需要出现的主体、情绪、构图或画面动作"
+                        />
+                      </Field>
+
+                      <Field label={<span className="inline-flex items-center gap-1.5">section_reference_images <HelpTip text="这一页的局部参考图。送入模型时会排在全局参考图之后。" /></span>}>
+                        <ImageDropzone
+                          files={section.section_reference_images}
+                          setFiles={(next) =>
+                            updateSection(section.id, (current) => ({
+                              ...current,
+                              section_reference_images:
+                                typeof next === "function" ? next(current.section_reference_images) : next,
+                            }))
+                          }
+                          maxFiles={MAX_REF_FILES}
+                        />
+                      </Field>
+                    </div>
+
+                    <div className="space-y-3">
+                      <div className="grid gap-3 md:grid-cols-2">
+                        <Field label={<span className="inline-flex items-center gap-1.5">section_model <HelpTip text="只影响当前 section。若这个 section 要求完全不同的风格或能力，可单独切模型。" /></span>}>
+                          <Select
+                            value={String(section.section_model)}
+                            onChange={(v) => applySectionModel(section.id, v as ModelId)}
+                            options={catalog.models.map((item) => ({ value: item.model_id, label: item.label }))}
+                          />
+                        </Field>
+                        <Field label={<span className="inline-flex items-center gap-1.5">section_aspect_ratio <HelpTip text="当前 section 的独立宽高比。PPT 内容页常见 16:9，人物竖图常见 3:4 或 9:16。" /></span>}>
+                          <Select
+                            value={String(section.section_aspect_ratio)}
+                            onChange={(v) => updateSection(section.id, (current) => ({ ...current, section_aspect_ratio: v as AspectRatio }))}
+                            options={(cap?.supported_aspect_ratios || ["1:1"]).map((item) => ({ value: item, label: item }))}
+                          />
+                        </Field>
+                        <Field label={<span className="inline-flex items-center gap-1.5">section_image_size <HelpTip text="当前 section 的独立尺寸。尺寸越大越适合留裁切空间，但成本和等待时间通常会上升。" /></span>}>
+                          <Select
+                            value={String(section.section_image_size)}
+                            onChange={(v) => updateSection(section.id, (current) => ({ ...current, section_image_size: v as ImageSize }))}
+                            options={
+                              cap?.supports_image_size
+                                ? (cap.supported_image_sizes || []).map((item) => ({ value: item, label: item }))
+                                : [{ value: "AUTO", label: "AUTO" }]
+                            }
+                          />
+                        </Field>
+                        <Field label={<span className="inline-flex items-center gap-1.5">section_job_count ({section.section_job_count}) <HelpTip text="当前 section 要生成几张。总任务数会按所有计划 section 的 job_count 求和。" /></span>}>
+                          <input
+                            type="range"
+                            min={1}
+                            max={12}
+                            step={1}
+                            value={section.section_job_count}
+                            onChange={(e) =>
+                              updateSection(section.id, (current) => ({
+                                ...current,
+                                section_job_count: Number(e.target.value),
+                              }))
+                            }
+                            className="w-full"
+                          />
+                        </Field>
+                      </div>
+
+                      <Field label={<span className="inline-flex items-center gap-1.5">section_temperature ({section.section_temperature.toFixed(2)}) <HelpTip text="这个 section 的随机度。需要更稳定的品牌视觉时建议偏低；做概念探索时可以略高。" /></span>}>
+                        <input
+                          type="range"
+                          min={0}
+                          max={2}
+                          step={0.05}
+                          value={section.section_temperature}
+                          onChange={(e) =>
+                            updateSection(section.id, (current) => ({
+                              ...current,
+                              section_temperature: Number(e.target.value),
+                            }))
+                          }
+                          className="w-full"
+                        />
+                      </Field>
+
+                      <Field label={<span className="inline-flex items-center gap-1.5">collection_mode <HelpTip text="决定当前 section 生成出来的图是否要写入本地 session。推荐默认自动建 session，后续筛图更顺手。" /></span>}>
+                        <Select
+                          value={section.collection_mode}
+                          onChange={(v) =>
+                            updateSection(section.id, (current) => ({
+                              ...current,
+                              collection_mode: v as BatchCollectionMode,
+                            }))
+                          }
+                          options={BATCH_COLLECTION_MODE_OPTIONS.map((item) => ({ value: item.value, label: item.label }))}
+                        />
+                      </Field>
+
+                      {section.collection_mode === "AUTO_NEW" ? (
+                        <Field label={<span className="inline-flex items-center gap-1.5">collection_name <HelpTip text="AUTO_NEW 时可手动指定 session 名称；留空则回退到命名模板。" /></span>}>
+                          <Input
+                            value={section.collection_name}
+                            onChange={(v) => updateSection(section.id, (current) => ({ ...current, collection_name: v }))}
+                            placeholder="可选，自定义 session 名称"
+                          />
+                        </Field>
+                      ) : null}
+
+                      {section.collection_mode === "AUTO_BATCH" ? (
+                        <div className="rounded-2xl border border-zinc-200 bg-zinc-50/80 px-3 py-3 text-sm text-zinc-700 dark:border-white/10 dark:bg-zinc-950/40 dark:text-zinc-200">
+                          <div className="font-semibold">Auto session name</div>
+                          <div className="mt-1 break-all text-xs text-zinc-500 dark:text-zinc-400">{autoSessionName}</div>
+                        </div>
+                      ) : null}
+
+                      {section.collection_mode === "EXISTING" ? (
+                        <BatchSessionSelector
+                          pickerSessions={sortedPickerSessions}
+                          selectedIds={section.existing_session_ids}
+                          onToggle={(sessionId, checked) =>
+                            updateSection(section.id, (current) => ({
+                              ...current,
+                              existing_session_ids: checked
+                                ? Array.from(new Set([sessionId, ...current.existing_session_ids]))
+                                : current.existing_session_ids.filter((id) => id !== sessionId),
+                            }))
+                          }
+                          onCreateAndSelect={(name) => createAndAttachExistingSession(section.id, name)}
+                        />
+                      ) : null}
+
+                      <div className="rounded-2xl border border-zinc-200 bg-zinc-50/80 p-3 dark:border-white/10 dark:bg-zinc-950/40">
+                        <div className="flex items-center gap-2 text-sm font-semibold text-zinc-900 dark:text-zinc-50">
+                          Prompt Preview
+                          <HelpTip text="这是提交给后端的最终 prompt 预览，已经把变量、全局 prompt 和页码注入逻辑都合成好了。" />
+                        </div>
+                        <pre className="mt-2 whitespace-pre-wrap break-words text-xs leading-6 text-zinc-600 dark:text-zinc-300">
+                          {previewText || "当前 section 还没有内容"}
+                        </pre>
+                      </div>
+                    </div>
+                  </div>
+                </Card>
+              );
+            })}
+          </div>
+        </div>
+      </PageContainer>
+    </>
+  );
+}
 
 function CreateJobPage() {
   const client = useApiClient();
@@ -3984,11 +5320,17 @@ function CreateJobPage() {
   const settings = useSettingsStore((s) => s.settings);
   const setSettings = useSettingsStore((s) => s.setSettings);
   const updateDefaultParams = useSettingsStore((s) => s.updateDefaultParams);
+  const pickerSessions = usePickerStore((s) => s.sessions);
+  const createPickerSession = usePickerStore((s) => s.createSession);
+  const addPickerItems = usePickerStore((s) => s.addItems);
 
   const [prompt, setPrompt] = useState("");
   const [files, setFiles] = useState<File[]>([]);
   const [model, setModel] = useState<ModelId>(settings.defaultModel || catalog.default_model);
   const [mode, setMode] = useState<CreateMode>("IMAGE_ONLY");
+  const [sessionSearch, setSessionSearch] = useState("");
+  const [newSessionName, setNewSessionName] = useState("");
+  const [boundSessionIds, setBoundSessionIds] = useState<string[]>([]);
 
   const initParams = getParamsForModel(settings, settings.defaultModel || catalog.default_model);
   const [aspect, setAspect] = useState<AspectRatio>(initParams.aspect_ratio);
@@ -4027,6 +5369,12 @@ function CreateJobPage() {
     () => catalog.models.find((m) => m.model_id === pendingModelChoice) || null,
     [catalog.models, pendingModelChoice]
   );
+  const filteredPickerSessions = useMemo(() => {
+    const query = sessionSearch.trim().toLowerCase();
+    if (!query) return pickerSessions;
+    return pickerSessions.filter((session) => session.name.toLowerCase().includes(query));
+  }, [pickerSessions, sessionSearch]);
+  const boundSessionIdSet = useMemo(() => new Set(boundSessionIds), [boundSessionIds]);
 
   const applyModelChoice = (nextModel: ModelId) => {
     setModel(nextModel);
@@ -4062,6 +5410,10 @@ function CreateJobPage() {
     setMaxRetries(saved.max_retries);
     hydratedModelRef.current = model;
   }, [currentModel, model, settings.defaultModel, settings.defaultParams, settings.defaultParamsByModel]);
+
+  useEffect(() => {
+    setBoundSessionIds((prev) => prev.filter((sessionId) => pickerSessions.some((session) => session.session_id === sessionId)));
+  }, [pickerSessions]);
 
   useEffect(() => {
     const onPaste = (evt: ClipboardEvent) => {
@@ -4218,6 +5570,41 @@ function CreateJobPage() {
     return nextSession;
   };
 
+  const toggleBoundSession = (sessionId: string, checked: boolean) => {
+    setBoundSessionIds((prev) => {
+      if (checked) return Array.from(new Set([sessionId, ...prev]));
+      return prev.filter((id) => id !== sessionId);
+    });
+  };
+
+  const handleCreateAndBindSession = () => {
+    const sessionId = createPickerSession(newSessionName.trim() || undefined);
+    setBoundSessionIds((prev) => Array.from(new Set([sessionId, ...prev])));
+    setNewSessionName("");
+    push({ kind: "success", title: "已创建并绑定 session" });
+  };
+
+  const attachJobToBoundSessions = (job: {
+    job_id: string;
+    job_access_token?: string;
+    created_at?: string;
+    status?: JobStatus;
+  }) => {
+    if (!boundSessionIds.length) return;
+    boundSessionIds.forEach((sessionId) => {
+      addPickerItems(sessionId, [
+        {
+          item_key: pickerPendingItemKey(job.job_id),
+          job_id: job.job_id,
+          job_access_token: job.job_access_token,
+          picked: true,
+          status: job.status || "QUEUED",
+          added_at: job.created_at || isoNow(),
+        },
+      ]);
+    });
+  };
+
   const executeCreate = async (targetCountOverride?: number, allowTurnstileRecovery = true) => {
     const err = validate();
     if (err) {
@@ -4304,6 +5691,12 @@ function CreateJobPage() {
           batch_index: batchId ? i + 1 : undefined,
         };
         useJobsStore.getState().upsertJob(rec);
+        attachJobToBoundSessions({
+          job_id,
+          job_access_token,
+          created_at: rec.created_at,
+          status: rec.status_cache,
+        });
       }
 
       if (!created.length) {
@@ -4446,178 +5839,282 @@ function CreateJobPage() {
         />
 
         <div className="grid grid-cols-1 gap-3 lg:grid-cols-3">
-        <Card className="lg:col-span-2">
-          <div className="text-sm font-bold text-zinc-900 dark:text-zinc-50">Prompt</div>
-          <div className="mt-2">
-            <TextArea
-              value={prompt}
-              onChange={setPrompt}
-              rows={6}
-              placeholder="描述你想生成的图像（建议包含主体、风格、光照、构图、镜头等）"
-            />
-          </div>
-
-          <Divider />
-
-          <div className="flex items-center justify-between gap-3">
-            <div>
-              <div className="text-sm font-bold text-zinc-900 dark:text-zinc-50">参考图</div>
-              <div className="text-xs text-zinc-600 dark:text-zinc-300">拖拽/选择上传或直接 Ctrl/Cmd+V 粘贴，支持预览与删除</div>
+          <Card className="lg:col-span-2">
+            <div className="text-sm font-bold text-zinc-900 dark:text-zinc-50">Prompt</div>
+            <div className="mt-2">
+              <TextArea
+                value={prompt}
+                onChange={setPrompt}
+                rows={5}
+                placeholder="描述你想生成的图像（建议包含主体、风格、光照、构图、镜头等）"
+              />
             </div>
-            <div className="text-xs text-zinc-500 dark:text-zinc-400">{files.length}/{MAX_REF_FILES}</div>
-          </div>
-
-          <div className="mt-3">
-            <ImageDropzone files={files} setFiles={setFiles} maxFiles={MAX_REF_FILES} />
-          </div>
-        </Card>
-
-        <Card>
-          <div className="flex items-start justify-between gap-2">
-            <div>
-              <div className="text-sm font-bold text-zinc-900 dark:text-zinc-50">参数</div>
-              <div className="text-xs text-zinc-600 dark:text-zinc-300">默认值来自 Settings</div>
-            </div>
-            <span className="rounded-full border border-zinc-200 bg-white/60 px-2 py-1 text-[10px] font-bold text-zinc-600 dark:border-white/10 dark:bg-zinc-900/40 dark:text-zinc-300">
-              v1
-            </span>
-          </div>
-
-          <div className="mt-3 space-y-3">
-            <Field label="model">
-              <Select
-                value={String(model)}
-                onChange={(v) => handleModelChange(v as ModelId)}
-                options={catalog.models.map((m) => ({ value: m.model_id, label: `${m.label} (${m.model_id})` }))}
-              />
-            </Field>
-
-            <Field label="aspect_ratio">
-              <Select
-                value={String(aspect)}
-                onChange={(v) => setAspect(v as AspectRatio)}
-                options={(currentModel?.supported_aspect_ratios || ["1:1"]).map((v) => ({ value: v, label: v }))}
-              />
-              <div className="mt-1 text-[11px] text-zinc-500 dark:text-zinc-400">Google 当前接口不支持 `auto`。</div>
-            </Field>
-
-            {currentModel?.supports_image_size ? (
-              <Field label="image_size">
-                <Select
-                  value={String(size)}
-                  onChange={(v) => setSize(v as ImageSize)}
-                  options={(currentModel.supported_image_sizes || []).map((v) => ({ value: v, label: v }))}
-                />
-              </Field>
-            ) : (
-              <Field label="image_size">
-                <div className="rounded-xl border border-zinc-200 bg-zinc-50 px-3 py-2 text-sm text-zinc-600 dark:border-white/10 dark:bg-zinc-950/30 dark:text-zinc-300">
-                  当前模型输出分辨率固定（无需设置 image_size）
-                </div>
-              </Field>
-            )}
-
-            {currentModel?.supports_thinking_level ? (
-              <Field label="thinking_level">
-                <Select
-                  value={String(thinkingLevel || currentModel.default_params.thinking_level || currentModel.supported_thinking_levels[0] || "High")}
-                  onChange={(v) => setThinkingLevel(v)}
-                  options={(currentModel.supported_thinking_levels || []).map((v) => ({ value: v, label: v }))}
-                />
-              </Field>
-            ) : null}
-
-            <Field label={<span className="inline-flex items-center gap-1.5">temperature ({temperature.toFixed(2)}) <HelpTip text="控制生成结果的随机性。数值越高，结果越发散；数值越低，结果越稳定、更贴近提示词。" /></span>}>
-              <input
-                type="range"
-                min={0}
-                max={1.5}
-                step={0.01}
-                value={temperature}
-                onChange={(e) => setTemperature(Number(e.target.value))}
-                className="w-full"
-              />
-            </Field>
-
-            <Field label={<span className="inline-flex items-center gap-1.5">timeout_sec ({timeoutSec}s) <HelpTip text="单次请求允许后端等待上游模型返回结果的最长时间。时间越长，越适合复杂任务，但等待也会更久。" /></span>}>
-              <input
-                type="range"
-                min={15}
-                max={600}
-                step={1}
-                value={timeoutSec}
-                onChange={(e) => setTimeoutSec(Number(e.target.value))}
-                className="w-full"
-              />
-            </Field>
-
-            <Field label={<span className="inline-flex items-center gap-1.5">max_retries ({maxRetries}) <HelpTip text="当上游请求失败时，后端会自动重试的次数。设为 0 表示失败后立即返回，不再自动补试。" /></span>}>
-              <input
-                type="range"
-                min={0}
-                max={3}
-                step={1}
-                value={maxRetries}
-                onChange={(e) => setMaxRetries(Number(e.target.value))}
-                className="w-full"
-              />
-            </Field>
-
-            <Field label={`job_count (${jobCount})`}>
-              <input
-                type="range"
-                min={1}
-                max={12}
-                step={1}
-                value={jobCount}
-                onChange={(e) => setJobCount(Number(e.target.value))}
-                className="w-full"
-              />
-              <div className="mt-1 text-[11px] text-zinc-500 dark:text-zinc-400">
-                同一 prompt 连续创建多个 job，默认 1，用于一次生成多张图供挑选。
-              </div>
-            </Field>
 
             <Divider />
 
-            <div className="flex items-center justify-between">
+            <div className="flex items-center justify-between gap-3">
               <div>
-                <div className="text-sm font-bold text-zinc-900 dark:text-zinc-50">高级模式</div>
-                <div className="text-xs text-zinc-600 dark:text-zinc-300">
-                  {currentModel?.supports_text_output ? "Text+Image（仅部分模型有效）" : "当前模型仅支持 IMAGE_ONLY"}
+                <div className="text-sm font-bold text-zinc-900 dark:text-zinc-50">参考图</div>
+                <div className="text-xs text-zinc-600 dark:text-zinc-300">拖拽/选择上传或直接 Ctrl/Cmd+V 粘贴，支持预览与删除</div>
+              </div>
+              <div className="text-xs text-zinc-500 dark:text-zinc-400">{files.length}/{MAX_REF_FILES}</div>
+            </div>
+
+            <div className="mt-3">
+              <ImageDropzone files={files} setFiles={setFiles} maxFiles={MAX_REF_FILES} />
+            </div>
+            <Divider />
+
+            <div className="flex flex-wrap items-start justify-between gap-3">
+              <div>
+                <div className="text-sm font-bold text-zinc-900 dark:text-zinc-50">绑定 Session</div>
+                <div className="text-xs text-zinc-600 dark:text-zinc-300">放在当前页内快速绑定。支持多选、搜索、即时新建，也可以完全不选。</div>
+              </div>
+              <div className="rounded-full border border-zinc-200 bg-zinc-50 px-2.5 py-1 text-[10px] font-bold text-zinc-600 dark:border-white/10 dark:bg-zinc-950/40 dark:text-zinc-300">
+                已选 {boundSessionIds.length}
+              </div>
+            </div>
+
+            <div className="mt-3 grid grid-cols-1 gap-2 xl:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto]">
+              <Input
+                value={sessionSearch}
+                onChange={setSessionSearch}
+                placeholder="搜索 session 名称"
+              />
+              <Input
+                value={newSessionName}
+                onChange={setNewSessionName}
+                placeholder="新建 session 名称（可留空）"
+              />
+              <Button variant="secondary" className="xl:min-w-[88px]" onClick={handleCreateAndBindSession}>
+                新建
+              </Button>
+            </div>
+
+            <div className="mt-3 flex flex-wrap items-center justify-between gap-2 text-[11px] text-zinc-500 dark:text-zinc-400">
+              <span>本地已有 {pickerSessions.length} 个 session</span>
+              {boundSessionIds.length ? (
+                <button
+                  type="button"
+                  className="font-semibold text-zinc-700 hover:text-zinc-900 dark:text-zinc-300 dark:hover:text-white"
+                  onClick={() => setBoundSessionIds([])}
+                >
+                  清空选择
+                </button>
+              ) : null}
+            </div>
+
+            <div className="mt-3">
+              {filteredPickerSessions.length ? (
+                <div
+                  className="flex gap-2 overflow-x-auto pb-1"
+                  onWheel={(e) => {
+                    if (Math.abs(e.deltaY) > Math.abs(e.deltaX)) {
+                      (e.currentTarget as HTMLDivElement).scrollLeft += e.deltaY;
+                    }
+                  }}
+                >
+                  {filteredPickerSessions.map((session) => {
+                    const checked = boundSessionIdSet.has(session.session_id);
+                    const counts = getPickerSessionCounts(session);
+                    return (
+                      <label
+                        key={session.session_id}
+                        className={cn(
+                          "min-w-[250px] flex-none cursor-pointer rounded-2xl border px-3 py-3 transition",
+                          checked
+                            ? "border-zinc-900 bg-zinc-50 shadow-sm dark:border-white dark:bg-zinc-950/70"
+                            : "border-zinc-200 bg-white/60 hover:border-zinc-300 dark:border-white/10 dark:bg-zinc-950/30 dark:hover:border-white/20"
+                        )}
+                      >
+                        <div className="flex items-start gap-3">
+                          <input
+                            type="checkbox"
+                            className="mt-1 h-4 w-4 rounded border-zinc-300 text-zinc-900 focus:ring-zinc-400"
+                            checked={checked}
+                            onChange={(e) => toggleBoundSession(session.session_id, e.target.checked)}
+                          />
+                          <div className="min-w-0 flex-1">
+                            <div className="truncate text-sm font-semibold text-zinc-900 dark:text-zinc-50">{session.name}</div>
+                            <div className="mt-1 truncate text-[11px] text-zinc-500 dark:text-zinc-400">
+                              创建于 {formatLocal(session.created_at)}
+                            </div>
+                          </div>
+                        </div>
+                        <div className="mt-3 grid grid-cols-2 gap-2 text-[11px]">
+                          <div className="rounded-xl bg-zinc-50 px-2.5 py-2 dark:bg-zinc-950/60">
+                            <div className="font-semibold text-zinc-900 dark:text-zinc-50">{counts.filmstrip}</div>
+                            <div className="text-zinc-500 dark:text-zinc-400">Filmstrip</div>
+                          </div>
+                          <div className="rounded-xl bg-zinc-50 px-2.5 py-2 dark:bg-zinc-950/60">
+                            <div className="font-semibold text-zinc-900 dark:text-zinc-50">{counts.preferred}</div>
+                            <div className="text-zinc-500 dark:text-zinc-400">优选池</div>
+                          </div>
+                        </div>
+                      </label>
+                    );
+                  })}
+                </div>
+              ) : (
+                <div className="rounded-2xl border border-dashed border-zinc-200 px-3 py-4 text-center text-xs text-zinc-500 dark:border-white/10 dark:text-zinc-400">
+                  没有匹配的 session，可直接上方新建。
+                </div>
+              )}
+            </div>
+
+            <div className="mt-3 text-xs text-zinc-500 dark:text-zinc-400">
+              不选任何 session 也能正常生成；如果已绑定，任务进入生成队列后会先以“生成中”占位写入。
+            </div>
+          </Card>
+
+          <div>
+            <Card>
+              <div className="flex items-start justify-between gap-2">
+                <div>
+                  <div className="text-sm font-bold text-zinc-900 dark:text-zinc-50">参数</div>
+                  <div className="text-xs text-zinc-600 dark:text-zinc-300">默认值来自 Settings</div>
+                </div>
+                <span className="rounded-full border border-zinc-200 bg-white/60 px-2 py-1 text-[10px] font-bold text-zinc-600 dark:border-white/10 dark:bg-zinc-900/40 dark:text-zinc-300">
+                  v1
+                </span>
+              </div>
+
+              <div className="mt-3 space-y-3">
+                <Field label="model">
+                  <Select
+                    value={String(model)}
+                    onChange={(v) => handleModelChange(v as ModelId)}
+                    options={catalog.models.map((m) => ({ value: m.model_id, label: `${m.label} (${m.model_id})` }))}
+                  />
+                </Field>
+
+                <Field label="aspect_ratio">
+                  <Select
+                    value={String(aspect)}
+                    onChange={(v) => setAspect(v as AspectRatio)}
+                    options={(currentModel?.supported_aspect_ratios || ["1:1"]).map((v) => ({ value: v, label: v }))}
+                  />
+                  <div className="mt-1 text-[11px] text-zinc-500 dark:text-zinc-400">Google 当前接口不支持 `auto`。</div>
+                </Field>
+
+                {currentModel?.supports_image_size ? (
+                  <Field label="image_size">
+                    <Select
+                      value={String(size)}
+                      onChange={(v) => setSize(v as ImageSize)}
+                      options={(currentModel.supported_image_sizes || []).map((v) => ({ value: v, label: v }))}
+                    />
+                  </Field>
+                ) : (
+                  <Field label="image_size">
+                    <div className="rounded-xl border border-zinc-200 bg-zinc-50 px-3 py-2 text-sm text-zinc-600 dark:border-white/10 dark:bg-zinc-950/30 dark:text-zinc-300">
+                      当前模型输出分辨率固定（无需设置 image_size）
+                    </div>
+                  </Field>
+                )}
+
+                {currentModel?.supports_thinking_level ? (
+                  <Field label="thinking_level">
+                    <Select
+                      value={String(thinkingLevel || currentModel.default_params.thinking_level || currentModel.supported_thinking_levels[0] || "High")}
+                      onChange={(v) => setThinkingLevel(v)}
+                      options={(currentModel.supported_thinking_levels || []).map((v) => ({ value: v, label: v }))}
+                    />
+                  </Field>
+                ) : null}
+
+                <Field label={<span className="inline-flex items-center gap-1.5">temperature ({temperature.toFixed(2)}) <HelpTip text="控制生成结果的随机性。数值越高，结果越发散；数值越低，结果越稳定、更贴近提示词。" /></span>}>
+                  <input
+                    type="range"
+                    min={0}
+                    max={1.5}
+                    step={0.01}
+                    value={temperature}
+                    onChange={(e) => setTemperature(Number(e.target.value))}
+                    className="w-full"
+                  />
+                </Field>
+
+                <Field label={<span className="inline-flex items-center gap-1.5">timeout_sec ({timeoutSec}s) <HelpTip text="单次请求允许后端等待上游模型返回结果的最长时间。时间越长，越适合复杂任务，但等待也会更久。" /></span>}>
+                  <input
+                    type="range"
+                    min={15}
+                    max={600}
+                    step={1}
+                    value={timeoutSec}
+                    onChange={(e) => setTimeoutSec(Number(e.target.value))}
+                    className="w-full"
+                  />
+                </Field>
+
+                <Field label={<span className="inline-flex items-center gap-1.5">max_retries ({maxRetries}) <HelpTip text="当上游请求失败时，后端会自动重试的次数。设为 0 表示失败后立即返回，不再自动补试。" /></span>}>
+                  <input
+                    type="range"
+                    min={0}
+                    max={3}
+                    step={1}
+                    value={maxRetries}
+                    onChange={(e) => setMaxRetries(Number(e.target.value))}
+                    className="w-full"
+                  />
+                </Field>
+
+                <Field label={`job_count (${jobCount})`}>
+                  <input
+                    type="range"
+                    min={1}
+                    max={12}
+                    step={1}
+                    value={jobCount}
+                    onChange={(e) => setJobCount(Number(e.target.value))}
+                    className="w-full"
+                  />
+                  <div className="mt-1 text-[11px] text-zinc-500 dark:text-zinc-400">
+                    同一 prompt 连续创建多个 job，默认 1，用于一次生成多张图供挑选。
+                  </div>
+                </Field>
+
+                <Divider />
+
+                <div className="flex items-center justify-between">
+                  <div>
+                    <div className="text-sm font-bold text-zinc-900 dark:text-zinc-50">高级模式</div>
+                    <div className="text-xs text-zinc-600 dark:text-zinc-300">
+                      {currentModel?.supports_text_output ? "Text+Image（仅部分模型有效）" : "当前模型仅支持 IMAGE_ONLY"}
+                    </div>
+                  </div>
+                  {currentModel?.supports_text_output ? (
+                    <Switch value={mode === "TEXT_AND_IMAGE"} onChange={(v) => setMode(v ? "TEXT_AND_IMAGE" : "IMAGE_ONLY")} />
+                  ) : (
+                    <span className="rounded-full border border-zinc-200 bg-zinc-100 px-3 py-1 text-xs font-bold text-zinc-600 dark:border-white/10 dark:bg-zinc-900/40 dark:text-zinc-300">
+                      IMAGE_ONLY
+                    </span>
+                  )}
+                </div>
+
+                <Button
+                  variant="primary"
+                  disabled={loading}
+                  onClick={onSubmit}
+                  className="w-full"
+                  title="创建后会写入本地历史，并跳转到详情页"
+                >
+                  {loading ? (
+                    <span className="inline-flex items-center gap-2">
+                      <span className="inline-block h-4 w-4 animate-spin rounded-full border-2 border-white/30 border-t-white dark:border-zinc-400/30 dark:border-t-zinc-900" />
+                      生成中…
+                    </span>
+                  ) : (
+                    "生成"
+                  )}
+                </Button>
+
+                <div className="text-xs text-zinc-500 dark:text-zinc-400">
+                  创建成功后：会把 job_id / token / params 写入 localStorage（本地为主）。
                 </div>
               </div>
-              {currentModel?.supports_text_output ? (
-                <Switch value={mode === "TEXT_AND_IMAGE"} onChange={(v) => setMode(v ? "TEXT_AND_IMAGE" : "IMAGE_ONLY")} />
-              ) : (
-                <span className="rounded-full border border-zinc-200 bg-zinc-100 px-3 py-1 text-xs font-bold text-zinc-600 dark:border-white/10 dark:bg-zinc-900/40 dark:text-zinc-300">
-                  IMAGE_ONLY
-                </span>
-              )}
-            </div>
-
-            <Button
-              variant="primary"
-              disabled={loading}
-              onClick={onSubmit}
-              className="w-full"
-              title="创建后会写入本地历史，并跳转到详情页"
-            >
-              {loading ? (
-                <span className="inline-flex items-center gap-2">
-                  <span className="inline-block h-4 w-4 animate-spin rounded-full border-2 border-white/30 border-t-white dark:border-zinc-400/30 dark:border-t-zinc-900" />
-                  生成中…
-                </span>
-              ) : (
-                "生成"
-              )}
-            </Button>
-
-            <div className="text-xs text-zinc-500 dark:text-zinc-400">
-              创建成功后：会把 job_id / token / params 写入 localStorage（本地为主）。
-            </div>
+            </Card>
           </div>
-        </Card>
         </div>
       </PageContainer>
     </>
@@ -4631,6 +6128,357 @@ function Field({ label, children }: { label: React.ReactNode; children: React.Re
       {children}
     </div>
   );
+}
+
+function PickerSessionJobSync() {
+  const client = useApiClient();
+  const settings = useSettingsStore((s) => s.settings);
+  const jobs = useJobsStore((s) => s.jobs);
+  const updateJob = useJobsStore((s) => s.updateJob);
+  const sessions = usePickerStore((s) => s.sessions);
+  const patchSession = usePickerStore((s) => s.patchSession);
+  const addItems = usePickerStore((s) => s.addItems);
+  const hydratedJobsRef = useRef<Record<string, true>>({});
+  const hydratingJobsRef = useRef<Record<string, true>>({});
+
+  const jobsById = useMemo(() => {
+    const map = new Map<string, JobRecord>();
+    jobs.forEach((job) => map.set(job.job_id, job));
+    return map;
+  }, [jobs]);
+
+  const pendingJobs = useMemo(() => {
+    const map = new Map<
+      string,
+      {
+        job_id: string;
+        job_access_token?: string;
+        status: JobStatus;
+        placeholders: Array<{ session_id: string; key: string; item: PickerSessionItem }>;
+      }
+    >();
+
+    sessions.forEach((session) => {
+      session.items.forEach((item) => {
+        if (pickerItemHasImage(item)) return;
+        const current = map.get(item.job_id);
+        const status = pickerItemJobStatus(item, jobsById.get(item.job_id));
+        if (current) {
+          current.placeholders.push({ session_id: session.session_id, key: pickerItemKey(item), item });
+          if (!current.job_access_token && item.job_access_token) current.job_access_token = item.job_access_token;
+          if (current.status !== "FAILED" && (status === "RUNNING" || status === "QUEUED")) current.status = status;
+        } else {
+          map.set(item.job_id, {
+            job_id: item.job_id,
+            job_access_token: item.job_access_token,
+            status,
+            placeholders: [{ session_id: session.session_id, key: pickerItemKey(item), item }],
+          });
+        }
+      });
+    });
+
+    return Array.from(map.values());
+  }, [jobsById, sessions]);
+
+  useEffect(() => {
+    const activeJobIds = new Set(pendingJobs.map((entry) => entry.job_id));
+    Object.keys(hydratedJobsRef.current).forEach((jobId) => {
+      if (!activeJobIds.has(jobId)) delete hydratedJobsRef.current[jobId];
+    });
+    Object.keys(hydratingJobsRef.current).forEach((jobId) => {
+      if (!activeJobIds.has(jobId)) delete hydratingJobsRef.current[jobId];
+    });
+  }, [pendingJobs]);
+
+  useEffect(() => {
+    if (!pendingJobs.length) return;
+
+    const controller = new AbortController();
+
+    const applySnapshot = (snap: JobStatusSnapshot) => {
+      const rec = jobsById.get(snap.job_id);
+      updateJob(snap.job_id, {
+        status_cache: (snap.status || rec?.status_cache || "UNKNOWN") as JobStatus,
+        model_cache: (snap.model as ModelId) || rec?.model_cache,
+        last_seen_at: isoNow(),
+        ...jobTimingPatch({ job_id: snap.job_id, timing: snap.timing || {} } as JobMeta),
+      });
+    };
+
+    const hydrateSucceededJob = async (entry: (typeof pendingJobs)[number]) => {
+      if (hydratedJobsRef.current[entry.job_id] || hydratingJobsRef.current[entry.job_id]) return;
+      hydratingJobsRef.current[entry.job_id] = true;
+      try {
+        const meta = await client.getJob(entry.job_id, entry.job_access_token, controller.signal);
+        updateJob(entry.job_id, {
+          status_cache: (meta.status || "SUCCEEDED") as JobStatus,
+          model_cache: (meta.model as ModelId) || jobsById.get(entry.job_id)?.model_cache,
+          last_seen_at: isoNow(),
+          ...jobTimingPatch(meta),
+        });
+        const imageIds = extractImageIdsFromResult(meta?.result);
+        if (imageIds.length) {
+          entry.placeholders.forEach(({ session_id, key, item }) => {
+            patchSession(session_id, (session) => ({
+              ...session,
+              items: session.items.filter((sessionItem) => pickerItemKey(sessionItem) !== key),
+            }));
+            addItems(
+              session_id,
+              imageIds.map((image_id) => ({
+                job_id: entry.job_id,
+                image_id,
+                job_access_token: entry.job_access_token || jobsById.get(entry.job_id)?.job_access_token,
+                pool: item.pool,
+                picked: item.picked,
+                rating: item.rating,
+                notes: item.notes,
+                added_at: item.added_at,
+                status: "SUCCEEDED" as JobStatus,
+              }))
+            );
+          });
+        } else {
+          entry.placeholders.forEach(({ session_id, key }) => {
+            patchSession(session_id, (session) => ({
+              ...session,
+              items: session.items.map((item) =>
+                pickerItemKey(item) === key
+                  ? { ...item, status: "SUCCEEDED", notes: item.notes || "结果已完成，等待图片清单同步" }
+                  : item
+              ),
+            }));
+          });
+        }
+        hydratedJobsRef.current[entry.job_id] = true;
+      } catch {
+        // keep placeholder and retry later
+      } finally {
+        delete hydratingJobsRef.current[entry.job_id];
+      }
+    };
+
+    const tick = async () => {
+      const unsettled = pendingJobs.filter((entry) => {
+        const status = (useJobsStore.getState().jobs.find((job) => job.job_id === entry.job_id)?.status_cache || entry.status) as JobStatus;
+        return status !== "SUCCEEDED" && status !== "FAILED";
+      });
+
+      if (unsettled.length) {
+        const refs: JobAccessRef[] = unsettled.map((entry) => ({
+          job_id: entry.job_id,
+          job_access_token: entry.job_access_token,
+        }));
+
+        try {
+          const payload = await client.activeJobs(refs, 100, controller.signal);
+          (payload.active || []).forEach(applySnapshot);
+          (payload.settled || []).forEach(applySnapshot);
+        } catch {
+          await mapLimit(unsettled, clamp(settings.polling.concurrency || 5, 1, 12), async (entry) => {
+            try {
+              const meta = await client.getJob(entry.job_id, entry.job_access_token, controller.signal);
+              updateJob(entry.job_id, {
+                status_cache: (meta.status || "UNKNOWN") as JobStatus,
+                model_cache: (meta.model as ModelId) || jobsById.get(entry.job_id)?.model_cache,
+                last_seen_at: isoNow(),
+                ...jobTimingPatch(meta),
+              });
+            } catch {
+              // ignore transient sync errors
+            }
+          });
+        }
+
+        const latestAfterBatch = new Map(useJobsStore.getState().jobs.map((job) => [job.job_id, job]));
+        const unresolved = unsettled.filter((entry) => {
+          const status = (latestAfterBatch.get(entry.job_id)?.status_cache || entry.status || "UNKNOWN") as JobStatus;
+          return status !== "SUCCEEDED" && status !== "FAILED";
+        });
+        if (unresolved.length) {
+          await mapLimit(unresolved, clamp(settings.polling.concurrency || 5, 1, 12), async (entry) => {
+            try {
+              const meta = await client.getJob(entry.job_id, entry.job_access_token, controller.signal);
+              updateJob(entry.job_id, {
+                status_cache: (meta.status || "UNKNOWN") as JobStatus,
+                model_cache: (meta.model as ModelId) || jobsById.get(entry.job_id)?.model_cache,
+                last_seen_at: isoNow(),
+                ...jobTimingPatch(meta),
+              });
+            } catch {
+              // ignore transient sync errors
+            }
+          });
+        }
+      }
+
+      const latestJobs = new Map(useJobsStore.getState().jobs.map((job) => [job.job_id, job]));
+      const succeeded = pendingJobs.filter((entry) => {
+        const status = (latestJobs.get(entry.job_id)?.status_cache || entry.status || "UNKNOWN") as JobStatus;
+        return status === "SUCCEEDED" && !hydratedJobsRef.current[entry.job_id];
+      });
+      if (succeeded.length) {
+        await mapLimit(succeeded, 2, async (entry) => {
+          await hydrateSucceededJob(entry);
+          return null;
+        });
+      }
+    };
+
+    tick();
+    const hasActive = pendingJobs.some((entry) => {
+      const status = (jobsById.get(entry.job_id)?.status_cache || entry.status) as JobStatus;
+      return status !== "SUCCEEDED" && status !== "FAILED";
+    });
+    if (!hasActive) {
+      return () => controller.abort();
+    }
+
+    const timer = window.setInterval(tick, clamp(settings.polling.intervalMs || 1200, 800, 10000));
+    return () => {
+      controller.abort();
+      window.clearInterval(timer);
+    };
+  }, [addItems, client, jobsById, patchSession, pendingJobs, settings.polling.concurrency, settings.polling.intervalMs, updateJob]);
+
+  return null;
+}
+
+function FailedBatchSessionCleanup() {
+  const jobs = useJobsStore((s) => s.jobs);
+  const sessions = usePickerStore((s) => s.sessions);
+  const removeItem = usePickerStore((s) => s.removeItem);
+  const cleanedRef = useRef<Record<string, true>>({});
+
+  useEffect(() => {
+    jobs.forEach((job) => {
+      if (!job.auto_remove_failed_from_picker) return;
+      if ((job.status_cache || "UNKNOWN") !== "FAILED") return;
+      const linkedSessionIds = job.linked_session_ids || [];
+      if (!linkedSessionIds.length) return;
+      const cleanupKey = `${job.job_id}:${linkedSessionIds.join(",")}`;
+      if (cleanedRef.current[cleanupKey]) return;
+      linkedSessionIds.forEach((sessionId) => {
+        const session = sessions.find((item) => item.session_id === sessionId);
+        if (!session) return;
+        const pendingKey = pickerPendingItemKey(job.job_id);
+        if (session.items.some((item) => pickerItemKey(item) === pendingKey)) {
+          removeItem(sessionId, pendingKey);
+        }
+      });
+      cleanedRef.current[cleanupKey] = true;
+    });
+  }, [jobs, removeItem, sessions]);
+
+  return null;
+}
+
+function PendingSessionDirectHydrator() {
+  const client = useApiClient();
+  const settings = useSettingsStore((s) => s.settings);
+  const sessions = usePickerStore((s) => s.sessions);
+  const patchSession = usePickerStore((s) => s.patchSession);
+  const addItems = usePickerStore((s) => s.addItems);
+  const updateJob = useJobsStore((s) => s.updateJob);
+
+  const pendingEntries = useMemo(() => {
+    const map = new Map<
+      string,
+      {
+        job_id: string;
+        job_access_token?: string;
+        placeholders: Array<{ session_id: string; key: string; item: PickerSessionItem }>;
+      }
+    >();
+
+    sessions.forEach((session) => {
+      session.items.forEach((item) => {
+        if (pickerItemHasImage(item)) return;
+        const key = pickerItemKey(item);
+        const found = map.get(item.job_id);
+        if (found) {
+          found.placeholders.push({ session_id: session.session_id, key, item });
+          if (!found.job_access_token && item.job_access_token) found.job_access_token = item.job_access_token;
+        } else {
+          map.set(item.job_id, {
+            job_id: item.job_id,
+            job_access_token: item.job_access_token,
+            placeholders: [{ session_id: session.session_id, key, item }],
+          });
+        }
+      });
+    });
+
+    return Array.from(map.values());
+  }, [sessions]);
+
+  useEffect(() => {
+    if (!pendingEntries.length) return;
+    const controller = new AbortController();
+
+    const tick = async () => {
+      await mapLimit(pendingEntries, 2, async (entry) => {
+        try {
+          const meta = await client.getJob(entry.job_id, entry.job_access_token, controller.signal);
+          const nextStatus = (meta.status || "UNKNOWN") as JobStatus;
+          updateJob(entry.job_id, {
+            status_cache: nextStatus,
+            model_cache: (meta.model as ModelId) || useJobsStore.getState().jobs.find((job) => job.job_id === entry.job_id)?.model_cache,
+            last_seen_at: isoNow(),
+            ...jobTimingPatch(meta),
+          });
+
+          if (nextStatus === "SUCCEEDED") {
+            const imageIds = extractImageIdsFromResult(meta?.result);
+            if (imageIds.length) {
+              entry.placeholders.forEach(({ session_id, key, item }) => {
+                patchSession(session_id, (session) => ({
+                  ...session,
+                  items: session.items.filter((sessionItem) => pickerItemKey(sessionItem) !== key),
+                }));
+                addItems(
+                  session_id,
+                  imageIds.map((image_id) => ({
+                    job_id: entry.job_id,
+                    image_id,
+                    job_access_token: entry.job_access_token,
+                    pool: item.pool,
+                    picked: item.picked,
+                    rating: item.rating,
+                    notes: item.notes,
+                    added_at: item.added_at,
+                    status: "SUCCEEDED" as JobStatus,
+                  }))
+                );
+              });
+            }
+            return;
+          }
+
+          entry.placeholders.forEach(({ session_id, key }) => {
+            patchSession(session_id, (session) => ({
+              ...session,
+              items: session.items.map((item) =>
+                pickerItemKey(item) === key ? { ...item, status: nextStatus } : item
+              ),
+            }));
+          });
+        } catch {
+          // ignore transient polling errors
+        }
+      });
+    };
+
+    tick();
+    const timer = window.setInterval(tick, clamp(settings.polling.intervalMs || 1200, 800, 10000));
+    return () => {
+      controller.abort();
+      window.clearInterval(timer);
+    };
+  }, [addItems, client, patchSession, pendingEntries, settings.polling.intervalMs, updateJob]);
+
+  return null;
 }
 
 // -----------------------------
@@ -4819,7 +6667,7 @@ function HistoryPage() {
 
     if (tokens) {
       list = list.filter((j) => {
-        const hay = `${j.job_id} ${j.model_cache || ""} ${(j.prompt_preview || "")} ${(j.tags || []).join(" ")}`.toLowerCase();
+        const hay = `${j.job_id} ${j.model_cache || ""} ${(j.prompt_preview || "")} ${(j.tags || []).join(" ")} ${j.batch_name || ""} ${j.batch_note || ""} ${j.section_title || ""} ${j.section_index || ""}`.toLowerCase();
         return hay.includes(tokens);
       });
     }
@@ -5107,7 +6955,7 @@ function HistoryPage() {
         <Card className="h-fit xl:sticky xl:top-20">
           <div className="text-sm font-bold text-zinc-900 dark:text-zinc-50">筛选</div>
           <div className="mt-3 space-y-3">
-            <Field label="搜索（prompt / tag / job_id）">
+            <Field label="搜索（prompt / tag / job_id / batch / section）">
               <Input value={q} onChange={setQ} placeholder="输入关键词…" />
             </Field>
 
@@ -5409,6 +7257,16 @@ function JobList({
               同批次 #{j.batch_index || "?"}/{j.batch_size}
             </span>
           ) : null}
+          {j.batch_name ? (
+            <span className="rounded-full border border-white/10 bg-white/10 px-2 py-0.5">
+              Batch {j.batch_name}
+            </span>
+          ) : null}
+          {typeof j.section_index === "number" ? (
+            <span className="rounded-full border border-white/10 bg-white/10 px-2 py-0.5">
+              Section {j.section_index}{j.section_title ? ` · ${j.section_title}` : ""}
+            </span>
+          ) : null}
           {j.model_cache ? <span className="rounded-full border border-white/10 bg-white/10 px-2 py-0.5">{j.model_cache}</span> : null}
           {j.params_cache?.image_size ? <span className="rounded-full border border-white/10 bg-white/10 px-2 py-0.5">{j.params_cache.image_size}</span> : null}
           {j.params_cache?.aspect_ratio ? <span className="rounded-full border border-white/10 bg-white/10 px-2 py-0.5">{j.params_cache.aspect_ratio}</span> : null}
@@ -5481,6 +7339,16 @@ function JobList({
                 <span className="rounded-full border border-sky-300/70 bg-white/70 px-2 py-0.5 text-[11px] font-semibold text-sky-700 dark:border-sky-700/40 dark:bg-sky-950/20 dark:text-sky-200">
                   当前页 {group.items.length}/{totalInBatch} jobs
                 </span>
+                {first?.batch_name ? (
+                  <span className="rounded-full border border-emerald-300/70 bg-white/70 px-2 py-0.5 text-[11px] font-semibold text-emerald-700 dark:border-emerald-700/40 dark:bg-emerald-950/20 dark:text-emerald-200">
+                    {first.batch_name}
+                  </span>
+                ) : null}
+                {first?.batch_note ? (
+                  <span className="rounded-full border border-zinc-200 bg-white/70 px-2 py-0.5 text-[11px] text-zinc-600 dark:border-white/10 dark:bg-zinc-900/50 dark:text-zinc-300">
+                    {first.batch_note}
+                  </span>
+                ) : null}
                 <span className="rounded-full border border-zinc-200 bg-white/70 px-2 py-0.5 text-[11px] text-zinc-600 dark:border-white/10 dark:bg-zinc-900/50 dark:text-zinc-300">
                   批次 {shortId(group.batchId!, 5)}
                 </span>
@@ -6107,6 +7975,40 @@ function BestCrownBadge({ active }: { active: boolean }) {
   );
 }
 
+function LoadingRing({ className }: { className?: string }) {
+  return (
+    <span
+      className={cn(
+        "inline-block h-4 w-4 animate-spin rounded-full border-2 border-zinc-300/60 border-t-zinc-900 dark:border-white/20 dark:border-t-white",
+        className
+      )}
+    />
+  );
+}
+
+function PickerPendingVisual({ status }: { status: JobStatus }) {
+  const failed = status === "FAILED";
+  const waitingResult = status === "SUCCEEDED";
+  const title = failed ? "生成失败" : waitingResult ? "生成完成，正在同步结果" : "图像生成中";
+  const desc = failed ? "保留该条目，便于后续排查或移除。" : waitingResult ? "正在写入 session 图片清单。" : "任务已进入 session，图片返回后会自动补全。";
+
+  return (
+    <div className="flex h-full w-full flex-col items-center justify-center gap-2 px-4 text-center">
+      {failed ? (
+        <span className="inline-flex h-9 w-9 items-center justify-center rounded-full border border-rose-300 bg-rose-50 text-sm font-bold text-rose-700 dark:border-rose-900 dark:bg-rose-950/30 dark:text-rose-200">
+          !
+        </span>
+      ) : (
+        <LoadingRing className="h-5 w-5" />
+      )}
+      <div className={cn("text-sm font-semibold", failed ? "text-rose-700 dark:text-rose-200" : "text-zinc-700 dark:text-zinc-100")}>
+        {title}
+      </div>
+      <div className="max-w-[240px] text-[11px] leading-5 text-zinc-500 dark:text-zinc-400">{desc}</div>
+    </div>
+  );
+}
+
 function PickerCompareSlot({
   slotLabel,
   item,
@@ -6143,11 +8045,13 @@ function PickerCompareSlot({
   onFixToken: () => void;
 }) {
   useEffect(() => {
-    if (item) onEnsureImage();
+    if (item && pickerItemHasImage(item)) onEnsureImage();
   }, [item?.job_id, item?.image_id]);
 
   const locked = image?.code === "TOKEN_REQUIRED";
   const notFound = image?.code === "404";
+  const hasImage = pickerItemHasImage(item);
+  const status = item ? pickerItemJobStatus(item, jobRec) : "UNKNOWN";
 
   return (
     <motion.div
@@ -6167,6 +8071,8 @@ function PickerCompareSlot({
       <div className="relative h-[260px] w-full sm:h-[320px] md:h-[360px]">
         {!item ? (
           <div className="flex h-full items-center justify-center text-sm text-zinc-500 dark:text-zinc-400">空槽位 {slotLabel}</div>
+        ) : !hasImage ? (
+          <PickerPendingVisual status={status} />
         ) : image?.url ? (
           <img
             src={image.url}
@@ -6219,7 +8125,7 @@ function PickerCompareSlot({
 
         <div className="absolute left-2 top-2 z-20 flex items-center gap-2">
           <span className="rounded-full bg-black/55 px-2 py-1 text-[11px] font-bold text-white">{slotLabel}</span>
-          <button type="button" onClick={onBest}>
+          <button type="button" onClick={onBest} disabled={!hasImage}>
             <BestCrownBadge active={isBest} />
           </button>
         </div>
@@ -6234,12 +8140,25 @@ function PickerCompareSlot({
       </div>
 
       {item ? (
-        <div className="relative z-20 border-t border-black/5 bg-white/80 p-2 dark:border-white/10 dark:bg-zinc-900/70">
+          <div className="relative z-20 border-t border-black/5 bg-white/80 p-2 dark:border-white/10 dark:bg-zinc-900/70">
           <div className="flex items-center justify-between gap-2">
             <div className="truncate text-xs font-semibold text-zinc-700 dark:text-zinc-200">
               {displayName}
             </div>
-            <RatingStars value={item.rating || 0} onChange={onRate} />
+            {hasImage ? (
+              <RatingStars value={item.rating || 0} onChange={onRate} />
+            ) : (
+              <span
+                className={cn(
+                  "rounded-full px-2 py-0.5 text-[10px] font-bold",
+                  status === "FAILED"
+                    ? "bg-rose-500/15 text-rose-700 dark:text-rose-200"
+                    : "bg-sky-500/15 text-sky-700 dark:text-sky-200"
+                )}
+              >
+                {status}
+              </span>
+            )}
           </div>
           {showInfo ? (
             <div className="mt-1 grid grid-cols-2 gap-1 text-[11px] text-zinc-500 dark:text-zinc-400">
@@ -6454,6 +8373,7 @@ function PickerPage() {
         image_id,
         job_access_token: loaded.token || jobsById.get(job_id)?.job_access_token,
         picked: true,
+        status: "SUCCEEDED" as JobStatus,
         added_at: isoNow(),
       }))
     );
@@ -6530,6 +8450,7 @@ function PickerPage() {
   const isPreferredKey = (key?: string | null) => Boolean(key && (itemMap.get(key)?.pool || "FILMSTRIP") === "PREFERRED");
 
   const ensureImage = async (item: PickerSessionItem) => {
+    if (!pickerItemHasImage(item)) return;
     const key = pickerItemKey(item);
     const snap = imageStateRef.current[key];
     if (snap?.url || snap?.loading || inFlightRef.current.has(key)) return;
@@ -6596,10 +8517,11 @@ function PickerPage() {
       const items = session.items.map((it) => {
         const itemKey = pickerItemKey(it);
         if (itemKey !== key) return it;
+        if (!pickerItemHasImage(it)) return it;
         const currentPool = it.pool === "PREFERRED" ? "PREFERRED" : "FILMSTRIP";
         return { ...it, pool: currentPool === "PREFERRED" ? "FILMSTRIP" : "PREFERRED" };
       });
-      const preferred = items.find((it) => (it.pool || "FILMSTRIP") === "PREFERRED");
+      const preferred = items.find((it) => (it.pool || "FILMSTRIP") === "PREFERRED" && pickerItemHasImage(it));
       return {
         ...session,
         items,
@@ -6664,6 +8586,7 @@ function PickerPage() {
   );
 
   const downloadOne = async (item: PickerSessionItem) => {
+    if (!pickerItemHasImage(item)) return false;
     try {
       const blob = await runWithImageAccessTurnstile(() =>
         client.getImageBlob(item.job_id, item.image_id, item.job_access_token)
@@ -6683,7 +8606,7 @@ function PickerPage() {
   };
 
   const downloadBest = async () => {
-    const preferred = orderedItemsByPool.filter((it) => (it.pool || "FILMSTRIP") === "PREFERRED");
+    const preferred = orderedItemsByPool.filter((it) => (it.pool || "FILMSTRIP") === "PREFERRED" && pickerItemHasImage(it));
     if (!preferred.length) {
       push({ kind: "info", title: "优选池为空" });
       return;
@@ -6698,7 +8621,7 @@ function PickerPage() {
   };
 
   const downloadPicked = async () => {
-    const picked = sessionItems.filter((it) => it.picked);
+    const picked = sessionItems.filter((it) => it.picked && pickerItemHasImage(it));
     if (!picked.length) {
       push({ kind: "info", title: "请先勾选要下载的图片" });
       return;
@@ -6715,7 +8638,7 @@ function PickerPage() {
   const downloadFocus = async () => {
     if (!focusKey) return;
     const item = itemMap.get(focusKey);
-    if (!item) return;
+    if (!item || !pickerItemHasImage(item)) return;
     const ok = await downloadOne(item);
     if (ok) push({ kind: "success", title: "下载已触发" });
   };
@@ -6793,6 +8716,8 @@ function PickerPage() {
     const isBest = Boolean(slotKey && isPreferredKey(slotKey));
     const jobRec = item ? jobsById.get(item.job_id) : undefined;
     const display = item ? pickerDisplayName(item, jobRec) : `空槽位 ${label}`;
+    const hasImage = pickerItemHasImage(item);
+    const status = item ? pickerItemJobStatus(item, jobRec) : "UNKNOWN";
     const immersiveHeightClass =
       compareMode === "FOUR"
         ? "h-[44vh] min-h-[300px] md:h-[46vh]"
@@ -6818,6 +8743,8 @@ function PickerPage() {
         <div className={cn("relative w-full", immersiveHeightClass)}>
           {!item ? (
             <div className="flex h-full items-center justify-center text-sm text-zinc-400">{display}</div>
+          ) : !hasImage ? (
+            <PickerPendingVisual status={status} />
           ) : state?.url ? (
             <img
               src={state.url}
@@ -6848,8 +8775,9 @@ function PickerPage() {
             )}
             onClick={(e) => {
               e.stopPropagation();
-              if (slotKey) toggleBest(slotKey);
+              if (slotKey && hasImage) toggleBest(slotKey);
             }}
+            disabled={!hasImage}
           >
             {isBest ? "移回片池" : "移入优选"}
           </button>
@@ -6872,11 +8800,17 @@ function PickerPage() {
           <div className="pointer-events-none absolute inset-x-0 bottom-0 z-20 border-t border-white/10 bg-black/55 px-3 py-2 opacity-0 backdrop-blur transition group-hover:opacity-100">
             <div className="flex items-center justify-between gap-2">
               <div className="truncate text-xs font-semibold text-zinc-200">{display}</div>
-              <RatingStars
-                value={item.rating || 0}
-                onChange={(n) => slotKey && updateItem(currentSession.session_id, slotKey, { rating: n })}
-                className="pointer-events-auto"
-              />
+              {hasImage ? (
+                <RatingStars
+                  value={item.rating || 0}
+                  onChange={(n) => slotKey && updateItem(currentSession.session_id, slotKey, { rating: n })}
+                  className="pointer-events-auto"
+                />
+              ) : (
+                <span className="pointer-events-auto rounded-full bg-white/10 px-2 py-0.5 text-[10px] font-bold text-white/80">
+                  {status}
+                </span>
+              )}
             </div>
           </div>
         ) : null}
@@ -7071,6 +9005,8 @@ function PickerPage() {
                 const active = key === focusKey;
                 const inSlot = normalizedSlots.indexOf(key);
                 const state = imageState[key];
+                const hasImage = pickerItemHasImage(item);
+                const status = pickerItemJobStatus(item, jobsById.get(item.job_id));
                 return (
                   <motion.div
                     layout
@@ -7084,9 +9020,11 @@ function PickerPage() {
                       type="button"
                       className="relative block h-36 w-full overflow-hidden bg-zinc-100 dark:bg-zinc-900"
                       onClick={() => setFocus(currentSession.session_id, key)}
-                      onMouseEnter={() => ensureImage(item)}
+                      onMouseEnter={() => hasImage && ensureImage(item)}
                     >
-                      {state?.url ? (
+                      {!hasImage ? (
+                        <PickerPendingVisual status={status} />
+                      ) : state?.url ? (
                         <img
                           src={state.url}
                           alt={item.image_id}
@@ -7115,20 +9053,33 @@ function PickerPage() {
                         </label>
                         <div className="text-[11px] text-zinc-500 dark:text-zinc-400">{inSlot >= 0 ? String.fromCharCode(65 + inSlot) : "-"}</div>
                       </div>
-                      <RatingStars
-                        value={item.rating || 0}
-                        onChange={(n) => updateItem(currentSession.session_id, key, { rating: n })}
-                      />
+                      {hasImage ? (
+                        <RatingStars
+                          value={item.rating || 0}
+                          onChange={(n) => updateItem(currentSession.session_id, key, { rating: n })}
+                        />
+                      ) : (
+                        <div
+                          className={cn(
+                            "rounded-xl px-2 py-1 text-[11px] font-semibold",
+                            status === "FAILED"
+                              ? "bg-rose-500/10 text-rose-700 dark:text-rose-200"
+                              : "bg-sky-500/10 text-sky-700 dark:text-sky-200"
+                          )}
+                        >
+                          {status === "FAILED" ? "该任务生成失败" : "图像生成中，完成后会自动补图"}
+                        </div>
+                      )}
                       <div className="flex flex-wrap gap-1">
                         {["A", "B", "C", "D"].map((s, i) => (
                           <Button key={s} variant="ghost" className="!px-1.5 !py-0.5 text-[10px]" onClick={() => setSlot(currentSession.session_id, i, key)}>
                             {s}
                           </Button>
                         ))}
-                        <Button variant="ghost" className="!px-1.5 !py-0.5 text-[10px]" onClick={() => toggleBest(key)}>
+                        <Button variant="ghost" className="!px-1.5 !py-0.5 text-[10px]" onClick={() => toggleBest(key)} disabled={!hasImage}>
                           优选
                         </Button>
-                        <Button variant="ghost" className="!px-1.5 !py-0.5 text-[10px]" onClick={() => downloadOne(item)}>下载</Button>
+                        <Button variant="ghost" className="!px-1.5 !py-0.5 text-[10px]" onClick={() => downloadOne(item)} disabled={!hasImage}>下载</Button>
                         <Button variant="danger" className="!px-1.5 !py-0.5 text-[10px]" onClick={() => removeItem(currentSession.session_id, key)}>
                           移除
                         </Button>
@@ -7273,6 +9224,8 @@ function PickerPage() {
                         const k = pickerItemKey(it);
                         const s = imageState[k];
                         const active = k === focusKey;
+                        const hasImage = pickerItemHasImage(it);
+                        const status = pickerItemJobStatus(it, jobsById.get(it.job_id));
                         return (
                           <button
                             key={`${k}_immersive_strip`}
@@ -7282,9 +9235,24 @@ function PickerPage() {
                               active ? "border-white shadow-[0_0_0_1px_rgba(255,255,255,0.25)]" : "border-white/20"
                             )}
                             onClick={() => setFocus(currentSession.session_id, k)}
-                            onMouseEnter={() => ensureImage(it)}
+                            onMouseEnter={() => hasImage && ensureImage(it)}
                           >
-                            {s?.url ? <img src={s.url} alt={pickerDisplayName(it, jobsById.get(it.job_id))} className="h-full w-full object-cover" /> : <Skeleton className="h-full w-full" />}
+                            {!hasImage ? (
+                              <div className="flex h-full w-full flex-col items-center justify-center gap-1 bg-white/5 px-2 text-center">
+                                {status === "FAILED" ? (
+                                  <span className="inline-flex h-4 w-4 items-center justify-center rounded-full border border-rose-300/60 text-[10px] font-bold text-rose-200">
+                                    !
+                                  </span>
+                                ) : (
+                                  <LoadingRing className="h-3.5 w-3.5" />
+                                )}
+                                <span className="text-[10px] text-white/75">{status === "FAILED" ? "失败" : "生成中"}</span>
+                              </div>
+                            ) : s?.url ? (
+                              <img src={s.url} alt={pickerDisplayName(it, jobsById.get(it.job_id))} className="h-full w-full object-cover" />
+                            ) : (
+                              <Skeleton className="h-full w-full" />
+                            )}
                             {isPreferredKey(k) ? <span className="absolute left-1 top-1 rounded-full bg-amber-500/90 px-1.5 py-0.5 text-[10px] font-bold text-white">优</span> : null}
                             <span className="absolute bottom-1 left-1 rounded bg-black/55 px-1.5 py-0.5 text-[10px] text-white">{idx + 1}</span>
                           </button>
@@ -7463,6 +9431,7 @@ function PickerPage() {
                           image_id: ref!.image_id,
                           job_access_token: manualTokenByJob[ref!.job_id] || jobsById.get(ref!.job_id)?.job_access_token,
                           picked: true,
+                          status: "SUCCEEDED" as JobStatus,
                           added_at: isoNow(),
                         }))
                     );
@@ -7844,6 +9813,9 @@ export default function App() {
               </div>
             ) : session ? (
               <>
+                <PickerSessionJobSync />
+                <FailedBatchSessionCleanup />
+                <PendingSessionDirectHydrator />
                 <TopNav />
                 <AnimatedRoutes />
                 <Footer />
