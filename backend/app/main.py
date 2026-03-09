@@ -199,10 +199,71 @@ def _generation_turnstile_valid_until(request: Request) -> datetime | None:
     return None
 
 
+def _generation_turnstile_single_use_valid_until(request: Request) -> datetime | None:
+    session = request.scope.get("session")
+    value = session.get("generation_turnstile_single_use_until") if isinstance(session, dict) else None
+    dt = _parse_session_datetime(value)
+    if dt and dt >= now_local():
+        return dt
+    if isinstance(session, dict):
+        session.pop("generation_turnstile_single_use_until", None)
+    return None
+
+
 def _mark_generation_turnstile_verified(request: Request) -> datetime:
     valid_until = now_local() + timedelta(seconds=settings.generation_turnstile_ttl_sec)
     request.session["generation_turnstile_verified_until"] = valid_until.isoformat()
     return valid_until
+
+
+def _mark_generation_turnstile_single_use(request: Request) -> datetime:
+    valid_until = now_local() + timedelta(seconds=settings.generation_turnstile_ttl_sec)
+    request.session["generation_turnstile_single_use_until"] = valid_until.isoformat()
+    return valid_until
+
+
+def _clear_generation_turnstile_batch_allowance(request: Request) -> None:
+    request.session.pop("generation_turnstile_single_use_until", None)
+    request.session.pop("generation_turnstile_batch_job_count", None)
+    request.session.pop("generation_turnstile_batch_remaining_uses", None)
+
+
+def _set_generation_turnstile_batch_allowance(request: Request, requested_job_count: int) -> None:
+    valid_until = _mark_generation_turnstile_single_use(request)
+    request.session["generation_turnstile_batch_job_count"] = int(requested_job_count)
+    request.session["generation_turnstile_batch_remaining_uses"] = int(requested_job_count)
+    request.session["generation_turnstile_single_use_until"] = valid_until.isoformat()
+
+
+def _get_generation_turnstile_batch_allowance(request: Request) -> dict[str, int] | None:
+    if _generation_turnstile_single_use_valid_until(request) is None:
+        _clear_generation_turnstile_batch_allowance(request)
+        return None
+    try:
+        requested_job_count = int(request.session.get("generation_turnstile_batch_job_count") or 0)
+        remaining_uses = int(request.session.get("generation_turnstile_batch_remaining_uses") or 0)
+    except Exception:
+        _clear_generation_turnstile_batch_allowance(request)
+        return None
+    if requested_job_count <= 0 or remaining_uses <= 0:
+        _clear_generation_turnstile_batch_allowance(request)
+        return None
+    return {
+        "requested_job_count": requested_job_count,
+        "remaining_uses": remaining_uses,
+    }
+
+
+def _consume_generation_turnstile_batch_allowance(request: Request, requested_job_count: int) -> None:
+    allowance = _get_generation_turnstile_batch_allowance(request)
+    if not allowance or allowance["requested_job_count"] != int(requested_job_count):
+        _clear_generation_turnstile_batch_allowance(request)
+        return
+    remaining = allowance["remaining_uses"] - 1
+    if remaining <= 0:
+        _clear_generation_turnstile_batch_allowance(request)
+        return
+    request.session["generation_turnstile_batch_remaining_uses"] = remaining
 
 
 def _job_activity_counts_for_user(user_id: str) -> dict[str, int]:
@@ -226,13 +287,15 @@ def _usage_payload(user: dict[str, Any], policy: dict[str, Any] | None = None) -
     usage = user_store.get_daily_usage(str(user["user_id"]))
     activity = _job_activity_counts_for_user(str(user["user_id"]))
     daily_limit = policy.get("daily_image_limit")
-    remaining = None if daily_limit is None else max(0, int(daily_limit) - int(usage["images_generated"]))
+    quota_consumed = int(usage["jobs_created"])
+    remaining = None if daily_limit is None else max(0, int(daily_limit) - quota_consumed)
     return {
         "date": now_local().date().isoformat(),
         "jobs_created_today": int(usage["jobs_created"]),
         "jobs_succeeded_today": int(usage["jobs_succeeded"]),
         "jobs_failed_today": int(usage["jobs_failed"]),
         "images_generated_today": int(usage["images_generated"]),
+        "quota_consumed_today": quota_consumed,
         "quota_resets_today": int(usage["quota_resets"]),
         "active_jobs": int(activity["active_jobs"]),
         "running_jobs": int(activity["running_jobs"]),
@@ -300,50 +363,48 @@ def _assert_generation_allowed(
 ) -> dict[str, Any]:
     policy = user_store.get_effective_policy(user)
     usage = _usage_payload(user, policy)
-    active_jobs = int(usage["active_jobs"])
-    running_jobs = int(usage["running_jobs"])
-
-    concurrent_limit = int(policy.get("concurrent_jobs_limit") or 0)
-    if concurrent_limit and running_jobs >= concurrent_limit:
-        raise api_error(
-            ErrorCode.RATE_LIMITED,
-            f"Concurrent running limit reached ({concurrent_limit})",
-            http_status=429,
-            details={
-                "running_jobs": running_jobs,
-                "concurrent_jobs_limit": concurrent_limit,
-            },
-        )
+    quota_consumed = int(usage["quota_consumed_today"])
 
     daily_limit = policy.get("daily_image_limit")
     if daily_limit is not None:
-        reserved_total = int(usage["images_generated_today"]) + active_jobs + requested_job_count
-        if reserved_total > int(daily_limit):
+        next_total = quota_consumed + 1
+        if next_total > int(daily_limit):
             raise api_error(
                 ErrorCode.QUOTA_EXCEEDED,
                 f"Daily image limit exceeded ({daily_limit})",
                 http_status=429,
                 details={
-                    "images_generated_today": usage["images_generated_today"],
-                    "active_jobs": active_jobs,
-                    "requested_job_count": requested_job_count,
+                    "quota_consumed_today": quota_consumed,
+                    "jobs_created_today": usage["jobs_created_today"],
+                    "next_total": next_total,
                     "daily_image_limit": daily_limit,
                 },
             )
 
     if str(user.get("role") or "").upper() == "ADMIN":
-        return policy
+        return {"policy": policy, "consume_turnstile_batch_allowance": False}
 
     trigger_reasons: dict[str, Any] = {}
+    requires_batch_turnstile = False
     job_threshold = policy.get("turnstile_job_count_threshold")
     if job_threshold is not None and requested_job_count > int(job_threshold):
         trigger_reasons["job_count_threshold"] = int(job_threshold)
+        requires_batch_turnstile = True
 
     daily_threshold = policy.get("turnstile_daily_usage_threshold")
-    if daily_threshold is not None and int(usage["images_generated_today"]) > int(daily_threshold):
+    if daily_threshold is not None and quota_consumed >= int(daily_threshold):
         trigger_reasons["daily_usage_threshold"] = int(daily_threshold)
 
-    if trigger_reasons and _generation_turnstile_valid_until(request) is None:
+    has_session_turnstile = _generation_turnstile_valid_until(request) is not None
+    batch_allowance = _get_generation_turnstile_batch_allowance(request)
+    has_batch_turnstile = (
+        batch_allowance is not None
+        and batch_allowance["requested_job_count"] == int(requested_job_count)
+        and batch_allowance["remaining_uses"] > 0
+    )
+    if trigger_reasons and (
+        not has_session_turnstile or (requires_batch_turnstile and not has_batch_turnstile)
+    ):
         raise api_error(
             ErrorCode.TURNSTILE_REQUIRED,
             "Extra Turnstile verification is required before generating images",
@@ -351,11 +412,16 @@ def _assert_generation_allowed(
             details={
                 **trigger_reasons,
                 "requested_job_count": requested_job_count,
+                "quota_consumed_today": quota_consumed,
+                "jobs_created_today": usage["jobs_created_today"],
                 "images_generated_today": usage["images_generated_today"],
             },
         )
 
-    return policy
+    return {
+        "policy": policy,
+        "consume_turnstile_batch_allowance": requires_batch_turnstile,
+    }
 
 
 def _daily_user_payload(
@@ -373,7 +439,8 @@ def _daily_user_payload(
     }
     counts = job_counts.get(str(user["user_id"])) or {"total_jobs": 0, "active_jobs": 0}
     daily_limit = policy.get("daily_image_limit")
-    remaining = None if daily_limit is None else max(0, int(daily_limit) - int(usage["images_generated"]))
+    quota_consumed = int(usage["jobs_created"])
+    remaining = None if daily_limit is None else max(0, int(daily_limit) - quota_consumed)
     return {
         **user,
         "policy": policy,
@@ -383,6 +450,7 @@ def _daily_user_payload(
             "jobs_succeeded_today": int(usage["jobs_succeeded"]),
             "jobs_failed_today": int(usage["jobs_failed"]),
             "images_generated_today": int(usage["images_generated"]),
+            "quota_consumed_today": quota_consumed,
             "quota_resets_today": int(usage["quota_resets"]),
             "active_jobs": int(counts["active_jobs"]),
             "remaining_images_today": remaining,
@@ -457,6 +525,9 @@ async def verify_generation_turnstile(
     if str(current_user.get("role") or "").upper() != "ADMIN":
         await _verify_turnstile_or_raise(request, payload.turnstile_token)
         _mark_generation_turnstile_verified(request)
+        _clear_generation_turnstile_batch_allowance(request)
+        if payload.requested_job_count is not None:
+            _set_generation_turnstile_batch_allowance(request, int(payload.requested_job_count))
     return _session_payload(request, current_user)
 
 
@@ -1016,7 +1087,7 @@ async def create_job(
     current_user: dict[str, Any] = Depends(get_current_user),
 ) -> CreateJobResponse:
     requested_job_count = _requested_job_count_from_header(x_requested_job_count)
-    _assert_generation_allowed(request, current_user, requested_job_count=requested_job_count)
+    gate = _assert_generation_allowed(request, current_user, requested_job_count=requested_job_count)
     req, refs = await _parse_create_request(request)
     job_id, token, status_, created_at = job_manager.create_job(
         req,
@@ -1025,6 +1096,8 @@ async def create_job(
         requested_job_count=requested_job_count,
         idempotency_key=idempotency_key,
     )
+    if gate["consume_turnstile_batch_allowance"]:
+        _consume_generation_turnstile_batch_allowance(request, requested_job_count)
     return CreateJobResponse(job_id=job_id, job_access_token=token, status=status_, created_at=created_at)
 
 
@@ -1141,8 +1214,10 @@ async def retry_job(
 ) -> dict[str, Any]:
     if not validate_job_id(job_id):
         raise api_error(ErrorCode.JOB_NOT_FOUND, "Job not found", http_status=404)
-    _assert_generation_allowed(request, current_user, requested_job_count=1)
+    gate = _assert_generation_allowed(request, current_user, requested_job_count=1)
     new_job_id, new_token, _ = job_manager.retry_job(job_id, x_job_token, current_user, payload.override_params)
+    if gate["consume_turnstile_batch_allowance"]:
+        _consume_generation_turnstile_batch_allowance(request, 1)
     return {
         "new_job_id": new_job_id,
         "new_job_access_token": new_token,

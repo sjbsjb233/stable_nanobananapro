@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import threading
 import time
 from pathlib import Path
 
@@ -8,6 +9,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.config import settings
+from app.gemini_client import GeminiError
 from app.main import app
 from app.storage import storage
 from app.user_store import user_store
@@ -259,10 +261,10 @@ def test_admin_user_management_and_turnstile_gate(client: TestClient, monkeypatc
             "role": "USER",
             "enabled": True,
             "policy_overrides": {
-                "daily_image_limit": 3,
+                "daily_image_limit": 10,
                 "concurrent_jobs_limit": 2,
                 "turnstile_job_count_threshold": 1,
-                "turnstile_daily_usage_threshold": 0,
+                "turnstile_daily_usage_threshold": 999,
             },
         },
     )
@@ -309,12 +311,12 @@ def test_admin_user_management_and_turnstile_gate(client: TestClient, monkeypatc
 
     verified = client.post(
         "/v1/auth/turnstile/generation",
-        json={"turnstile_token": "turnstile-ok"},
+        json={"turnstile_token": "turnstile-ok", "requested_job_count": 2},
     )
     assert verified.status_code == 200
     assert verified.json()["generation_turnstile_verified_until"]
 
-    created_after_verify = client.post(
+    created_after_verify_first = client.post(
         "/v1/jobs",
         headers={"X-Requested-Job-Count": "2"},
         json={
@@ -329,10 +331,237 @@ def test_admin_user_management_and_turnstile_gate(client: TestClient, monkeypatc
             "mode": "IMAGE_ONLY",
         },
     )
-    assert created_after_verify.status_code == 201
+    assert created_after_verify_first.status_code == 201
+
+    created_after_verify_second = client.post(
+        "/v1/jobs",
+        headers={"X-Requested-Job-Count": "2"},
+        json={
+            "prompt": "alice prompt follow-up",
+            "params": {
+                "aspect_ratio": "1:1",
+                "image_size": "1K",
+                "temperature": 0.7,
+                "timeout_sec": 60,
+                "max_retries": 1,
+            },
+            "mode": "IMAGE_ONLY",
+        },
+    )
+    assert created_after_verify_second.status_code == 201
+
+    gated_again = client.post(
+        "/v1/jobs",
+        headers={"X-Requested-Job-Count": "2"},
+        json={
+            "prompt": "alice prompt again",
+            "params": {
+                "aspect_ratio": "1:1",
+                "image_size": "1K",
+                "temperature": 0.7,
+                "timeout_sec": 60,
+                "max_retries": 1,
+            },
+            "mode": "IMAGE_ONLY",
+        },
+    )
+    assert gated_again.status_code == 403
+    assert gated_again.json()["error"]["code"] == "TURNSTILE_REQUIRED"
 
     client.post("/v1/auth/logout")
     login(client)
     reset = client.post(f"/v1/admin/users/{alice['user_id']}/reset-quota")
     assert reset.status_code == 200
     assert reset.json()["usage"]["quota_resets_today"] >= 1
+
+
+def test_running_concurrency_limit_queues_excess_jobs(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    lock = threading.Lock()
+    active_calls = 0
+    max_active_calls = 0
+
+    def slow_generate_image(prompt, model, mode, params, reference_images):
+        nonlocal active_calls, max_active_calls
+        with lock:
+            active_calls += 1
+            max_active_calls = max(max_active_calls, active_calls)
+        try:
+            time.sleep(0.2)
+            return {
+                "raw": {"candidates": []},
+                "images": [{"mime": "image/png", "bytes": PNG_1X1}],
+                "usage_metadata": {"totalTokenCount": 10},
+                "finish_reason": "STOP",
+                "safety_ratings": [],
+                "latency_ms": 50,
+            }
+        finally:
+            with lock:
+                active_calls -= 1
+
+    monkeypatch.setattr("app.gemini_client.gemini_client.generate_image", slow_generate_image)
+    login(client)
+
+    created = client.post(
+        "/v1/admin/users",
+        json={
+            "username": "bob",
+            "password": "bobpass123",
+            "role": "USER",
+            "enabled": True,
+            "policy_overrides": {
+                "daily_image_limit": 10,
+                "concurrent_jobs_limit": 1,
+                "turnstile_job_count_threshold": 99,
+                "turnstile_daily_usage_threshold": 999,
+            },
+        },
+    )
+    assert created.status_code == 201
+
+    client.post("/v1/auth/logout")
+    login(client, username="bob", password="bobpass123")
+
+    job_ids: list[str] = []
+    for idx in range(3):
+        resp = client.post(
+            "/v1/jobs",
+            json={
+                "prompt": f"bob prompt {idx}",
+                "params": {
+                    "aspect_ratio": "1:1",
+                    "image_size": "1K",
+                    "temperature": 0.7,
+                    "timeout_sec": 60,
+                    "max_retries": 1,
+                },
+                "mode": "IMAGE_ONLY",
+            },
+        )
+        assert resp.status_code == 201
+        job_ids.append(resp.json()["job_id"])
+
+    saw_running_and_queue = False
+    for _ in range(20):
+        statuses = [client.get(f"/v1/jobs/{job_id}").json()["status"] for job_id in job_ids]
+        if statuses.count("RUNNING") == 1 and statuses.count("QUEUED") >= 1:
+            saw_running_and_queue = True
+            break
+        time.sleep(0.05)
+
+    assert saw_running_and_queue
+
+    final_statuses: list[str] = []
+    for _ in range(60):
+        final_statuses = [client.get(f"/v1/jobs/{job_id}").json()["status"] for job_id in job_ids]
+        if all(status == "SUCCEEDED" for status in final_statuses):
+            break
+        time.sleep(0.05)
+
+    assert final_statuses == ["SUCCEEDED", "SUCCEEDED", "SUCCEEDED"]
+    assert max_active_calls == 1
+
+
+def test_created_jobs_consume_quota_and_trigger_daily_turnstile(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    def failing_generate_image(prompt, model, mode, params, reference_images):
+        raise GeminiError(code="UPSTREAM_ERROR", message="forced failure", retryable=False)
+
+    monkeypatch.setattr("app.gemini_client.gemini_client.generate_image", failing_generate_image)
+    login(client)
+
+    created = client.post(
+        "/v1/admin/users",
+        json={
+            "username": "test1",
+            "password": "test1pass123",
+            "role": "USER",
+            "enabled": True,
+            "policy_overrides": {
+                "daily_image_limit": 2,
+                "concurrent_jobs_limit": 2,
+                "turnstile_job_count_threshold": 99,
+                "turnstile_daily_usage_threshold": 1,
+            },
+        },
+    )
+    assert created.status_code == 201
+
+    client.post("/v1/auth/logout")
+    login(client, username="test1", password="test1pass123")
+
+    first = client.post(
+        "/v1/jobs",
+        json={
+            "prompt": "first",
+            "params": {
+                "aspect_ratio": "1:1",
+                "image_size": "1K",
+                "temperature": 0.7,
+                "timeout_sec": 60,
+                "max_retries": 0,
+            },
+            "mode": "IMAGE_ONLY",
+        },
+    )
+    assert first.status_code == 201
+
+    second = client.post(
+        "/v1/jobs",
+        json={
+            "prompt": "second",
+            "params": {
+                "aspect_ratio": "1:1",
+                "image_size": "1K",
+                "temperature": 0.7,
+                "timeout_sec": 60,
+                "max_retries": 0,
+            },
+            "mode": "IMAGE_ONLY",
+        },
+    )
+    assert second.status_code == 403
+    assert second.json()["error"]["code"] == "TURNSTILE_REQUIRED"
+
+    verified = client.post(
+        "/v1/auth/turnstile/generation",
+        json={"turnstile_token": "turnstile-ok", "requested_job_count": 1},
+    )
+    assert verified.status_code == 200
+
+    second_after_verify = client.post(
+        "/v1/jobs",
+        json={
+            "prompt": "second",
+            "params": {
+                "aspect_ratio": "1:1",
+                "image_size": "1K",
+                "temperature": 0.7,
+                "timeout_sec": 60,
+                "max_retries": 0,
+            },
+            "mode": "IMAGE_ONLY",
+        },
+    )
+    assert second_after_verify.status_code == 201
+
+    me = client.get("/v1/auth/me")
+    assert me.status_code == 200
+    assert me.json()["usage"]["quota_consumed_today"] == 2
+    assert me.json()["usage"]["remaining_images_today"] == 0
+
+    third = client.post(
+        "/v1/jobs",
+        json={
+            "prompt": "third",
+            "params": {
+                "aspect_ratio": "1:1",
+                "image_size": "1K",
+                "temperature": 0.7,
+                "timeout_sec": 60,
+                "max_retries": 0,
+            },
+            "mode": "IMAGE_ONLY",
+        },
+    )
+    assert third.status_code == 429
+    assert third.json()["error"]["code"] == "QUOTA_EXCEEDED"

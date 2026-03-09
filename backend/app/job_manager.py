@@ -40,6 +40,7 @@ class JobManager:
         self._queue: queue.Queue[str] = queue.Queue(maxsize=settings.job_queue_max)
         self._stop_event = threading.Event()
         self._workers: list[threading.Thread] = []
+        self._dispatch_lock = threading.Lock()
         self._idempotency_lock = threading.Lock()
         self._idempotency: dict[str, IdempotencyRecord] = {}
 
@@ -71,6 +72,13 @@ class JobManager:
                 return
 
             try:
+                claim_state = self._claim_job_for_execution(job_id)
+                if claim_state is None:
+                    continue
+                if claim_state is False:
+                    self._requeue_job(job_id)
+                    time.sleep(0.05)
+                    continue
                 self._run_job(job_id)
             except Exception as exc:
                 logger.exception("Unhandled worker exception: job_id=%s", job_id)
@@ -143,6 +151,55 @@ class JobManager:
         if not storage.job_exists(job_id):
             raise api_error(ErrorCode.JOB_NOT_FOUND, "Job not found", http_status=404)
         return storage.load_meta(job_id)
+
+    def _owner_running_limit(self, owner: dict[str, Any]) -> int:
+        owner_id = str(owner.get("user_id") or "")
+        policy_user = user_store.get_user_by_id(owner_id) if owner_id else None
+        effective_policy = user_store.get_effective_policy(policy_user or owner)
+        return max(0, int(effective_policy.get("concurrent_jobs_limit") or 0))
+
+    def _running_jobs_for_owner(self, owner_user_id: str, *, exclude_job_id: str | None = None) -> int:
+        running = 0
+        for meta in storage.iter_job_meta():
+            if exclude_job_id and str(meta.get("job_id") or "") == exclude_job_id:
+                continue
+            if meta.get("status") != JobStatus.RUNNING:
+                continue
+            owner = meta.get("owner") if isinstance(meta.get("owner"), dict) else {}
+            if str(owner.get("user_id") or "") == owner_user_id:
+                running += 1
+        return running
+
+    def _claim_job_for_execution(self, job_id: str) -> bool | None:
+        with self._dispatch_lock:
+            try:
+                meta = storage.load_meta(job_id)
+            except Exception:
+                return None
+
+            if meta.get("status") != JobStatus.QUEUED:
+                return None
+
+            owner = meta.get("owner") if isinstance(meta.get("owner"), dict) else {}
+            owner_user_id = str(owner.get("user_id") or "")
+            if owner_user_id:
+                running_limit = self._owner_running_limit(owner)
+                if running_limit and self._running_jobs_for_owner(owner_user_id, exclude_job_id=job_id) >= running_limit:
+                    return False
+
+            started_at = self._utcnow()
+            meta["status"] = JobStatus.RUNNING
+            meta["updated_at"] = started_at.isoformat()
+            self._hydrate_running_timing(meta, started_at)
+            storage.save_meta(job_id, meta)
+            storage.write_job_log(job_id, "Job started")
+            return True
+
+    def _requeue_job(self, job_id: str) -> None:
+        try:
+            self._queue.put(job_id, timeout=0.5)
+        except queue.Full:
+            logger.warning("Failed to requeue job while waiting for running slot: job_id=%s", job_id)
 
     def _check_job_token(self, meta: dict[str, Any], token: str | None) -> None:
         if settings.job_auth_mode != "TOKEN":
@@ -409,13 +466,6 @@ class JobManager:
     def _run_job(self, job_id: str) -> None:
         meta = storage.load_meta(job_id)
         params = meta["params"]
-
-        started_at = self._utcnow()
-        meta["status"] = JobStatus.RUNNING
-        meta["updated_at"] = started_at.isoformat()
-        self._hydrate_running_timing(meta, started_at)
-        storage.save_meta(job_id, meta)
-        storage.write_job_log(job_id, "Job started")
 
         request_data = storage.load_request(job_id)
         refs: list[ReferenceImage] = []

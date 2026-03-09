@@ -325,6 +325,7 @@ type SessionUsage = {
   jobs_succeeded_today: number;
   jobs_failed_today: number;
   images_generated_today: number;
+  quota_consumed_today: number;
   quota_resets_today: number;
   active_jobs: number;
   running_jobs?: number;
@@ -1475,11 +1476,14 @@ class ApiClient {
     return this.request<AuthSession>("/auth/me", { method: "GET", signal });
   }
 
-  verifyGenerationTurnstile(turnstileToken: string, signal?: AbortSignal) {
+  verifyGenerationTurnstile(turnstileToken: string, requestedJobCount?: number, signal?: AbortSignal) {
     return this.request<AuthSession>("/auth/turnstile/generation", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ turnstile_token: turnstileToken }),
+      body: JSON.stringify({
+        turnstile_token: turnstileToken,
+        requested_job_count: requestedJobCount,
+      }),
       signal,
     });
   }
@@ -2037,7 +2041,7 @@ function TopNav() {
   const quotaLabel =
     isAdmin
       ? "无限额"
-      : `${usage?.remaining_images_today ?? 0} 张剩余额度`;
+      : `${usage?.remaining_images_today ?? 0} 次剩余额度`;
   const concurrencyLabel = `${usage?.running_jobs ?? 0}/${user.policy.concurrent_jobs_limit} running`;
 
   return (
@@ -3540,7 +3544,7 @@ function AdminPage() {
                   <div>
                     <div className="text-sm font-bold">{item.username}</div>
                     <div className={cn("mt-1 text-xs", item.user_id === selectedUserId ? "text-white/80 dark:text-zinc-700" : "text-zinc-500 dark:text-zinc-400")}>
-                      {item.role} · {item.enabled ? "enabled" : "disabled"} · today {item.usage.images_generated_today}
+                      {item.role} · {item.enabled ? "enabled" : "disabled"} · consumed {item.usage.quota_consumed_today}
                     </div>
                   </div>
                   <div className={cn("text-xs", item.user_id === selectedUserId ? "text-white/80 dark:text-zinc-700" : "text-zinc-500 dark:text-zinc-400")}>
@@ -3670,6 +3674,7 @@ function CreateJobPage() {
   const [generationTurnstileToken, setGenerationTurnstileToken] = useState<string | null>(null);
   const [generationTurnstileKey, setGenerationTurnstileKey] = useState(0);
   const [verifyingGenerationTurnstile, setVerifyingGenerationTurnstile] = useState(false);
+  const [pendingGenerationTargetCount, setPendingGenerationTargetCount] = useState<number | null>(null);
   const hydratedModelRef = useRef<ModelId | null>(null);
   const lastPasteAtRef = useRef<number>(0);
   const MAX_REF_FILES = 14;
@@ -3841,10 +3846,14 @@ function CreateJobPage() {
     if (!currentUser || currentUser.role === "ADMIN") return false;
     const countThreshold = currentUser.policy.turnstile_job_count_threshold;
     const dailyThreshold = currentUser.policy.turnstile_daily_usage_threshold;
-    return (
-      (typeof countThreshold === "number" && targetCount > countThreshold) ||
-      (typeof dailyThreshold === "number" && (currentUsage?.images_generated_today ?? 0) > dailyThreshold)
-    );
+    if (typeof countThreshold === "number" && targetCount > countThreshold) {
+      // High job_count always requires a fresh Turnstile challenge.
+      return true;
+    }
+    if (typeof dailyThreshold === "number" && (currentUsage?.quota_consumed_today ?? 0) >= dailyThreshold) {
+      return !hasFreshGenerationVerification(candidate);
+    }
+    return false;
   };
 
   const refreshSession = async () => {
@@ -3853,7 +3862,7 @@ function CreateJobPage() {
     return nextSession;
   };
 
-  const executeCreate = async () => {
+  const executeCreate = async (targetCountOverride?: number) => {
     const err = validate();
     if (err) {
       push({ kind: "error", title: "表单校验失败", message: err });
@@ -3880,7 +3889,7 @@ function CreateJobPage() {
         max_retries: maxRetries,
       };
 
-      const targetCount = clamp(Math.round(jobCount), 1, 12);
+      const targetCount = clamp(Math.round(targetCountOverride ?? jobCount), 1, 12);
       const batchId = targetCount > 1 ? createBatchId() : undefined;
       const created: Array<{ job_id: string; job_access_token?: string }> = [];
       let firstErr: string | null = null;
@@ -3972,7 +3981,8 @@ function CreateJobPage() {
     const targetCount = clamp(Math.round(jobCount), 1, 12);
     try {
       const nextSession = await refreshSession();
-      if (needsGenerationTurnstile(nextSession, targetCount) && !hasFreshGenerationVerification(nextSession)) {
+      if (needsGenerationTurnstile(nextSession, targetCount)) {
+        setPendingGenerationTargetCount(targetCount);
         setGenerationTurnstileToken(null);
         setGenerationTurnstileKey((v) => v + 1);
         setGenerationModalOpen(true);
@@ -3983,18 +3993,21 @@ function CreateJobPage() {
       return;
     }
 
-    await executeCreate();
+    setPendingGenerationTargetCount(null);
+    await executeCreate(targetCount);
   };
 
   const confirmGenerationTurnstile = async () => {
     if (!generationTurnstileToken) return;
     setVerifyingGenerationTurnstile(true);
     try {
-      const nextSession = await client.verifyGenerationTurnstile(generationTurnstileToken);
+      const targetCount = clamp(Math.round(pendingGenerationTargetCount ?? jobCount), 1, 12);
+      const nextSession = await client.verifyGenerationTurnstile(generationTurnstileToken, targetCount);
       setSession(nextSession);
       setGenerationModalOpen(false);
       setGenerationTurnstileToken(null);
-      await executeCreate();
+      setPendingGenerationTargetCount(null);
+      await executeCreate(targetCount);
     } catch (e: any) {
       setGenerationTurnstileKey((v) => v + 1);
       setGenerationTurnstileToken(null);
@@ -4018,6 +4031,7 @@ function CreateJobPage() {
           if (verifyingGenerationTurnstile) return;
           setGenerationModalOpen(false);
           setGenerationTurnstileToken(null);
+          setPendingGenerationTargetCount(null);
         }}
         onConfirm={confirmGenerationTurnstile}
       />
@@ -4032,7 +4046,7 @@ function CreateJobPage() {
                 <div className="rounded-full border border-zinc-200 bg-white/70 px-3 py-2 text-xs font-semibold text-zinc-600 dark:border-white/10 dark:bg-zinc-900/40 dark:text-zinc-300">
                   {isAdmin
                     ? "管理员无限额"
-                    : `今日已生成 ${usage?.images_generated_today ?? 0} 张 · 剩余 ${usage?.remaining_images_today ?? 0} 张`}
+                    : `今日已消耗 ${usage?.quota_consumed_today ?? 0} 次 · 剩余 ${usage?.remaining_images_today ?? 0} 次`}
                 </div>
               ) : null}
               <Button variant="secondary" onClick={() => {
@@ -7292,7 +7306,7 @@ function SettingsPage() {
                 <div className="mt-2 text-lg font-bold text-zinc-900 dark:text-zinc-50">{user.username}</div>
                 <div className="mt-1 text-sm text-zinc-600 dark:text-zinc-300">{user.role}</div>
                 <div className="mt-3 grid grid-cols-2 gap-2 text-xs">
-                  <KeyValue k="已生成" v={String(usage?.images_generated_today ?? 0)} />
+                  <KeyValue k="已消耗" v={String(usage?.quota_consumed_today ?? 0)} />
                   <KeyValue k="剩余额度" v={user.role === "ADMIN" ? "unlimited" : String(usage?.remaining_images_today ?? 0)} />
                   <KeyValue k="running" v={`${usage?.running_jobs ?? 0}/${user.policy.concurrent_jobs_limit}`} />
                   <KeyValue k="queued" v={String(usage?.queued_jobs ?? 0)} />
