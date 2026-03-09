@@ -23,6 +23,7 @@ from .schemas import CreateJobRequest, ErrorCode, JobParams, JobStatus
 from .security import hash_token, new_job_access_token, new_job_id, validate_job_id, verify_token
 from .storage import storage
 from .time_utils import APP_TZ, now_local
+from .user_store import user_store
 
 logger = get_logger("job_manager")
 
@@ -150,33 +151,50 @@ class JobManager:
         if not token_hash or not token or not verify_token(token, token_hash):
             raise api_error(ErrorCode.JOB_TOKEN_INVALID, "Invalid job token", http_status=403)
 
-    def get_meta(self, job_id: str, token: str | None) -> dict[str, Any]:
-        meta = self._load_or_404(job_id)
+    def _check_job_access(self, meta: dict[str, Any], token: str | None, user: dict[str, Any] | None) -> None:
+        owner = meta.get("owner") if isinstance(meta.get("owner"), dict) else {}
+        owner_id = str(owner.get("user_id") or "")
+        user_id = str((user or {}).get("user_id") or "")
+        is_admin = str((user or {}).get("role") or "").upper() == "ADMIN"
+
+        if owner_id:
+            if is_admin or owner_id == user_id:
+                return
+            raise api_error(ErrorCode.FORBIDDEN, "You do not have access to this job", http_status=403)
+
+        if is_admin:
+            return
+        if settings.job_auth_mode != "TOKEN":
+            raise api_error(ErrorCode.FORBIDDEN, "You do not have access to this job", http_status=403)
         self._check_job_token(meta, token)
+
+    def get_meta(self, job_id: str, token: str | None, user: dict[str, Any] | None = None) -> dict[str, Any]:
+        meta = self._load_or_404(job_id)
+        self._check_job_access(meta, token, user)
         return meta
 
-    def get_request(self, job_id: str, token: str | None) -> dict[str, Any]:
+    def get_request(self, job_id: str, token: str | None, user: dict[str, Any] | None = None) -> dict[str, Any]:
         meta = self._load_or_404(job_id)
-        self._check_job_token(meta, token)
+        self._check_job_access(meta, token, user)
         return storage.load_request(job_id)
 
-    def get_response(self, job_id: str, token: str | None) -> dict[str, Any]:
+    def get_response(self, job_id: str, token: str | None, user: dict[str, Any] | None = None) -> dict[str, Any]:
         meta = self._load_or_404(job_id)
-        self._check_job_token(meta, token)
+        self._check_job_access(meta, token, user)
         return storage.load_response(job_id)
 
-    def get_image(self, job_id: str, token: str | None, image_id: str) -> tuple[bytes, str]:
+    def get_image(self, job_id: str, token: str | None, image_id: str, user: dict[str, Any] | None = None) -> tuple[bytes, str]:
         meta = self._load_or_404(job_id)
-        self._check_job_token(meta, token)
+        self._check_job_access(meta, token, user)
 
         for image in meta.get("result", {}).get("images", []):
             if image.get("image_id") == image_id:
                 return storage.load_result_image(job_id, image["filename"]), image.get("mime", "image/png")
         raise api_error(ErrorCode.IMAGE_NOT_FOUND, "Image not found", http_status=404)
 
-    def delete_job(self, job_id: str, token: str | None) -> None:
+    def delete_job(self, job_id: str, token: str | None, user: dict[str, Any] | None = None) -> None:
         meta = self._load_or_404(job_id)
-        self._check_job_token(meta, token)
+        self._check_job_access(meta, token, user)
         storage.delete_job(job_id)
 
     def _clean_idempotency(self) -> None:
@@ -222,6 +240,8 @@ class JobManager:
         self,
         req: CreateJobRequest,
         reference_images: list[ReferenceImage],
+        owner: dict[str, Any],
+        requested_job_count: int = 1,
         idempotency_key: str | None = None,
     ) -> tuple[str, str | None, JobStatus, datetime]:
         if len(reference_images) > settings.max_reference_images:
@@ -272,9 +292,15 @@ class JobManager:
             "created_at": created_at.isoformat(),
             "updated_at": created_at.isoformat(),
             "status": JobStatus.QUEUED,
+            "owner": {
+                "user_id": owner.get("user_id"),
+                "username": owner.get("username"),
+                "role": owner.get("role"),
+            },
             "model": req.model,
             "mode": req.mode,
             "params": req.params.model_dump(),
+            "requested_job_count": max(1, int(requested_job_count)),
             "result": {"images": []},
             "usage": {
                 "prompt_token_count": 0,
@@ -330,6 +356,8 @@ class JobManager:
             raise api_error(ErrorCode.RATE_LIMITED, "Job queue is full", http_status=429)
 
         storage.write_job_log(job_id, "Job created and enqueued")
+        if owner.get("user_id"):
+            user_store.record_job_created(str(owner["user_id"]))
 
         if idempotency_key:
             with self._idempotency_lock:
@@ -345,10 +373,11 @@ class JobManager:
         self,
         job_id: str,
         token: str | None,
+        user: dict[str, Any],
         override_params: JobParams | None,
     ) -> tuple[str, str | None, datetime]:
         meta = self._load_or_404(job_id)
-        self._check_job_token(meta, token)
+        self._check_job_access(meta, token, user)
 
         request_data = storage.load_request(job_id)
         params = JobParams(**meta["params"])
@@ -374,7 +403,7 @@ class JobManager:
             if idx >= settings.max_reference_images - 1:
                 break
 
-        new_job_id, new_token, _, created_at = self.create_job(req, refs)
+        new_job_id, new_token, _, created_at = self.create_job(req, refs, user)
         return new_job_id, new_token, created_at
 
     def _run_job(self, job_id: str) -> None:
@@ -577,6 +606,9 @@ class JobManager:
         meta["error"] = None
         storage.save_meta(job_id, meta)
         storage.write_job_log(job_id, "Job succeeded")
+        owner = meta.get("owner") if isinstance(meta.get("owner"), dict) else {}
+        if owner.get("user_id"):
+            user_store.record_job_success(str(owner["user_id"]), len(image_metas))
 
     def _error_code_to_meta(self, code: str) -> tuple[str, bool]:
         if code in {"UPSTREAM_TIMEOUT", "WORKER_WATCHDOG_TIMEOUT"}:
@@ -638,6 +670,9 @@ class JobManager:
         }
         storage.save_meta(job_id, meta)
         storage.write_job_log(job_id, f"Job failed: {error_type} - {err.message} (debug_id={debug_id})")
+        owner = meta.get("owner") if isinstance(meta.get("owner"), dict) else {}
+        if owner.get("user_id"):
+            user_store.record_job_failure(str(owner["user_id"]))
         logger.error(
             "Job failed: job_id=%s type=%s code=%s retryable=%s debug_id=%s message=%s details=%s",
             job_id,
@@ -676,6 +711,12 @@ class JobManager:
             out = io.BytesIO()
             img.save(out, format="PNG")
             return out.getvalue(), width, height
+
+    def queue_size(self) -> int:
+        return self._queue.qsize()
+
+    def worker_count(self) -> int:
+        return len(self._workers)
 
 
 job_manager = JobManager()

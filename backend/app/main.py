@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import math
 import time
+import uuid
 from datetime import datetime, timedelta
 from typing import Any, AsyncIterator
 
@@ -11,6 +12,7 @@ from fastapi import HTTPException
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.middleware.cors import CORSMiddleware
+from starlette.middleware.sessions import SessionMiddleware
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from .billing import current_month_period
@@ -36,20 +38,27 @@ from .schemas import (
     BillingSummaryModelItem,
     CreateJobRequest,
     CreateJobResponse,
+    CreateUserRequest,
     DashboardSummaryRequest,
     ErrorCode,
     ErrorResponse,
     GoogleRemainingConfiguredResponse,
     GoogleRemainingUnconfiguredResponse,
     HealthResponse,
+    LoginRequest,
     ModelCapability,
     ModelsResponse,
     JobParams,
     RetryJobRequest,
+    TurnstileVerifyRequest,
+    UpdateSystemPolicyRequest,
+    UpdateUserRequest,
 )
 from .security import validate_image_id, validate_job_id
 from .storage import storage
 from .time_utils import now_local
+from .turnstile import verify_turnstile_token
+from .user_store import user_store, validate_username
 
 logger = get_logger("api")
 app = FastAPI(title="Nano Banana API", version=settings.app_version)
@@ -71,7 +80,16 @@ app.add_middleware(
         "X-Job-Token",
         "X-Admin-Key",
         "Idempotency-Key",
+        "X-Requested-Job-Count",
     ],
+)
+app.add_middleware(
+    SessionMiddleware,
+    secret_key=settings.session_secret_key,
+    session_cookie=settings.session_cookie_name,
+    max_age=settings.session_max_age_sec,
+    same_site="lax",
+    https_only=settings.session_https_only,
 )
 
 
@@ -79,6 +97,7 @@ app.add_middleware(
 def _startup() -> None:
     setup_logging()
     ensure_data_dirs()
+    user_store.ensure_initialized()
     logger.info(
         "Backend startup: version=%s deployed_at=%s data_dir=%s",
         settings.app_version,
@@ -97,6 +116,7 @@ def _shutdown() -> None:
 @app.middleware("http")
 async def request_logging_middleware(request: Request, call_next):
     started = time.perf_counter()
+    request.state.current_user = None
     try:
         response = await call_next(request)
     except Exception:
@@ -125,11 +145,250 @@ def _error_json(status_code: int, code: ErrorCode, message: str, details: dict[s
         "error": {
             "code": code,
             "message": message,
-            "debug_id": __import__("uuid").uuid4().hex,
+            "debug_id": uuid.uuid4().hex,
             "details": details or {},
         }
     }
     return JSONResponse(status_code=status_code, content=payload)
+
+
+def _parse_session_datetime(value: Any) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value))
+    except Exception:
+        return None
+
+
+def _get_authenticated_user_or_none(request: Request) -> dict[str, Any] | None:
+    session = request.scope.get("session")
+    user_id = session.get("user_id") if isinstance(session, dict) else None
+    if not user_id:
+        return None
+    user = user_store.get_user_by_id(str(user_id))
+    if not user or not user.get("enabled"):
+        if isinstance(session, dict):
+            session.clear()
+        return None
+    return user
+
+
+def get_current_user(request: Request) -> dict[str, Any]:
+    user = getattr(request.state, "current_user", None) or _get_authenticated_user_or_none(request)
+    if not user:
+        raise api_error(ErrorCode.AUTH_REQUIRED, "Authentication required", http_status=401)
+    request.state.current_user = user
+    return user
+
+
+def get_admin_user(current_user: dict[str, Any] = Depends(get_current_user)) -> dict[str, Any]:
+    if str(current_user.get("role") or "").upper() != "ADMIN":
+        raise api_error(ErrorCode.FORBIDDEN, "Admin access required", http_status=403)
+    return current_user
+
+
+def _generation_turnstile_valid_until(request: Request) -> datetime | None:
+    session = request.scope.get("session")
+    value = session.get("generation_turnstile_verified_until") if isinstance(session, dict) else None
+    dt = _parse_session_datetime(value)
+    if dt and dt >= now_local():
+        return dt
+    if isinstance(session, dict):
+        session.pop("generation_turnstile_verified_until", None)
+    return None
+
+
+def _mark_generation_turnstile_verified(request: Request) -> datetime:
+    valid_until = now_local() + timedelta(seconds=settings.generation_turnstile_ttl_sec)
+    request.session["generation_turnstile_verified_until"] = valid_until.isoformat()
+    return valid_until
+
+
+def _job_activity_counts_for_user(user_id: str) -> dict[str, int]:
+    counts = {"queued_jobs": 0, "running_jobs": 0, "active_jobs": 0}
+    for meta in storage.iter_job_meta():
+        owner = meta.get("owner") if isinstance(meta.get("owner"), dict) else {}
+        if str(owner.get("user_id") or "") != str(user_id):
+            continue
+        status_value = str(meta.get("status") or "")
+        if status_value == "QUEUED":
+            counts["queued_jobs"] += 1
+            counts["active_jobs"] += 1
+        elif status_value == "RUNNING":
+            counts["running_jobs"] += 1
+            counts["active_jobs"] += 1
+    return counts
+
+
+def _usage_payload(user: dict[str, Any], policy: dict[str, Any] | None = None) -> dict[str, Any]:
+    policy = policy or user_store.get_effective_policy(user)
+    usage = user_store.get_daily_usage(str(user["user_id"]))
+    activity = _job_activity_counts_for_user(str(user["user_id"]))
+    daily_limit = policy.get("daily_image_limit")
+    remaining = None if daily_limit is None else max(0, int(daily_limit) - int(usage["images_generated"]))
+    return {
+        "date": now_local().date().isoformat(),
+        "jobs_created_today": int(usage["jobs_created"]),
+        "jobs_succeeded_today": int(usage["jobs_succeeded"]),
+        "jobs_failed_today": int(usage["jobs_failed"]),
+        "images_generated_today": int(usage["images_generated"]),
+        "quota_resets_today": int(usage["quota_resets"]),
+        "active_jobs": int(activity["active_jobs"]),
+        "running_jobs": int(activity["running_jobs"]),
+        "queued_jobs": int(activity["queued_jobs"]),
+        "remaining_images_today": remaining,
+    }
+
+
+def _session_payload(request: Request, user: dict[str, Any]) -> dict[str, Any]:
+    policy = user_store.get_effective_policy(user)
+    verified_until = _generation_turnstile_valid_until(request)
+    return {
+        "authenticated": True,
+        "user": {
+            **user,
+            "policy": policy,
+        },
+        "usage": _usage_payload(user, policy),
+        "generation_turnstile_verified_until": verified_until.isoformat() if verified_until is not None else None,
+    }
+
+
+async def _verify_turnstile_or_raise(request: Request, token: str) -> dict[str, Any]:
+    if not settings.turnstile_secret_key:
+        raise api_error(
+            ErrorCode.INVALID_INPUT,
+            "Turnstile secret is not configured",
+            http_status=503,
+        )
+
+    remote_ip = request.client.host if request.client else None
+    try:
+        payload = await verify_turnstile_token(token, remote_ip)
+    except Exception as exc:
+        logger.exception("Turnstile verification request failed: %s", exc)
+        raise api_error(
+            ErrorCode.INVALID_INPUT,
+            "Turnstile verification failed",
+            http_status=502,
+        ) from exc
+
+    if not payload.get("success"):
+        raise api_error(
+            ErrorCode.FORBIDDEN,
+            "Turnstile verification failed",
+            http_status=403,
+            details={"error_codes": payload.get("error-codes") or []},
+        )
+    return payload
+
+
+def _requested_job_count_from_header(value: str | None) -> int:
+    try:
+        parsed = int(str(value or "1"))
+    except Exception:
+        return 1
+    return max(1, min(parsed, 100))
+
+
+def _assert_generation_allowed(
+    request: Request,
+    user: dict[str, Any],
+    *,
+    requested_job_count: int,
+) -> dict[str, Any]:
+    policy = user_store.get_effective_policy(user)
+    usage = _usage_payload(user, policy)
+    active_jobs = int(usage["active_jobs"])
+    running_jobs = int(usage["running_jobs"])
+
+    concurrent_limit = int(policy.get("concurrent_jobs_limit") or 0)
+    if concurrent_limit and running_jobs >= concurrent_limit:
+        raise api_error(
+            ErrorCode.RATE_LIMITED,
+            f"Concurrent running limit reached ({concurrent_limit})",
+            http_status=429,
+            details={
+                "running_jobs": running_jobs,
+                "concurrent_jobs_limit": concurrent_limit,
+            },
+        )
+
+    daily_limit = policy.get("daily_image_limit")
+    if daily_limit is not None:
+        reserved_total = int(usage["images_generated_today"]) + active_jobs + requested_job_count
+        if reserved_total > int(daily_limit):
+            raise api_error(
+                ErrorCode.QUOTA_EXCEEDED,
+                f"Daily image limit exceeded ({daily_limit})",
+                http_status=429,
+                details={
+                    "images_generated_today": usage["images_generated_today"],
+                    "active_jobs": active_jobs,
+                    "requested_job_count": requested_job_count,
+                    "daily_image_limit": daily_limit,
+                },
+            )
+
+    if str(user.get("role") or "").upper() == "ADMIN":
+        return policy
+
+    trigger_reasons: dict[str, Any] = {}
+    job_threshold = policy.get("turnstile_job_count_threshold")
+    if job_threshold is not None and requested_job_count > int(job_threshold):
+        trigger_reasons["job_count_threshold"] = int(job_threshold)
+
+    daily_threshold = policy.get("turnstile_daily_usage_threshold")
+    if daily_threshold is not None and int(usage["images_generated_today"]) > int(daily_threshold):
+        trigger_reasons["daily_usage_threshold"] = int(daily_threshold)
+
+    if trigger_reasons and _generation_turnstile_valid_until(request) is None:
+        raise api_error(
+            ErrorCode.TURNSTILE_REQUIRED,
+            "Extra Turnstile verification is required before generating images",
+            http_status=403,
+            details={
+                **trigger_reasons,
+                "requested_job_count": requested_job_count,
+                "images_generated_today": usage["images_generated_today"],
+            },
+        )
+
+    return policy
+
+
+def _daily_user_payload(
+    user: dict[str, Any],
+    policy: dict[str, Any],
+    usage_by_user: dict[str, dict[str, int]],
+    job_counts: dict[str, dict[str, int]],
+) -> dict[str, Any]:
+    usage = usage_by_user.get(str(user["user_id"])) or {
+        "jobs_created": 0,
+        "jobs_succeeded": 0,
+        "jobs_failed": 0,
+        "images_generated": 0,
+        "quota_resets": 0,
+    }
+    counts = job_counts.get(str(user["user_id"])) or {"total_jobs": 0, "active_jobs": 0}
+    daily_limit = policy.get("daily_image_limit")
+    remaining = None if daily_limit is None else max(0, int(daily_limit) - int(usage["images_generated"]))
+    return {
+        **user,
+        "policy": policy,
+        "usage": {
+            "date": now_local().date().isoformat(),
+            "jobs_created_today": int(usage["jobs_created"]),
+            "jobs_succeeded_today": int(usage["jobs_succeeded"]),
+            "jobs_failed_today": int(usage["jobs_failed"]),
+            "images_generated_today": int(usage["images_generated"]),
+            "quota_resets_today": int(usage["quota_resets"]),
+            "active_jobs": int(counts["active_jobs"]),
+            "remaining_images_today": remaining,
+        },
+        "total_jobs": int(counts["total_jobs"]),
+    }
 
 
 @app.exception_handler(StarletteHTTPException)
@@ -154,6 +413,51 @@ async def validation_exception_handler(_: Request, exc: RequestValidationError) 
 @app.get(f"{settings.api_prefix}/health", response_model=HealthResponse)
 async def health() -> HealthResponse:
     return HealthResponse(time=now_local(), version=settings.app_version, deployed_at=APP_DEPLOYED_AT)
+
+
+@app.post(f"{settings.api_prefix}/auth/login")
+async def login(payload: LoginRequest, request: Request) -> dict[str, Any]:
+    await _verify_turnstile_or_raise(request, payload.turnstile_token)
+
+    user = user_store.authenticate(payload.username, payload.password)
+    if not user:
+        raise api_error(
+            ErrorCode.INVALID_CREDENTIALS,
+            "Invalid username or password",
+            http_status=401,
+        )
+
+    request.session.clear()
+    request.session["user_id"] = user["user_id"]
+    request.session["login_turnstile_verified_at"] = now_local().isoformat()
+    if str(user.get("role") or "").upper() == "ADMIN":
+        request.session["generation_turnstile_verified_until"] = (
+            now_local() + timedelta(seconds=settings.session_max_age_sec)
+        ).isoformat()
+    return _session_payload(request, user)
+
+
+@app.post(f"{settings.api_prefix}/auth/logout")
+async def logout(request: Request, _: dict[str, Any] = Depends(get_current_user)) -> dict[str, Any]:
+    request.session.clear()
+    return {"logged_out": True}
+
+
+@app.get(f"{settings.api_prefix}/auth/me")
+async def auth_me(request: Request, current_user: dict[str, Any] = Depends(get_current_user)) -> dict[str, Any]:
+    return _session_payload(request, current_user)
+
+
+@app.post(f"{settings.api_prefix}/auth/turnstile/generation")
+async def verify_generation_turnstile(
+    payload: TurnstileVerifyRequest,
+    request: Request,
+    current_user: dict[str, Any] = Depends(get_current_user),
+) -> dict[str, Any]:
+    if str(current_user.get("role") or "").upper() != "ADMIN":
+        await _verify_turnstile_or_raise(request, payload.turnstile_token)
+        _mark_generation_turnstile_verified(request)
+    return _session_payload(request, current_user)
 
 
 def _parse_job_params(raw: dict[str, Any]) -> JobParams:
@@ -541,7 +845,7 @@ def _compute_dashboard_stats(metas: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 @app.get(f"{settings.api_prefix}/models", response_model=ModelsResponse)
-async def list_models() -> ModelsResponse:
+async def list_models(_: dict[str, Any] = Depends(get_current_user)) -> ModelsResponse:
     default_model = settings.default_model.strip()
     if not get_model_spec(default_model):
         default_model = DEFAULT_MODEL_ID
@@ -553,7 +857,11 @@ async def list_models() -> ModelsResponse:
 
 
 @app.post(f"{settings.api_prefix}/jobs/batch-meta")
-async def jobs_batch_meta(payload: BatchMetaRequest, request: Request) -> dict[str, Any]:
+async def jobs_batch_meta(
+    payload: BatchMetaRequest,
+    request: Request,
+    current_user: dict[str, Any] = Depends(get_current_user),
+) -> dict[str, Any]:
     job_read_rate_limit(request)
     refs = _normalize_job_refs(payload.jobs, limit=500)
 
@@ -572,6 +880,7 @@ async def jobs_batch_meta(payload: BatchMetaRequest, request: Request) -> dict[s
         "response",
         "error",
         "auth",
+        "owner",
     }
     fields = None
     if payload.fields:
@@ -584,7 +893,7 @@ async def jobs_batch_meta(payload: BatchMetaRequest, request: Request) -> dict[s
 
     for job_id, token in refs:
         try:
-            meta = job_manager.get_meta(job_id, token)
+            meta = job_manager.get_meta(job_id, token, current_user)
         except HTTPException as exc:
             if exc.status_code == 403:
                 forbidden.append(job_id)
@@ -606,7 +915,11 @@ async def jobs_batch_meta(payload: BatchMetaRequest, request: Request) -> dict[s
 
 
 @app.post(f"{settings.api_prefix}/jobs/active")
-async def jobs_active_snapshot(payload: ActiveJobsRequest, request: Request) -> dict[str, Any]:
+async def jobs_active_snapshot(
+    payload: ActiveJobsRequest,
+    request: Request,
+    current_user: dict[str, Any] = Depends(get_current_user),
+) -> dict[str, Any]:
     job_read_rate_limit(request)
     refs = _normalize_job_refs(payload.jobs, limit=500)
 
@@ -618,7 +931,7 @@ async def jobs_active_snapshot(payload: ActiveJobsRequest, request: Request) -> 
 
     for job_id, token in refs:
         try:
-            meta = job_manager.get_meta(job_id, token)
+            meta = job_manager.get_meta(job_id, token, current_user)
         except HTTPException as exc:
             if exc.status_code == 403:
                 forbidden.append(job_id)
@@ -655,7 +968,11 @@ async def jobs_active_snapshot(payload: ActiveJobsRequest, request: Request) -> 
 
 
 @app.post(f"{settings.api_prefix}/dashboard/summary")
-async def dashboard_summary(payload: DashboardSummaryRequest, request: Request) -> dict[str, Any]:
+async def dashboard_summary(
+    payload: DashboardSummaryRequest,
+    request: Request,
+    current_user: dict[str, Any] = Depends(get_current_user),
+) -> dict[str, Any]:
     job_read_rate_limit(request)
     refs = _normalize_job_refs(payload.jobs, limit=payload.limit)
 
@@ -667,7 +984,7 @@ async def dashboard_summary(payload: DashboardSummaryRequest, request: Request) 
 
     for job_id, token in refs:
         try:
-            meta = job_manager.get_meta(job_id, token)
+            meta = job_manager.get_meta(job_id, token, current_user)
         except HTTPException as exc:
             if exc.status_code == 403:
                 forbidden.append(job_id)
@@ -695,31 +1012,53 @@ async def dashboard_summary(payload: DashboardSummaryRequest, request: Request) 
 async def create_job(
     request: Request,
     idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+    x_requested_job_count: str | None = Header(default=None, alias="X-Requested-Job-Count"),
+    current_user: dict[str, Any] = Depends(get_current_user),
 ) -> CreateJobResponse:
+    requested_job_count = _requested_job_count_from_header(x_requested_job_count)
+    _assert_generation_allowed(request, current_user, requested_job_count=requested_job_count)
     req, refs = await _parse_create_request(request)
-    job_id, token, status_, created_at = job_manager.create_job(req, refs, idempotency_key=idempotency_key)
+    job_id, token, status_, created_at = job_manager.create_job(
+        req,
+        refs,
+        current_user,
+        requested_job_count=requested_job_count,
+        idempotency_key=idempotency_key,
+    )
     return CreateJobResponse(job_id=job_id, job_access_token=token, status=status_, created_at=created_at)
 
 
 @app.get(f"{settings.api_prefix}/jobs/{{job_id}}", dependencies=[Depends(job_read_rate_limit)])
-async def get_job(job_id: str, x_job_token: str | None = Header(default=None, alias="X-Job-Token")) -> dict[str, Any]:
+async def get_job(
+    job_id: str,
+    x_job_token: str | None = Header(default=None, alias="X-Job-Token"),
+    current_user: dict[str, Any] = Depends(get_current_user),
+) -> dict[str, Any]:
     if not validate_job_id(job_id):
         raise api_error(ErrorCode.JOB_NOT_FOUND, "Job not found", http_status=404)
-    return job_manager.get_meta(job_id, x_job_token)
+    return job_manager.get_meta(job_id, x_job_token, current_user)
 
 
 @app.get(f"{settings.api_prefix}/jobs/{{job_id}}/request", dependencies=[Depends(job_read_rate_limit)])
-async def get_job_request(job_id: str, x_job_token: str | None = Header(default=None, alias="X-Job-Token")) -> dict[str, Any]:
+async def get_job_request(
+    job_id: str,
+    x_job_token: str | None = Header(default=None, alias="X-Job-Token"),
+    current_user: dict[str, Any] = Depends(get_current_user),
+) -> dict[str, Any]:
     if not validate_job_id(job_id):
         raise api_error(ErrorCode.JOB_NOT_FOUND, "Job not found", http_status=404)
-    return {"job_id": job_id, "request": job_manager.get_request(job_id, x_job_token)}
+    return {"job_id": job_id, "request": job_manager.get_request(job_id, x_job_token, current_user)}
 
 
 @app.get(f"{settings.api_prefix}/jobs/{{job_id}}/response", dependencies=[Depends(job_read_rate_limit)])
-async def get_job_response(job_id: str, x_job_token: str | None = Header(default=None, alias="X-Job-Token")) -> dict[str, Any]:
+async def get_job_response(
+    job_id: str,
+    x_job_token: str | None = Header(default=None, alias="X-Job-Token"),
+    current_user: dict[str, Any] = Depends(get_current_user),
+) -> dict[str, Any]:
     if not validate_job_id(job_id):
         raise api_error(ErrorCode.JOB_NOT_FOUND, "Job not found", http_status=404)
-    return {"job_id": job_id, "response": job_manager.get_response(job_id, x_job_token)}
+    return {"job_id": job_id, "response": job_manager.get_response(job_id, x_job_token, current_user)}
 
 
 @app.get(f"{settings.api_prefix}/jobs/{{job_id}}/images/{{image_id}}", dependencies=[Depends(job_read_rate_limit)])
@@ -727,21 +1066,22 @@ async def get_job_image(
     job_id: str,
     image_id: str,
     x_job_token: str | None = Header(default=None, alias="X-Job-Token"),
+    current_user: dict[str, Any] = Depends(get_current_user),
 ) -> Response:
     if not validate_job_id(job_id):
         raise api_error(ErrorCode.JOB_NOT_FOUND, "Job not found", http_status=404)
     if not validate_image_id(image_id):
         raise api_error(ErrorCode.IMAGE_NOT_FOUND, "Image not found", http_status=404)
 
-    image_bytes, mime = job_manager.get_image(job_id, x_job_token, image_id)
+    image_bytes, mime = job_manager.get_image(job_id, x_job_token, image_id, current_user)
     return Response(content=image_bytes, media_type=mime)
 
 
-async def _event_stream(job_id: str, token: str | None) -> AsyncIterator[bytes]:
+async def _event_stream(job_id: str, token: str | None, user: dict[str, Any]) -> AsyncIterator[bytes]:
     last_status = None
     while True:
         try:
-            meta = job_manager.get_meta(job_id, token)
+            meta = job_manager.get_meta(job_id, token, user)
         except Exception:
             payload = {"status": "FAILED", "error": "Job stream unavailable"}
             yield f"event: error\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n".encode("utf-8")
@@ -771,41 +1111,199 @@ async def _event_stream(job_id: str, token: str | None) -> AsyncIterator[bytes]:
 async def get_job_events(
     job_id: str,
     x_job_token: str | None = Header(default=None, alias="X-Job-Token"),
+    current_user: dict[str, Any] = Depends(get_current_user),
 ) -> StreamingResponse:
     if not validate_job_id(job_id):
         raise api_error(ErrorCode.JOB_NOT_FOUND, "Job not found", http_status=404)
-    job_manager.get_meta(job_id, x_job_token)
-    return StreamingResponse(_event_stream(job_id, x_job_token), media_type="text/event-stream")
+    job_manager.get_meta(job_id, x_job_token, current_user)
+    return StreamingResponse(_event_stream(job_id, x_job_token, current_user), media_type="text/event-stream")
 
 
 @app.delete(f"{settings.api_prefix}/jobs/{{job_id}}")
-async def delete_job(job_id: str, x_job_token: str | None = Header(default=None, alias="X-Job-Token")) -> dict[str, Any]:
+async def delete_job(
+    job_id: str,
+    x_job_token: str | None = Header(default=None, alias="X-Job-Token"),
+    current_user: dict[str, Any] = Depends(get_current_user),
+) -> dict[str, Any]:
     if not validate_job_id(job_id):
         raise api_error(ErrorCode.JOB_NOT_FOUND, "Job not found", http_status=404)
-    job_manager.delete_job(job_id, x_job_token)
+    job_manager.delete_job(job_id, x_job_token, current_user)
     return {"job_id": job_id, "deleted": True}
 
 
 @app.post(f"{settings.api_prefix}/jobs/{{job_id}}/retry", status_code=status.HTTP_201_CREATED)
 async def retry_job(
+    request: Request,
     job_id: str,
     payload: RetryJobRequest,
     x_job_token: str | None = Header(default=None, alias="X-Job-Token"),
+    current_user: dict[str, Any] = Depends(get_current_user),
 ) -> dict[str, Any]:
     if not validate_job_id(job_id):
         raise api_error(ErrorCode.JOB_NOT_FOUND, "Job not found", http_status=404)
-    new_job_id, new_token, _ = job_manager.retry_job(job_id, x_job_token, payload.override_params)
+    _assert_generation_allowed(request, current_user, requested_job_count=1)
+    new_job_id, new_token, _ = job_manager.retry_job(job_id, x_job_token, current_user, payload.override_params)
     return {
         "new_job_id": new_job_id,
         "new_job_access_token": new_token,
     }
 
 
-def _check_admin_key(x_admin_key: str | None) -> None:
-    if not settings.admin_api_key:
-        return
-    if x_admin_key != settings.admin_api_key:
-        raise api_error(ErrorCode.JOB_TOKEN_INVALID, "Invalid admin key", http_status=403)
+def _job_counts_by_user(metas: list[dict[str, Any]]) -> dict[str, dict[str, int]]:
+    counts: dict[str, dict[str, int]] = {}
+    for meta in metas:
+        owner = meta.get("owner") if isinstance(meta.get("owner"), dict) else {}
+        user_id = str(owner.get("user_id") or "")
+        if not user_id:
+            continue
+        bucket = counts.setdefault(user_id, {"total_jobs": 0, "active_jobs": 0})
+        bucket["total_jobs"] += 1
+        if meta.get("status") in {"QUEUED", "RUNNING"}:
+            bucket["active_jobs"] += 1
+    return counts
+
+
+def _admin_overview_payload() -> dict[str, Any]:
+    now = now_local()
+    metas = storage.iter_job_meta()
+    users = user_store.list_users()
+    today = now.date()
+    queued_jobs = 0
+    running_jobs = 0
+    active_jobs = 0
+    succeeded_today = 0
+    failed_today = 0
+    images_generated_today = 0
+
+    for meta in metas:
+        status_value = str(meta.get("status") or "")
+        if status_value == "QUEUED":
+            queued_jobs += 1
+            active_jobs += 1
+        elif status_value == "RUNNING":
+            running_jobs += 1
+            active_jobs += 1
+
+        created = _parse_iso(meta.get("created_at")) or _parse_iso(meta.get("updated_at"))
+        if not created or created.date() != today:
+            continue
+        if status_value == "SUCCEEDED":
+            succeeded_today += 1
+            result = meta.get("result") if isinstance(meta.get("result"), dict) else {}
+            images_generated_today += len(result.get("images") or [])
+        elif status_value == "FAILED":
+            failed_today += 1
+
+    enabled_users = sum(1 for user in users if user.get("enabled"))
+    return {
+        "system": {
+            "app_version": settings.app_version,
+            "deployed_at": APP_DEPLOYED_AT.isoformat(),
+            "now": now.isoformat(),
+            "uptime_sec": max(0, int((now - APP_DEPLOYED_AT).total_seconds())),
+            "queue_size": job_manager.queue_size(),
+            "worker_count": job_manager.worker_count(),
+            "users_total": len(users),
+            "users_enabled": enabled_users,
+            "jobs_total": len(metas),
+            "queued_jobs": queued_jobs,
+            "running_jobs": running_jobs,
+            "active_jobs": active_jobs,
+            "succeeded_today": succeeded_today,
+            "failed_today": failed_today,
+            "images_generated_today": images_generated_today,
+        },
+        "policy": user_store.get_policy(),
+        "billing": _billing_summary_payload(),
+    }
+
+
+@app.get(f"{settings.api_prefix}/admin/overview")
+async def admin_overview(_: dict[str, Any] = Depends(get_admin_user)) -> dict[str, Any]:
+    return _admin_overview_payload()
+
+
+@app.get(f"{settings.api_prefix}/admin/users")
+async def admin_users(_: dict[str, Any] = Depends(get_admin_user)) -> dict[str, Any]:
+    users = user_store.list_users()
+    policy_doc = user_store.get_policy()
+    usage_by_user = user_store.get_daily_usage_for_all()
+    job_counts = _job_counts_by_user(storage.iter_job_meta())
+    items = [
+        _daily_user_payload(user, user_store.get_effective_policy(user, policy_doc), usage_by_user, job_counts)
+        for user in users
+    ]
+    return {"users": items}
+
+
+@app.post(f"{settings.api_prefix}/admin/users", status_code=status.HTTP_201_CREATED)
+async def admin_create_user(
+    payload: CreateUserRequest,
+    _: dict[str, Any] = Depends(get_admin_user),
+) -> dict[str, Any]:
+    if not validate_username(payload.username):
+        raise api_error(ErrorCode.INVALID_INPUT, "username must be 3-32 chars: letters, numbers, _ . -", http_status=400)
+    try:
+        user = user_store.create_user(
+            username=payload.username,
+            password=payload.password,
+            role=payload.role.value,
+            enabled=payload.enabled,
+            policy_overrides=payload.policy_overrides.model_dump(),
+        )
+    except ValueError as exc:
+        if str(exc) == "USERNAME_TAKEN":
+            raise api_error(ErrorCode.USERNAME_TAKEN, "Username already exists", http_status=409) from exc
+        raise
+
+    policy = user_store.get_effective_policy(user)
+    return _daily_user_payload(user, policy, user_store.get_daily_usage_for_all(), {})
+
+
+@app.patch(f"{settings.api_prefix}/admin/users/{{user_id}}")
+async def admin_update_user(
+    user_id: str,
+    payload: UpdateUserRequest,
+    _: dict[str, Any] = Depends(get_admin_user),
+) -> dict[str, Any]:
+    user = user_store.update_user(
+        user_id,
+        password=payload.password,
+        role=payload.role.value if payload.role is not None else None,
+        enabled=payload.enabled,
+        policy_overrides=payload.policy_overrides.model_dump() if payload.policy_overrides is not None else None,
+    )
+    if not user:
+        raise api_error(ErrorCode.USER_NOT_FOUND, "User not found", http_status=404)
+
+    policy_doc = user_store.get_policy()
+    usage_by_user = user_store.get_daily_usage_for_all()
+    job_counts = _job_counts_by_user(storage.iter_job_meta())
+    return _daily_user_payload(user, user_store.get_effective_policy(user, policy_doc), usage_by_user, job_counts)
+
+
+@app.post(f"{settings.api_prefix}/admin/users/{{user_id}}/reset-quota")
+async def admin_reset_user_quota(
+    user_id: str,
+    _: dict[str, Any] = Depends(get_admin_user),
+) -> dict[str, Any]:
+    user = user_store.get_user_by_id(user_id)
+    if not user:
+        raise api_error(ErrorCode.USER_NOT_FOUND, "User not found", http_status=404)
+    user_store.reset_daily_usage(user_id)
+    policy_doc = user_store.get_policy()
+    usage_by_user = user_store.get_daily_usage_for_all()
+    job_counts = _job_counts_by_user(storage.iter_job_meta())
+    return _daily_user_payload(user, user_store.get_effective_policy(user, policy_doc), usage_by_user, job_counts)
+
+
+@app.patch(f"{settings.api_prefix}/admin/policy")
+async def admin_update_policy(
+    payload: UpdateSystemPolicyRequest,
+    _: dict[str, Any] = Depends(get_admin_user),
+) -> dict[str, Any]:
+    policy = user_store.update_policy(payload.model_dump())
+    return {"policy": policy}
 
 
 def _billing_summary_payload() -> dict[str, Any]:
@@ -841,17 +1339,14 @@ def _billing_summary_payload() -> dict[str, Any]:
 
 
 @app.get(f"{settings.api_prefix}/billing/summary", response_model=None)
-async def billing_summary(x_admin_key: str | None = Header(default=None, alias="X-Admin-Key")) -> dict[str, Any]:
-    _check_admin_key(x_admin_key)
+async def billing_summary(_: dict[str, Any] = Depends(get_admin_user)) -> dict[str, Any]:
     return _billing_summary_payload()
 
 
 @app.get(f"{settings.api_prefix}/billing/google/remaining")
 async def billing_google_remaining(
-    x_admin_key: str | None = Header(default=None, alias="X-Admin-Key"),
+    _: dict[str, Any] = Depends(get_admin_user),
 ) -> dict[str, Any]:
-    _check_admin_key(x_admin_key)
-
     if settings.billing_mode == "INTERNAL":
         summary = _billing_summary_payload()
         payload = GoogleRemainingConfiguredResponse(

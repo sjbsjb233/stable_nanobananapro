@@ -29,7 +29,10 @@ stable_nanobananapro/
   - `gemini-2.5-flash-image`
   - `gemini-3-pro-image-preview`
 - API 前缀：`/v1`
-- 默认鉴权：`job_id + X-Job-Token`（仅保存 token hash）
+- 默认鉴权：`cookie session + 用户系统`
+- 除 `GET /v1/health` 与登录接口外，其他接口都要求已登录
+- 首次启动会自动创建 bootstrap 管理员（默认 `admin / admin123456`，请立即改密或通过 env 覆盖）
+- 登录必须通过 Cloudflare Turnstile；普通用户在高风险生成条件下还会触发二次 Turnstile 校验
 - 每个 Job 落盘文件：
   - `meta.json`
   - `request.json`
@@ -69,9 +72,23 @@ npm run dev
 可配项：
 
 - `VITE_API_BASE_URL=http://127.0.0.1:8000`
+- `VITE_TURNSTILE_SITE_KEY=0x4AAAAAACoBxRJwxj2oUZDc`
 - `VITE_LOG_LEVEL=INFO`
 - `VITE_LOG_RETENTION_DAYS=3`
 - `VITE_LOG_MAX_ENTRIES=1200`
+
+新增后端认证/配额相关 env：
+
+- `SESSION_SECRET_KEY`
+- `BOOTSTRAP_ADMIN_USERNAME`
+- `BOOTSTRAP_ADMIN_PASSWORD`
+- `TURNSTILE_SITE_KEY`
+- `TURNSTILE_SECRET_KEY`
+- `DEFAULT_USER_DAILY_IMAGE_LIMIT`
+- `DEFAULT_USER_CONCURRENT_JOBS_LIMIT`
+- `DEFAULT_ADMIN_CONCURRENT_JOBS_LIMIT`
+- `DEFAULT_USER_TURNSTILE_JOB_COUNT_THRESHOLD`
+- `DEFAULT_USER_TURNSTILE_DAILY_USAGE_THRESHOLD`
 
 ### 3. 本地开发测试
 

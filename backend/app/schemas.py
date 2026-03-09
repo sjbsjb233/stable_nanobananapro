@@ -26,16 +26,28 @@ class JobStatus(str, Enum):
 
 
 class ErrorCode(str, Enum):
+    AUTH_REQUIRED = "AUTH_REQUIRED"
+    FORBIDDEN = "FORBIDDEN"
     INVALID_INPUT = "INVALID_INPUT"
+    INVALID_CREDENTIALS = "INVALID_CREDENTIALS"
     JOB_NOT_FOUND = "JOB_NOT_FOUND"
     JOB_TOKEN_INVALID = "JOB_TOKEN_INVALID"
     RATE_LIMITED = "RATE_LIMITED"
+    QUOTA_EXCEEDED = "QUOTA_EXCEEDED"
     UPSTREAM_TIMEOUT = "UPSTREAM_TIMEOUT"
     UPSTREAM_RATE_LIMIT = "UPSTREAM_RATE_LIMIT"
     SAFETY_BLOCKED = "SAFETY_BLOCKED"
     NO_IMAGE_PART = "NO_IMAGE_PART"
     IMAGE_NOT_FOUND = "IMAGE_NOT_FOUND"
     BILLING_NOT_CONFIGURED = "BILLING_NOT_CONFIGURED"
+    TURNSTILE_REQUIRED = "TURNSTILE_REQUIRED"
+    USER_NOT_FOUND = "USER_NOT_FOUND"
+    USERNAME_TAKEN = "USERNAME_TAKEN"
+
+
+class UserRole(str, Enum):
+    ADMIN = "ADMIN"
+    USER = "USER"
 
 
 class JobParams(BaseModel):
@@ -259,3 +271,53 @@ class ActiveJobsRequest(BaseModel):
 class DashboardSummaryRequest(BaseModel):
     jobs: list[JobAccessRef] = Field(default_factory=list)
     limit: int = Field(default=200, ge=1, le=500)
+
+
+class LoginRequest(BaseModel):
+    username: str = Field(min_length=3, max_length=32)
+    password: str = Field(min_length=8, max_length=128)
+    turnstile_token: str = Field(min_length=1, max_length=4096)
+
+    @field_validator("username")
+    @classmethod
+    def normalize_username(cls, value: str) -> str:
+        return str(value).strip().lower()
+
+
+class TurnstileVerifyRequest(BaseModel):
+    turnstile_token: str = Field(min_length=1, max_length=4096)
+
+
+class UserPolicyOverrideInput(BaseModel):
+    daily_image_limit: int | None = Field(default=None, ge=0)
+    concurrent_jobs_limit: int | None = Field(default=None, ge=0)
+    turnstile_job_count_threshold: int | None = Field(default=None, ge=0)
+    turnstile_daily_usage_threshold: int | None = Field(default=None, ge=0)
+
+
+class CreateUserRequest(BaseModel):
+    username: str = Field(min_length=3, max_length=32)
+    password: str = Field(min_length=8, max_length=128)
+    role: UserRole = UserRole.USER
+    enabled: bool = True
+    policy_overrides: UserPolicyOverrideInput = Field(default_factory=UserPolicyOverrideInput)
+
+    @field_validator("username")
+    @classmethod
+    def normalize_username(cls, value: str) -> str:
+        return str(value).strip().lower()
+
+
+class UpdateUserRequest(BaseModel):
+    password: str | None = Field(default=None, min_length=8, max_length=128)
+    role: UserRole | None = None
+    enabled: bool | None = None
+    policy_overrides: UserPolicyOverrideInput | None = None
+
+
+class UpdateSystemPolicyRequest(BaseModel):
+    default_user_daily_image_limit: int | None = Field(default=None, ge=0)
+    default_user_concurrent_jobs_limit: int | None = Field(default=None, ge=0)
+    default_admin_concurrent_jobs_limit: int | None = Field(default=None, ge=0)
+    default_user_turnstile_job_count_threshold: int | None = Field(default=None, ge=0)
+    default_user_turnstile_daily_usage_threshold: int | None = Field(default=None, ge=0)

@@ -57,6 +57,24 @@ class Settings(BaseSettings):
     )
     cors_allow_credentials: bool = Field(default=True, alias="CORS_ALLOW_CREDENTIALS")
 
+    session_secret_key: str = Field(default="change-me-session-secret", alias="SESSION_SECRET_KEY")
+    session_cookie_name: str = Field(default="nbp_session", alias="SESSION_COOKIE_NAME")
+    session_max_age_sec: int = Field(default=7 * 24 * 3600, alias="SESSION_MAX_AGE_SEC")
+    session_https_only: bool = Field(default=False, alias="SESSION_HTTPS_ONLY")
+
+    bootstrap_admin_username: str = Field(default="admin", alias="BOOTSTRAP_ADMIN_USERNAME")
+    bootstrap_admin_password: str = Field(default="admin123456", alias="BOOTSTRAP_ADMIN_PASSWORD")
+
+    turnstile_site_key: str = Field(default="", alias="TURNSTILE_SITE_KEY")
+    turnstile_secret_key: str = Field(default="", alias="TURNSTILE_SECRET_KEY")
+    generation_turnstile_ttl_sec: int = Field(default=600, alias="GENERATION_TURNSTILE_TTL_SEC")
+
+    default_user_daily_image_limit: int = Field(default=100, alias="DEFAULT_USER_DAILY_IMAGE_LIMIT")
+    default_user_concurrent_jobs_limit: int = Field(default=2, alias="DEFAULT_USER_CONCURRENT_JOBS_LIMIT")
+    default_admin_concurrent_jobs_limit: int = Field(default=20, alias="DEFAULT_ADMIN_CONCURRENT_JOBS_LIMIT")
+    default_user_turnstile_job_count_threshold: int = Field(default=5, alias="DEFAULT_USER_TURNSTILE_JOB_COUNT_THRESHOLD")
+    default_user_turnstile_daily_usage_threshold: int = Field(default=50, alias="DEFAULT_USER_TURNSTILE_DAILY_USAGE_THRESHOLD")
+
 
 settings = Settings()
 
@@ -70,5 +88,7 @@ def get_cors_origins() -> list[str]:
 
 def ensure_data_dirs() -> None:
     jobs_dir = settings.data_dir / "jobs"
+    auth_dir = settings.data_dir / "auth"
     jobs_dir.mkdir(parents=True, exist_ok=True)
+    auth_dir.mkdir(parents=True, exist_ok=True)
     settings.log_dir.mkdir(parents=True, exist_ok=True)

@@ -14,6 +14,7 @@
   - 生产机负责：拉镜像并运行容器
   - 数据目录持久化，不跟容器生命周期绑定
   - 密钥配置通过 `env_file` 注入，不写进镜像
+  - 当前系统已包含用户登录/会话/Turnstile；除健康检查与登录接口外，其余 API 默认都要求已登录
 
 ## 2. 开发阶段：主要工作目录
 
@@ -31,6 +32,12 @@
 
 - `srv/`：本地仿真运行目录（本地环境产物，已忽略）
 - `srv_server/`：服务器部署模板（改部署策略时才改）
+
+认证相关额外关注：
+
+- `backend/.env` 需要配置 `SESSION_SECRET_KEY`、`TURNSTILE_SECRET_KEY`
+- 首次启动会按 `BOOTSTRAP_ADMIN_USERNAME` / `BOOTSTRAP_ADMIN_PASSWORD` 自动创建管理员
+- 前端 Turnstile 站点密钥走 `frontend/.env` 的 `VITE_TURNSTILE_SITE_KEY`
 
 ## 3. 开发环境运行（非 Docker）
 
