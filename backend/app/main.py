@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import random
 import time
 import uuid
 from datetime import datetime, timedelta
@@ -12,11 +13,10 @@ from fastapi import HTTPException
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.middleware.cors import CORSMiddleware
-from starlette.middleware.sessions import SessionMiddleware
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from .billing import current_month_period
-from .config import ensure_data_dirs, get_cors_origins, settings
+from .config import cors_allow_all_origins, ensure_data_dirs, get_cors_origins, settings
 from .errors import api_error
 from .gemini_client import ReferenceImage
 from .job_manager import job_manager
@@ -49,11 +49,13 @@ from .schemas import (
     ModelCapability,
     ModelsResponse,
     JobParams,
+    JobStatus,
     RetryJobRequest,
     TurnstileVerifyRequest,
     UpdateSystemPolicyRequest,
     UpdateUserRequest,
 )
+from .safe_session import SafeSessionMiddleware
 from .security import validate_image_id, validate_job_id
 from .storage import storage
 from .time_utils import now_local
@@ -65,13 +67,12 @@ app = FastAPI(title="Nano Banana API", version=settings.app_version)
 APP_DEPLOYED_AT = now_local()
 cors_origins = get_cors_origins()
 allow_credentials = settings.cors_allow_credentials
-if "*" in cors_origins:
-    # Browsers do not allow wildcard origin together with credentials.
-    allow_credentials = False
+allow_origin_regex = ".*" if cors_allow_all_origins() else None
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=cors_origins,
+    allow_origins=[] if allow_origin_regex else cors_origins,
+    allow_origin_regex=allow_origin_regex,
     allow_credentials=allow_credentials,
     allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
     allow_headers=[
@@ -84,7 +85,7 @@ app.add_middleware(
     ],
 )
 app.add_middleware(
-    SessionMiddleware,
+    SafeSessionMiddleware,
     secret_key=settings.session_secret_key,
     session_cookie=settings.session_cookie_name,
     max_age=settings.session_max_age_sec,
@@ -266,6 +267,52 @@ def _consume_generation_turnstile_batch_allowance(request: Request, requested_jo
     request.session["generation_turnstile_batch_remaining_uses"] = remaining
 
 
+def _clear_overquota_pending_batch(request: Request) -> None:
+    request.session.pop("overquota_pending_user_id", None)
+    request.session.pop("overquota_pending_requested_job_count", None)
+    request.session.pop("overquota_pending_jobs", None)
+
+
+def _store_overquota_pending_batch(
+    request: Request,
+    *,
+    user_id: str,
+    requested_job_count: int,
+    jobs: list[dict[str, Any]],
+) -> None:
+    if not jobs:
+        _clear_overquota_pending_batch(request)
+        return
+    request.session["overquota_pending_user_id"] = str(user_id)
+    request.session["overquota_pending_requested_job_count"] = int(requested_job_count)
+    request.session["overquota_pending_jobs"] = jobs
+
+
+def _pop_overquota_pending_job(
+    request: Request,
+    *,
+    user_id: str,
+    requested_job_count: int,
+) -> dict[str, Any] | None:
+    session = request.scope.get("session")
+    if not isinstance(session, dict):
+        return None
+    if str(session.get("overquota_pending_user_id") or "") != str(user_id):
+        return None
+    if int(session.get("overquota_pending_requested_job_count") or 0) != int(requested_job_count):
+        return None
+    jobs = session.get("overquota_pending_jobs")
+    if not isinstance(jobs, list) or not jobs:
+        _clear_overquota_pending_batch(request)
+        return None
+    item = jobs.pop(0)
+    if jobs:
+        session["overquota_pending_jobs"] = jobs
+    else:
+        _clear_overquota_pending_batch(request)
+    return item if isinstance(item, dict) else None
+
+
 def _job_activity_counts_for_user(user_id: str) -> dict[str, int]:
     counts = {"queued_jobs": 0, "running_jobs": 0, "active_jobs": 0}
     for meta in storage.iter_job_meta():
@@ -301,6 +348,22 @@ def _usage_payload(user: dict[str, Any], policy: dict[str, Any] | None = None) -
         "running_jobs": int(activity["running_jobs"]),
         "queued_jobs": int(activity["queued_jobs"]),
         "remaining_images_today": remaining,
+    }
+
+
+def _image_access_usage_payload(user: dict[str, Any], policy: dict[str, Any] | None = None) -> dict[str, Any]:
+    policy = policy or user_store.get_effective_policy(user)
+    usage = user_store.get_daily_usage(str(user["user_id"]))
+    base_limit = policy.get("daily_image_access_limit")
+    hard_limit = policy.get("daily_image_access_hard_limit")
+    bonus_quota = int(usage.get("image_access_bonus_quota", 0))
+    accesses = int(usage.get("image_accesses", 0))
+    effective_limit = None if base_limit is None else int(base_limit) + max(0, bonus_quota)
+    return {
+        "image_accesses_today": accesses,
+        "image_access_bonus_quota_today": bonus_quota,
+        "image_access_limit_today": effective_limit,
+        "image_access_hard_limit_today": hard_limit,
     }
 
 
@@ -347,6 +410,45 @@ async def _verify_turnstile_or_raise(request: Request, token: str) -> dict[str, 
     return payload
 
 
+def _image_access_verification_required(user: dict[str, Any]) -> dict[str, Any] | None:
+    if str(user.get("role") or "").upper() == "ADMIN":
+        return None
+
+    policy = user_store.get_effective_policy(user)
+    usage = user_store.get_daily_usage(str(user["user_id"]))
+    accesses = int(usage.get("image_accesses", 0))
+    base_limit = policy.get("daily_image_access_limit")
+    hard_limit = policy.get("daily_image_access_hard_limit")
+
+    if hard_limit is not None and accesses >= int(hard_limit):
+        raise api_error(
+            ErrorCode.QUOTA_EXCEEDED,
+            "Image access limit reached for today",
+            http_status=429,
+            details={
+                "turnstile_scope": "image_access",
+                "image_accesses_today": accesses,
+                "daily_image_access_hard_limit": int(hard_limit),
+            },
+        )
+
+    if base_limit is None:
+        return None
+
+    granted_bonus = int(usage.get("image_access_bonus_quota", 0))
+    allowed_without_new_verification = int(base_limit) + granted_bonus
+    if accesses < allowed_without_new_verification:
+        return None
+
+    return {
+        "turnstile_scope": "image_access",
+        "image_accesses_today": accesses,
+        "daily_image_access_limit": int(base_limit),
+        "image_access_bonus_quota_today": granted_bonus,
+        "daily_image_access_hard_limit": int(hard_limit) if hard_limit is not None else None,
+    }
+
+
 def _requested_job_count_from_header(value: str | None) -> int:
     try:
         parsed = int(str(value or "1"))
@@ -362,13 +464,17 @@ def _assert_generation_allowed(
     requested_job_count: int,
 ) -> dict[str, Any]:
     policy = user_store.get_effective_policy(user)
+    policy_doc = user_store.get_policy()
     usage = _usage_payload(user, policy)
     quota_consumed = int(usage["quota_consumed_today"])
 
     daily_limit = policy.get("daily_image_limit")
+    overflow_quota_mode = False
     if daily_limit is not None:
-        next_total = quota_consumed + 1
-        if next_total > int(daily_limit):
+        normal_limit = int(daily_limit)
+        extra_limit = int(policy_doc.get("default_user_extra_daily_image_limit") or 0)
+        requested_total = quota_consumed + requested_job_count
+        if requested_total > normal_limit + extra_limit:
             raise api_error(
                 ErrorCode.QUOTA_EXCEEDED,
                 f"Daily image limit exceeded ({daily_limit})",
@@ -376,24 +482,32 @@ def _assert_generation_allowed(
                 details={
                     "quota_consumed_today": quota_consumed,
                     "jobs_created_today": usage["jobs_created_today"],
-                    "next_total": next_total,
+                    "requested_job_count": requested_job_count,
+                    "requested_total": requested_total,
                     "daily_image_limit": daily_limit,
                 },
             )
+        overflow_quota_mode = requested_total > normal_limit
 
     if str(user.get("role") or "").upper() == "ADMIN":
-        return {"policy": policy, "consume_turnstile_batch_allowance": False}
+        return {
+            "policy": policy,
+            "consume_turnstile_batch_allowance": False,
+            "overflow_quota_mode": False,
+        }
 
     trigger_reasons: dict[str, Any] = {}
-    requires_batch_turnstile = False
+    requires_batch_turnstile = overflow_quota_mode
     job_threshold = policy.get("turnstile_job_count_threshold")
-    if job_threshold is not None and requested_job_count > int(job_threshold):
+    if not overflow_quota_mode and job_threshold is not None and requested_job_count > int(job_threshold):
         trigger_reasons["job_count_threshold"] = int(job_threshold)
         requires_batch_turnstile = True
 
     daily_threshold = policy.get("turnstile_daily_usage_threshold")
-    if daily_threshold is not None and quota_consumed >= int(daily_threshold):
+    if not overflow_quota_mode and daily_threshold is not None and quota_consumed >= int(daily_threshold):
         trigger_reasons["daily_usage_threshold"] = int(daily_threshold)
+    if overflow_quota_mode:
+        trigger_reasons["requested_job_count"] = requested_job_count
 
     has_session_turnstile = _generation_turnstile_valid_until(request) is not None
     batch_allowance = _get_generation_turnstile_batch_allowance(request)
@@ -421,6 +535,7 @@ def _assert_generation_allowed(
     return {
         "policy": policy,
         "consume_turnstile_batch_allowance": requires_batch_turnstile,
+        "overflow_quota_mode": overflow_quota_mode,
     }
 
 
@@ -435,6 +550,8 @@ def _daily_user_payload(
         "jobs_succeeded": 0,
         "jobs_failed": 0,
         "images_generated": 0,
+        "image_accesses": 0,
+        "image_access_bonus_quota": 0,
         "quota_resets": 0,
     }
     counts = job_counts.get(str(user["user_id"])) or {"total_jobs": 0, "active_jobs": 0}
@@ -450,6 +567,8 @@ def _daily_user_payload(
             "jobs_succeeded_today": int(usage["jobs_succeeded"]),
             "jobs_failed_today": int(usage["jobs_failed"]),
             "images_generated_today": int(usage["images_generated"]),
+            "image_accesses_today": int(usage.get("image_accesses", 0)),
+            "image_access_bonus_quota_today": int(usage.get("image_access_bonus_quota", 0)),
             "quota_consumed_today": quota_consumed,
             "quota_resets_today": int(usage["quota_resets"]),
             "active_jobs": int(counts["active_jobs"]),
@@ -526,9 +645,28 @@ async def verify_generation_turnstile(
         await _verify_turnstile_or_raise(request, payload.turnstile_token)
         _mark_generation_turnstile_verified(request)
         _clear_generation_turnstile_batch_allowance(request)
+        _clear_overquota_pending_batch(request)
         if payload.requested_job_count is not None:
             _set_generation_turnstile_batch_allowance(request, int(payload.requested_job_count))
     return _session_payload(request, current_user)
+
+
+@app.post(f"{settings.api_prefix}/auth/turnstile/image-access")
+async def verify_image_access_turnstile(
+    payload: TurnstileVerifyRequest,
+    request: Request,
+    current_user: dict[str, Any] = Depends(get_current_user),
+) -> dict[str, Any]:
+    if str(current_user.get("role") or "").upper() != "ADMIN":
+        await _verify_turnstile_or_raise(request, payload.turnstile_token)
+        policy = user_store.get_effective_policy(current_user)
+        bonus_quota = int(policy.get("image_access_turnstile_bonus_quota") or 0)
+        if bonus_quota > 0:
+            user_store.grant_image_access_bonus(str(current_user["user_id"]), bonus_quota)
+    return {
+        "verified": True,
+        "scope": "image_access",
+    }
 
 
 def _parse_job_params(raw: dict[str, Any]) -> JobParams:
@@ -609,6 +747,70 @@ def _validate_and_normalize_request(req: CreateJobRequest) -> CreateJobRequest:
         params=params,
         mode=mode,  # type: ignore[arg-type]
     )
+
+
+def _build_overquota_batch(
+    request: Request,
+    *,
+    req: CreateJobRequest,
+    refs: list[ReferenceImage],
+    current_user: dict[str, Any],
+    requested_job_count: int,
+) -> dict[str, Any]:
+    jobs: list[dict[str, Any]] = []
+    should_run_real_job = random.random() < float(settings.overquota_real_job_run_probability)
+
+    if should_run_real_job:
+        real_job_id, real_token, real_status, real_created_at = job_manager.create_job(
+            req,
+            refs,
+            current_user,
+            requested_job_count=requested_job_count,
+        )
+    else:
+        real_job_id, real_token, real_status, real_created_at = job_manager.create_failed_job(
+            req,
+            refs,
+            current_user,
+            requested_job_count=requested_job_count,
+        )
+    jobs.append(
+        {
+            "job_id": real_job_id,
+            "job_access_token": real_token,
+            "status": real_status.value if isinstance(real_status, JobStatus) else str(real_status),
+            "created_at": real_created_at.isoformat(),
+        }
+    )
+
+    for _ in range(max(0, requested_job_count - 1)):
+        failed_job_id, failed_token, failed_status, failed_created_at = job_manager.create_failed_job(
+            req,
+            refs,
+            current_user,
+            requested_job_count=requested_job_count,
+        )
+        jobs.append(
+            {
+                "job_id": failed_job_id,
+                "job_access_token": failed_token,
+                "status": failed_status.value if isinstance(failed_status, JobStatus) else str(failed_status),
+                "created_at": failed_created_at.isoformat(),
+            }
+        )
+
+    _clear_generation_turnstile_batch_allowance(request)
+    first, rest = jobs[0], jobs[1:]
+    if rest:
+        _store_overquota_pending_batch(
+            request,
+            user_id=str(current_user["user_id"]),
+            requested_job_count=requested_job_count,
+            jobs=rest,
+        )
+    else:
+        _clear_overquota_pending_batch(request)
+    return first
 
 
 async def _parse_create_request(request: Request) -> tuple[CreateJobRequest, list[ReferenceImage]]:
@@ -1087,8 +1289,36 @@ async def create_job(
     current_user: dict[str, Any] = Depends(get_current_user),
 ) -> CreateJobResponse:
     requested_job_count = _requested_job_count_from_header(x_requested_job_count)
+    pending_job = _pop_overquota_pending_job(
+        request,
+        user_id=str(current_user["user_id"]),
+        requested_job_count=requested_job_count,
+    )
+    if pending_job is not None:
+        return CreateJobResponse(
+            job_id=str(pending_job["job_id"]),
+            job_access_token=pending_job.get("job_access_token"),
+            status=JobStatus(str(pending_job.get("status") or JobStatus.FAILED.value)),
+            created_at=datetime.fromisoformat(str(pending_job["created_at"])),
+        )
+
     gate = _assert_generation_allowed(request, current_user, requested_job_count=requested_job_count)
     req, refs = await _parse_create_request(request)
+    if gate["overflow_quota_mode"]:
+        batch_job = _build_overquota_batch(
+            request,
+            req=req,
+            refs=refs,
+            current_user=current_user,
+            requested_job_count=requested_job_count,
+        )
+        return CreateJobResponse(
+            job_id=str(batch_job["job_id"]),
+            job_access_token=batch_job.get("job_access_token"),
+            status=JobStatus(str(batch_job.get("status") or JobStatus.FAILED.value)),
+            created_at=datetime.fromisoformat(str(batch_job["created_at"])),
+        )
+
     job_id, token, status_, created_at = job_manager.create_job(
         req,
         refs,
@@ -1146,7 +1376,18 @@ async def get_job_image(
     if not validate_image_id(image_id):
         raise api_error(ErrorCode.IMAGE_NOT_FOUND, "Image not found", http_status=404)
 
+    image_access_gate = _image_access_verification_required(current_user)
+    if image_access_gate is not None:
+        raise api_error(
+            ErrorCode.TURNSTILE_REQUIRED,
+            "Extra Turnstile verification is required before viewing images",
+            http_status=403,
+            details=image_access_gate,
+        )
+
     image_bytes, mime = job_manager.get_image(job_id, x_job_token, image_id, current_user)
+    if str(current_user.get("role") or "").upper() != "ADMIN":
+        user_store.record_image_access(str(current_user["user_id"]), 1)
     return Response(content=image_bytes, media_type=mime)
 
 
@@ -1242,6 +1483,7 @@ def _admin_overview_payload() -> dict[str, Any]:
     now = now_local()
     metas = storage.iter_job_meta()
     users = user_store.list_users()
+    usage_by_user = user_store.get_daily_usage_for_all()
     today = now.date()
     queued_jobs = 0
     running_jobs = 0
@@ -1249,6 +1491,7 @@ def _admin_overview_payload() -> dict[str, Any]:
     succeeded_today = 0
     failed_today = 0
     images_generated_today = 0
+    image_accesses_today = 0
 
     for meta in metas:
         status_value = str(meta.get("status") or "")
@@ -1270,6 +1513,7 @@ def _admin_overview_payload() -> dict[str, Any]:
             failed_today += 1
 
     enabled_users = sum(1 for user in users if user.get("enabled"))
+    image_accesses_today = sum(int(stats.get("image_accesses", 0)) for stats in usage_by_user.values())
     return {
         "system": {
             "app_version": settings.app_version,
@@ -1287,6 +1531,7 @@ def _admin_overview_payload() -> dict[str, Any]:
             "succeeded_today": succeeded_today,
             "failed_today": failed_today,
             "images_generated_today": images_generated_today,
+            "image_accesses_today": image_accesses_today,
         },
         "policy": user_store.get_policy(),
         "billing": _billing_summary_payload(),

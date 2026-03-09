@@ -294,6 +294,9 @@ class UserPolicyOverrideInput(BaseModel):
     concurrent_jobs_limit: int | None = Field(default=None, ge=0)
     turnstile_job_count_threshold: int | None = Field(default=None, ge=0)
     turnstile_daily_usage_threshold: int | None = Field(default=None, ge=0)
+    daily_image_access_limit: int | None = Field(default=None, ge=0)
+    image_access_turnstile_bonus_quota: int | None = Field(default=None, ge=0)
+    daily_image_access_hard_limit: int | None = Field(default=None, ge=0)
 
 
 class CreateUserRequest(BaseModel):
@@ -318,7 +321,11 @@ class UpdateUserRequest(BaseModel):
 
 class UpdateSystemPolicyRequest(BaseModel):
     default_user_daily_image_limit: int | None = Field(default=None, ge=0)
+    default_user_extra_daily_image_limit: int | None = Field(default=None, ge=0)
     default_user_concurrent_jobs_limit: int | None = Field(default=None, ge=0)
     default_admin_concurrent_jobs_limit: int | None = Field(default=None, ge=0)
     default_user_turnstile_job_count_threshold: int | None = Field(default=None, ge=0)
     default_user_turnstile_daily_usage_threshold: int | None = Field(default=None, ge=0)
+    default_user_daily_image_access_limit: int | None = Field(default=None, ge=0)
+    default_user_image_access_turnstile_bonus_quota: int | None = Field(default=None, ge=0)
+    default_user_daily_image_access_hard_limit: int | None = Field(default=None, ge=0)

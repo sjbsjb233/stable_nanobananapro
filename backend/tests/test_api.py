@@ -11,6 +11,7 @@ from fastapi.testclient import TestClient
 from app.config import settings
 from app.gemini_client import GeminiError
 from app.main import app
+from app.rate_limiter import InMemoryRateLimiter
 from app.storage import storage
 from app.user_store import user_store
 
@@ -69,6 +70,13 @@ def test_auth_required_and_login(client: TestClient) -> None:
     me = client.get("/v1/auth/me")
     assert me.status_code == 200
     assert me.json()["authenticated"] is True
+
+
+def test_invalid_session_cookie_does_not_crash(client: TestClient) -> None:
+    client.cookies.set("nbp_session", "definitely-not-a-valid-session-cookie")
+    me = client.get("/v1/auth/me")
+    assert me.status_code == 401
+    assert me.json()["error"]["code"] == "AUTH_REQUIRED"
 
 
 def test_job_lifecycle(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -265,6 +273,9 @@ def test_admin_user_management_and_turnstile_gate(client: TestClient, monkeypatc
                 "concurrent_jobs_limit": 2,
                 "turnstile_job_count_threshold": 1,
                 "turnstile_daily_usage_threshold": 999,
+                "daily_image_access_limit": 12,
+                "image_access_turnstile_bonus_quota": 4,
+                "daily_image_access_hard_limit": 20,
             },
         },
     )
@@ -283,10 +294,20 @@ def test_admin_user_management_and_turnstile_gate(client: TestClient, monkeypatc
 
     updated_policy = client.patch(
         "/v1/admin/policy",
-        json={"default_user_daily_image_limit": 88},
+        json={
+            "default_user_daily_image_limit": 88,
+            "default_user_extra_daily_image_limit": 7,
+            "default_user_daily_image_access_limit": 123,
+            "default_user_image_access_turnstile_bonus_quota": 9,
+            "default_user_daily_image_access_hard_limit": 150,
+        },
     )
     assert updated_policy.status_code == 200
     assert updated_policy.json()["policy"]["default_user_daily_image_limit"] == 88
+    assert updated_policy.json()["policy"]["default_user_extra_daily_image_limit"] == 7
+    assert updated_policy.json()["policy"]["default_user_daily_image_access_limit"] == 123
+    assert updated_policy.json()["policy"]["default_user_image_access_turnstile_bonus_quota"] == 9
+    assert updated_policy.json()["policy"]["default_user_daily_image_access_hard_limit"] == 150
 
     client.post("/v1/auth/logout")
     login(client, username="alice", password="alicepass123")
@@ -469,6 +490,12 @@ def test_created_jobs_consume_quota_and_trigger_daily_turnstile(client: TestClie
     monkeypatch.setattr("app.gemini_client.gemini_client.generate_image", failing_generate_image)
     login(client)
 
+    policy_reset = client.patch(
+        "/v1/admin/policy",
+        json={"default_user_extra_daily_image_limit": 0},
+    )
+    assert policy_reset.status_code == 200
+
     created = client.post(
         "/v1/admin/users",
         json={
@@ -565,3 +592,299 @@ def test_created_jobs_consume_quota_and_trigger_daily_turnstile(client: TestClie
     )
     assert third.status_code == 429
     assert third.json()["error"]["code"] == "QUOTA_EXCEEDED"
+
+
+def test_overquota_batch_creates_single_real_job_and_failed_placeholders(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_generate_image(prompt, model, mode, params, reference_images):
+        return {
+            "raw": {"candidates": []},
+            "images": [{"mime": "image/png", "bytes": PNG_1X1}],
+            "usage_metadata": {"totalTokenCount": 10},
+            "finish_reason": "STOP",
+            "safety_ratings": [],
+            "latency_ms": 50,
+        }
+
+    monkeypatch.setattr("app.gemini_client.gemini_client.generate_image", fake_generate_image)
+    monkeypatch.setattr("app.main.random.random", lambda: 0.0)
+    login(client)
+
+    updated_policy = client.patch(
+        "/v1/admin/policy",
+        json={
+            "default_user_daily_image_limit": 1,
+            "default_user_extra_daily_image_limit": 2,
+            "default_user_turnstile_job_count_threshold": 99,
+            "default_user_turnstile_daily_usage_threshold": 99,
+        },
+    )
+    assert updated_policy.status_code == 200
+
+    created = client.post(
+        "/v1/admin/users",
+        json={
+            "username": "overflow",
+            "password": "overflow123",
+            "role": "USER",
+            "enabled": True,
+        },
+    )
+    assert created.status_code == 201
+
+    client.post("/v1/auth/logout")
+    login(client, username="overflow", password="overflow123")
+
+    first_normal = client.post(
+        "/v1/jobs",
+        json={
+            "prompt": "normal",
+            "params": {
+                "aspect_ratio": "1:1",
+                "image_size": "1K",
+                "temperature": 0.7,
+                "timeout_sec": 60,
+                "max_retries": 0,
+            },
+            "mode": "IMAGE_ONLY",
+        },
+    )
+    assert first_normal.status_code == 201
+
+    overflow_needs_turnstile = client.post(
+        "/v1/jobs",
+        headers={"X-Requested-Job-Count": "2"},
+        json={
+            "prompt": "overflow batch",
+            "params": {
+                "aspect_ratio": "1:1",
+                "image_size": "1K",
+                "temperature": 0.7,
+                "timeout_sec": 60,
+                "max_retries": 0,
+            },
+            "mode": "IMAGE_ONLY",
+        },
+    )
+    assert overflow_needs_turnstile.status_code == 403
+    assert overflow_needs_turnstile.json()["error"]["code"] == "TURNSTILE_REQUIRED"
+
+    verified = client.post(
+        "/v1/auth/turnstile/generation",
+        json={"turnstile_token": "turnstile-ok", "requested_job_count": 2},
+    )
+    assert verified.status_code == 200
+
+    overflow_first = client.post(
+        "/v1/jobs",
+        headers={"X-Requested-Job-Count": "2"},
+        json={
+            "prompt": "overflow batch",
+            "params": {
+                "aspect_ratio": "1:1",
+                "image_size": "1K",
+                "temperature": 0.7,
+                "timeout_sec": 60,
+                "max_retries": 0,
+            },
+            "mode": "IMAGE_ONLY",
+        },
+    )
+    assert overflow_first.status_code == 201
+    assert overflow_first.json()["status"] == "QUEUED"
+
+    overflow_second = client.post(
+        "/v1/jobs",
+        headers={"X-Requested-Job-Count": "2"},
+        json={
+            "prompt": "overflow batch",
+            "params": {
+                "aspect_ratio": "1:1",
+                "image_size": "1K",
+                "temperature": 0.7,
+                "timeout_sec": 60,
+                "max_retries": 0,
+            },
+            "mode": "IMAGE_ONLY",
+        },
+    )
+    assert overflow_second.status_code == 201
+    assert overflow_second.json()["status"] == "FAILED"
+
+    me = client.get("/v1/auth/me")
+    assert me.status_code == 200
+    assert me.json()["usage"]["quota_consumed_today"] == 3
+    assert me.json()["usage"]["remaining_images_today"] == 0
+
+    blocked = client.post(
+        "/v1/jobs",
+        json={
+            "prompt": "blocked",
+            "params": {
+                "aspect_ratio": "1:1",
+                "image_size": "1K",
+                "temperature": 0.7,
+                "timeout_sec": 60,
+                "max_retries": 0,
+            },
+            "mode": "IMAGE_ONLY",
+        },
+    )
+    assert blocked.status_code == 429
+    assert blocked.json()["error"]["code"] == "QUOTA_EXCEEDED"
+
+
+def test_image_access_turnstile_and_hard_limit(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    def fake_generate_image(prompt, model, mode, params, reference_images):
+        return {
+            "raw": {"candidates": []},
+            "images": [{"mime": "image/png", "bytes": PNG_1X1}],
+            "usage_metadata": {"totalTokenCount": 10},
+            "finish_reason": "STOP",
+            "safety_ratings": [],
+            "latency_ms": 50,
+        }
+
+    monkeypatch.setattr("app.gemini_client.gemini_client.generate_image", fake_generate_image)
+    login(client)
+
+    created = client.post(
+        "/v1/admin/users",
+        json={
+            "username": "viewer",
+            "password": "viewerpass123",
+            "role": "USER",
+            "enabled": True,
+            "policy_overrides": {
+                "daily_image_limit": 10,
+                "concurrent_jobs_limit": 2,
+                "turnstile_job_count_threshold": 99,
+                "turnstile_daily_usage_threshold": 999,
+                "daily_image_access_limit": 1,
+                "image_access_turnstile_bonus_quota": 1,
+                "daily_image_access_hard_limit": 3,
+            },
+        },
+    )
+    assert created.status_code == 201
+    viewer = created.json()
+
+    client.post("/v1/auth/logout")
+    login(client, username="viewer", password="viewerpass123")
+
+    created_job = client.post(
+        "/v1/jobs",
+        json={
+            "prompt": "viewer prompt",
+            "params": {
+                "aspect_ratio": "1:1",
+                "image_size": "1K",
+                "temperature": 0.7,
+                "timeout_sec": 60,
+                "max_retries": 1,
+            },
+            "mode": "IMAGE_ONLY",
+        },
+    )
+    assert created_job.status_code == 201
+    body = created_job.json()
+    job_id = body["job_id"]
+    job_token = body["job_access_token"]
+
+    meta = None
+    for _ in range(30):
+        rr = client.get(f"/v1/jobs/{job_id}", headers={"X-Job-Token": job_token})
+        assert rr.status_code == 200
+        meta = rr.json()
+        if meta["status"] == "SUCCEEDED":
+            break
+        time.sleep(0.1)
+    assert meta is not None
+    assert meta["status"] == "SUCCEEDED"
+
+    first = client.get(f"/v1/jobs/{job_id}/images/image_0", headers={"X-Job-Token": job_token})
+    assert first.status_code == 200
+
+    second_needs_turnstile = client.get(f"/v1/jobs/{job_id}/images/image_0", headers={"X-Job-Token": job_token})
+    assert second_needs_turnstile.status_code == 403
+    assert second_needs_turnstile.json()["error"]["code"] == "TURNSTILE_REQUIRED"
+    assert second_needs_turnstile.json()["error"]["details"]["turnstile_scope"] == "image_access"
+
+    verified_1 = client.post(
+        "/v1/auth/turnstile/image-access",
+        json={"turnstile_token": "turnstile-ok"},
+    )
+    assert verified_1.status_code == 200
+    assert verified_1.json()["verified"] is True
+
+    second = client.get(f"/v1/jobs/{job_id}/images/image_0", headers={"X-Job-Token": job_token})
+    assert second.status_code == 200
+
+    third_needs_turnstile = client.get(f"/v1/jobs/{job_id}/images/image_0", headers={"X-Job-Token": job_token})
+    assert third_needs_turnstile.status_code == 403
+    assert third_needs_turnstile.json()["error"]["code"] == "TURNSTILE_REQUIRED"
+
+    verified_2 = client.post(
+        "/v1/auth/turnstile/image-access",
+        json={"turnstile_token": "turnstile-ok"},
+    )
+    assert verified_2.status_code == 200
+
+    third = client.get(f"/v1/jobs/{job_id}/images/image_0", headers={"X-Job-Token": job_token})
+    assert third.status_code == 200
+
+    hard_blocked = client.get(f"/v1/jobs/{job_id}/images/image_0", headers={"X-Job-Token": job_token})
+    assert hard_blocked.status_code == 429
+    assert hard_blocked.json()["error"]["code"] == "QUOTA_EXCEEDED"
+
+    client.post("/v1/auth/logout")
+    login(client)
+    reset = client.post(f"/v1/admin/users/{viewer['user_id']}/reset-quota")
+    assert reset.status_code == 200
+    assert reset.json()["usage"]["image_accesses_today"] == 0
+    assert reset.json()["usage"]["image_access_bonus_quota_today"] == 0
+
+
+def test_job_read_rate_limit_is_scoped_by_user_id(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("app.rate_limiter.limiter", InMemoryRateLimiter(1))
+    login(client)
+
+    created_user_1 = client.post(
+        "/v1/admin/users",
+        json={
+            "username": "reader1",
+            "password": "reader1pass",
+            "role": "USER",
+            "enabled": True,
+        },
+    )
+    assert created_user_1.status_code == 201
+
+    created_user_2 = client.post(
+        "/v1/admin/users",
+        json={
+            "username": "reader2",
+            "password": "reader2pass",
+            "role": "USER",
+            "enabled": True,
+        },
+    )
+    assert created_user_2.status_code == 201
+
+    client.post("/v1/auth/logout")
+    login(client, username="reader1", password="reader1pass")
+
+    first = client.post("/v1/jobs/batch-meta", json={"jobs": []})
+    assert first.status_code == 200
+
+    second = client.post("/v1/jobs/batch-meta", json={"jobs": []})
+    assert second.status_code == 429
+    assert second.json()["error"]["code"] == "RATE_LIMITED"
+
+    client.post("/v1/auth/logout")
+    login(client, username="reader2", password="reader2pass")
+
+    third = client.post("/v1/jobs/batch-meta", json={"jobs": []})
+    assert third.status_code == 200

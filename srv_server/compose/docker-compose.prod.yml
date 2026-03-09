@@ -16,6 +16,8 @@ services:
   frontend:
     container_name: ${APP_NAME}-frontend
     image: ${REGISTRY}/${NAMESPACE}/${APP_NAME}-frontend:${FRONTEND_TAG}
+    environment:
+      FRONTEND_DEFAULT_API_BASE_URL: ${FRONTEND_DEFAULT_API_BASE_URL:-http://127.0.0.1:${BACKEND_PORT}}
     ports:
       - "${FRONTEND_PORT}:80"
     depends_on:

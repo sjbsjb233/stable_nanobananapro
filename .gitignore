@@ -15,3 +15,5 @@ srv/stable/compose/.env
 srv/stable/config/backend.prod.env
 srv/stable/data
 srv_server/config/backend.env.example
+.playwright-cli/
+data/logs/

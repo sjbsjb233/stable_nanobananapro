@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import React, { createContext, useContext, useEffect, useMemo, useRef, useState } from "react";
 import {
   BrowserRouter,
   Navigate,
@@ -317,6 +317,9 @@ type UserPolicy = {
   concurrent_jobs_limit: number;
   turnstile_job_count_threshold?: number | null;
   turnstile_daily_usage_threshold?: number | null;
+  daily_image_access_limit?: number | null;
+  image_access_turnstile_bonus_quota?: number | null;
+  daily_image_access_hard_limit?: number | null;
 };
 
 type SessionUsage = {
@@ -331,6 +334,8 @@ type SessionUsage = {
   running_jobs?: number;
   queued_jobs?: number;
   remaining_images_today?: number | null;
+  image_accesses_today?: number;
+  image_access_bonus_quota_today?: number;
 };
 
 type SessionUser = {
@@ -353,10 +358,14 @@ type AuthSession = {
 
 type SystemPolicy = {
   default_user_daily_image_limit: number;
+  default_user_extra_daily_image_limit: number;
   default_user_concurrent_jobs_limit: number;
   default_admin_concurrent_jobs_limit: number;
   default_user_turnstile_job_count_threshold: number;
   default_user_turnstile_daily_usage_threshold: number;
+  default_user_daily_image_access_limit: number;
+  default_user_image_access_turnstile_bonus_quota: number;
+  default_user_daily_image_access_hard_limit: number;
 };
 
 type AdminSystemOverview = {
@@ -375,6 +384,7 @@ type AdminSystemOverview = {
   succeeded_today: number;
   failed_today: number;
   images_generated_today: number;
+  image_accesses_today: number;
 };
 
 type AdminOverviewResponse = {
@@ -395,6 +405,18 @@ type AdminUserItem = {
   usage: SessionUsage;
   total_jobs: number;
 };
+
+declare global {
+  interface Window {
+    __NBP_RUNTIME_CONFIG__?: {
+      apiBaseUrl?: string;
+    };
+    turnstile?: {
+      render: (container: HTMLElement, options: Record<string, any>) => string | number;
+      remove?: (widgetId: string | number) => void;
+    };
+  }
+}
 
 // -----------------------------
 // Storage keys
@@ -734,6 +756,8 @@ function useDebounced<T>(value: T, ms: number) {
 // -----------------------------
 
 const ENV_BASE_URL = (import.meta.env.VITE_API_BASE_URL || "").trim();
+const RUNTIME_BASE_URL =
+  typeof window !== "undefined" ? (window.__NBP_RUNTIME_CONFIG__?.apiBaseUrl || "").trim() : "";
 const TURNSTILE_SITE_KEY = (import.meta.env.VITE_TURNSTILE_SITE_KEY || "0x4AAAAAACoBxRJwxj2oUZDc").trim();
 const FALLBACK_BASE_URL =
   typeof window !== "undefined"
@@ -750,7 +774,7 @@ const DEFAULT_PARAMS_TEMPLATE: DefaultParams = {
 };
 
 const DEFAULT_SETTINGS: SettingsV1 = {
-  baseUrl: ENV_BASE_URL || FALLBACK_BASE_URL,
+  baseUrl: RUNTIME_BASE_URL || ENV_BASE_URL || FALLBACK_BASE_URL,
   defaultModel: "gemini-3-pro-image-preview",
   jobAuthMode: "TOKEN",
   adminModeEnabled: false,
@@ -1488,6 +1512,17 @@ class ApiClient {
     });
   }
 
+  verifyImageAccessTurnstile(turnstileToken: string, signal?: AbortSignal) {
+    return this.request<{ verified: boolean; scope: string }>("/auth/turnstile/image-access", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        turnstile_token: turnstileToken,
+      }),
+      signal,
+    });
+  }
+
   listModels(signal?: AbortSignal) {
     return this.request<ModelsPayload>("/models", { method: "GET", signal });
   }
@@ -1589,11 +1624,18 @@ class ApiClient {
     if (this.jobAuthMode === "TOKEN" && jobToken) headers["X-Job-Token"] = jobToken;
     return fetch(url, { method: "GET", headers, signal, credentials: "include" }).then(async (r) => {
       if (!r.ok) {
+        const contentType = r.headers.get("content-type") || "";
         logWarn("api", "image download failed", {
           path: `/jobs/${job_id}/images/${image_id}`,
           status: r.status,
         });
-        const err: ApiError = { error: { code: String(r.status), message: r.statusText || "Image download failed" } };
+        let err: ApiError = { error: { code: String(r.status), message: r.statusText || "Image download failed" } };
+        if (contentType.includes("application/json")) {
+          const payload = (await r.json().catch(() => null)) as ApiError | null;
+          if (payload?.error?.code || payload?.error?.message) {
+            err = payload;
+          }
+        }
         throw err;
       }
       logDebug("api", "image downloaded", {
@@ -2026,7 +2068,7 @@ function TopNav() {
   const client = useApiClient();
   const clearSession = useAuthStore((s) => s.clearSession);
   const { push } = useToast();
-  const { user, usage, isAdmin } = useAuthSession();
+  const { user, isAdmin } = useAuthSession();
 
   if (!user) return null;
 
@@ -2037,12 +2079,6 @@ function TopNav() {
     push({ kind: "info", title: "已退出登录" });
     navigate("/login");
   };
-
-  const quotaLabel =
-    isAdmin
-      ? "无限额"
-      : `${usage?.remaining_images_today ?? 0} 次剩余额度`;
-  const concurrencyLabel = `${usage?.running_jobs ?? 0}/${user.policy.concurrent_jobs_limit} running`;
 
   return (
     <div className="sticky top-0 z-40 border-b border-zinc-200/80 bg-white/70 backdrop-blur dark:border-white/10 dark:bg-zinc-950/60">
@@ -2061,12 +2097,6 @@ function TopNav() {
               </span>
               <span className="mx-2 text-zinc-300 dark:text-white/20">•</span>
               <span className="text-xs font-semibold">{user.username}</span>
-              <span className="mx-2 text-zinc-300 dark:text-white/20">•</span>
-              <span className="text-xs">{user.role}</span>
-              <span className="mx-2 text-zinc-300 dark:text-white/20">•</span>
-              <span className="text-xs">{quotaLabel}</span>
-              <span className="mx-2 text-zinc-300 dark:text-white/20">•</span>
-              <span className="text-xs">{concurrencyLabel}</span>
             </div>
           </div>
         </div>
@@ -2265,6 +2295,7 @@ function TurnstilePromptModal({
   loading,
   onClose,
   onConfirm,
+  confirmLabel = "继续",
 }: {
   open: boolean;
   title: string;
@@ -2275,6 +2306,7 @@ function TurnstilePromptModal({
   loading: boolean;
   onClose: () => void;
   onConfirm: () => void;
+  confirmLabel?: string;
 }) {
   if (!open) return null;
   return (
@@ -2288,12 +2320,113 @@ function TurnstilePromptModal({
         <div className="mt-5 flex items-center justify-end gap-2">
           <Button variant="ghost" onClick={onClose} disabled={loading}>取消</Button>
           <Button variant="primary" onClick={onConfirm} disabled={!token || loading}>
-            {loading ? "验证中…" : "继续生成"}
+            {loading ? "验证中…" : confirmLabel}
           </Button>
         </div>
       </Card>
     </div>
   );
+}
+
+type ImageAccessGuardContextValue = {
+  runWithImageAccessTurnstile: <T>(runner: () => Promise<T>) => Promise<T>;
+};
+
+const ImageAccessGuardContext = createContext<ImageAccessGuardContextValue | null>(null);
+
+function ImageAccessGuardProvider({ children }: { children: React.ReactNode }) {
+  const client = useApiClient();
+  const { push } = useToast();
+  const [open, setOpen] = useState(false);
+  const [token, setToken] = useState<string | null>(null);
+  const [tokenKey, setTokenKey] = useState(0);
+  const [verifying, setVerifying] = useState(false);
+  const pendingRef = useRef<{ resolve: () => void; reject: (error: any) => void } | null>(null);
+  const verificationPromiseRef = useRef<Promise<void> | null>(null);
+
+  const beginVerification = () => {
+    if (verificationPromiseRef.current) {
+      return verificationPromiseRef.current;
+    }
+    const promise = new Promise<void>((resolve, reject) => {
+      pendingRef.current = { resolve, reject };
+      setToken(null);
+      setTokenKey((v) => v + 1);
+      setOpen(true);
+    });
+    verificationPromiseRef.current = promise.finally(() => {
+      verificationPromiseRef.current = null;
+      pendingRef.current = null;
+    });
+    return verificationPromiseRef.current;
+  };
+
+  const runWithImageAccessTurnstile = async <T,>(runner: () => Promise<T>) => {
+    try {
+      return await runner();
+    } catch (e: any) {
+      if (e?.error?.code !== "TURNSTILE_REQUIRED" || e?.error?.details?.turnstile_scope !== "image_access") {
+        throw e;
+      }
+    }
+
+    await beginVerification();
+    return await runner();
+  };
+
+  const closeModal = (error?: any) => {
+    setOpen(false);
+    setToken(null);
+    if (error) {
+      pendingRef.current?.reject(error);
+      return;
+    }
+    pendingRef.current?.resolve();
+  };
+
+  const confirm = async () => {
+    if (!token) return;
+    setVerifying(true);
+    try {
+      await client.verifyImageAccessTurnstile(token);
+      closeModal();
+    } catch (e: any) {
+      setToken(null);
+      setTokenKey((v) => v + 1);
+      push({ kind: "error", title: "校验失败", message: e?.error?.message || "请重试" });
+    } finally {
+      setVerifying(false);
+    }
+  };
+
+  return (
+    <ImageAccessGuardContext.Provider value={{ runWithImageAccessTurnstile }}>
+      {children}
+      <TurnstilePromptModal
+        open={open}
+        title="继续查看前需要验证"
+        description="请先完成一次 Cloudflare Turnstile 验证，然后继续当前的图片查看或下载操作。"
+        token={token}
+        tokenKey={tokenKey}
+        setToken={setToken}
+        loading={verifying}
+        confirmLabel="继续查看"
+        onClose={() => {
+          if (verifying) return;
+          closeModal({ error: { code: "TURNSTILE_CANCELLED", message: "Verification cancelled" } });
+        }}
+        onConfirm={confirm}
+      />
+    </ImageAccessGuardContext.Provider>
+  );
+}
+
+function useImageAccessGuard() {
+  const value = useContext(ImageAccessGuardContext);
+  if (!value) {
+    throw new Error("ImageAccessGuardProvider is required");
+  }
+  return value;
 }
 
 function LoginPage() {
@@ -2347,14 +2480,14 @@ function LoginPage() {
               Nano Banana Pro
             </div>
             <div className="mt-4 text-base leading-7 text-zinc-600 dark:text-zinc-300">
-              登录后才能访问除健康检查外的所有接口。管理员可以进入 Admin 页面查看系统状态、用户使用情况、管理账号与配额策略。
+              一个围绕文生图工作流打造的控制台，支持稳定创建、任务追踪、结果回看与浏览器端协作体验。
             </div>
           </div>
 
           <div className="mt-8 grid grid-cols-1 gap-3 sm:grid-cols-3">
             <Card className="border-amber-200/70 bg-amber-50/80 dark:border-amber-900/60 dark:bg-amber-950/30" hover={false}>
-              <div className="text-xs font-semibold uppercase tracking-[0.18em] text-amber-700 dark:text-amber-200">Role Split</div>
-              <div className="mt-2 text-sm text-zinc-700 dark:text-zinc-200">管理员无限额，普通用户按日配额与并发限制执行。</div>
+              <div className="text-xs font-semibold uppercase tracking-[0.18em] text-amber-700 dark:text-amber-200">Studio</div>
+              <div className="mt-2 text-sm text-zinc-700 dark:text-zinc-200">统一入口管理创作、任务流、结果挑选和历史记录。</div>
             </Card>
             <Card className="border-sky-200/70 bg-sky-50/80 dark:border-sky-900/60 dark:bg-sky-950/30" hover={false}>
               <div className="text-xs font-semibold uppercase tracking-[0.18em] text-sky-700 dark:text-sky-200">Turnstile</div>
@@ -2374,7 +2507,7 @@ function LoginPage() {
 
           <div className="mt-6 space-y-4">
             <Field label="username">
-              <Input value={username} onChange={setUsername} placeholder="admin" />
+              <Input value={username} onChange={setUsername} placeholder="请输入账号" />
             </Field>
             <Field label="password">
               <Input value={password} onChange={setPassword} placeholder="请输入密码" type="password" />
@@ -2758,6 +2891,7 @@ function KpiCard({
 function DashboardPage() {
   const { loading, refreshing, stats, admin, refresh } = useDashboardData();
   const nav = useNavigate();
+  const { isAdmin } = useAuthSession();
 
   const cards = (
     <div className="grid grid-cols-2 gap-3 md:grid-cols-3 xl:grid-cols-6">
@@ -2916,31 +3050,33 @@ function DashboardPage() {
           </div>
         </Card>
 
-        <Card>
-          <div>
-            <div className="text-sm font-bold text-zinc-900 dark:text-zinc-50">管理员区块</div>
-            <div className="text-xs text-zinc-600 dark:text-zinc-300">仅管理员登录态可见，完整管理功能在 Admin 页面。</div>
-          </div>
-          <Divider />
-          {!admin ? (
-            <EmptyHint text="未开启或无权限" />
-          ) : (
-            <div className="space-y-3">
-              <KeyValue k="Budget" v={currency(admin.summary?.budget_usd)} />
-              <KeyValue k="Spent" v={currency(admin.summary?.spent_usd)} />
-              <KeyValue k="Remaining" v={currency(admin.summary?.remaining_usd)} />
-              <div className="text-xs text-zinc-500 dark:text-zinc-400">
-                {admin.summary?.mode ? `Mode: ${admin.summary.mode}` : ""}
-                {admin.summary?.last_updated_at ? ` · ${formatLocal(admin.summary.last_updated_at)}` : ""}
-              </div>
-              <Divider />
-              <KeyValue k="Google Remaining" v={currency(admin.google?.google_remaining_usd)} />
-              {admin.google?.notes ? (
-                <div className="text-xs text-zinc-600 dark:text-zinc-300">{admin.google.notes}</div>
-              ) : null}
+        {isAdmin ? (
+          <Card>
+            <div>
+              <div className="text-sm font-bold text-zinc-900 dark:text-zinc-50">管理视图</div>
+              <div className="text-xs text-zinc-600 dark:text-zinc-300">系统账单和运行状态摘要。</div>
             </div>
-          )}
-        </Card>
+            <Divider />
+            {!admin ? (
+              <EmptyHint text="管理数据暂不可用" />
+            ) : (
+              <div className="space-y-3">
+                <KeyValue k="Budget" v={currency(admin.summary?.budget_usd)} />
+                <KeyValue k="Spent" v={currency(admin.summary?.spent_usd)} />
+                <KeyValue k="Remaining" v={currency(admin.summary?.remaining_usd)} />
+                <div className="text-xs text-zinc-500 dark:text-zinc-400">
+                  {admin.summary?.mode ? `Mode: ${admin.summary.mode}` : ""}
+                  {admin.summary?.last_updated_at ? ` · ${formatLocal(admin.summary.last_updated_at)}` : ""}
+                </div>
+                <Divider />
+                <KeyValue k="Google Remaining" v={currency(admin.google?.google_remaining_usd)} />
+                {admin.google?.notes ? (
+                  <div className="text-xs text-zinc-600 dark:text-zinc-300">{admin.google.notes}</div>
+                ) : null}
+              </div>
+            )}
+          </Card>
+        ) : null}
       </div>
     </PageContainer>
   );
@@ -3275,6 +3411,9 @@ function AdminPage() {
   const [editConcurrentLimit, setEditConcurrentLimit] = useState("");
   const [editTurnstileJobCount, setEditTurnstileJobCount] = useState("");
   const [editTurnstileDailyUsage, setEditTurnstileDailyUsage] = useState("");
+  const [editImageAccessLimit, setEditImageAccessLimit] = useState("");
+  const [editImageAccessBonusQuota, setEditImageAccessBonusQuota] = useState("");
+  const [editImageAccessHardLimit, setEditImageAccessHardLimit] = useState("");
   const [savingUser, setSavingUser] = useState(false);
   const [resettingQuota, setResettingQuota] = useState(false);
 
@@ -3286,6 +3425,9 @@ function AdminPage() {
   const [newConcurrentLimit, setNewConcurrentLimit] = useState("");
   const [newTurnstileJobCount, setNewTurnstileJobCount] = useState("");
   const [newTurnstileDailyUsage, setNewTurnstileDailyUsage] = useState("");
+  const [newImageAccessLimit, setNewImageAccessLimit] = useState("");
+  const [newImageAccessBonusQuota, setNewImageAccessBonusQuota] = useState("");
+  const [newImageAccessHardLimit, setNewImageAccessHardLimit] = useState("");
   const [creatingUser, setCreatingUser] = useState(false);
 
   const parseOptionalNumber = (value: string) => {
@@ -3346,6 +3488,19 @@ function AdminPage() {
         ? ""
         : String(selectedUser.policy.turnstile_daily_usage_threshold)
     );
+    setEditImageAccessLimit(
+      selectedUser.policy.daily_image_access_limit == null ? "" : String(selectedUser.policy.daily_image_access_limit)
+    );
+    setEditImageAccessBonusQuota(
+      selectedUser.policy.image_access_turnstile_bonus_quota == null
+        ? ""
+        : String(selectedUser.policy.image_access_turnstile_bonus_quota)
+    );
+    setEditImageAccessHardLimit(
+      selectedUser.policy.daily_image_access_hard_limit == null
+        ? ""
+        : String(selectedUser.policy.daily_image_access_hard_limit)
+    );
   }, [selectedUser]);
 
   const savePolicy = async () => {
@@ -3376,6 +3531,9 @@ function AdminPage() {
           concurrent_jobs_limit: parseOptionalNumber(editConcurrentLimit),
           turnstile_job_count_threshold: parseOptionalNumber(editTurnstileJobCount),
           turnstile_daily_usage_threshold: parseOptionalNumber(editTurnstileDailyUsage),
+          daily_image_access_limit: parseOptionalNumber(editImageAccessLimit),
+          image_access_turnstile_bonus_quota: parseOptionalNumber(editImageAccessBonusQuota),
+          daily_image_access_hard_limit: parseOptionalNumber(editImageAccessHardLimit),
         },
       });
       setUsers((prev) => prev.map((item) => (item.user_id === updated.user_id ? updated : item)));
@@ -3421,6 +3579,9 @@ function AdminPage() {
           concurrent_jobs_limit: parseOptionalNumber(newConcurrentLimit),
           turnstile_job_count_threshold: parseOptionalNumber(newTurnstileJobCount),
           turnstile_daily_usage_threshold: parseOptionalNumber(newTurnstileDailyUsage),
+          daily_image_access_limit: parseOptionalNumber(newImageAccessLimit),
+          image_access_turnstile_bonus_quota: parseOptionalNumber(newImageAccessBonusQuota),
+          daily_image_access_hard_limit: parseOptionalNumber(newImageAccessHardLimit),
         },
       });
       setNewUsername("");
@@ -3431,6 +3592,9 @@ function AdminPage() {
       setNewConcurrentLimit("");
       setNewTurnstileJobCount("");
       setNewTurnstileDailyUsage("");
+      setNewImageAccessLimit("");
+      setNewImageAccessBonusQuota("");
+      setNewImageAccessHardLimit("");
       await loadAdminData({ silent: true });
       push({ kind: "success", title: "新用户已创建" });
     } catch (e: any) {
@@ -3505,6 +3669,9 @@ function AdminPage() {
               <Field label="普通用户每日额度">
                 <Input value={String(policyDraft.default_user_daily_image_limit)} onChange={(v) => setPolicyDraft({ ...policyDraft, default_user_daily_image_limit: Number(v || 0) })} />
               </Field>
+              <Field label="超额额外额度">
+                <Input value={String(policyDraft.default_user_extra_daily_image_limit)} onChange={(v) => setPolicyDraft({ ...policyDraft, default_user_extra_daily_image_limit: Number(v || 0) })} />
+              </Field>
               <Field label="普通用户并发上限">
                 <Input value={String(policyDraft.default_user_concurrent_jobs_limit)} onChange={(v) => setPolicyDraft({ ...policyDraft, default_user_concurrent_jobs_limit: Number(v || 0) })} />
               </Field>
@@ -3516,6 +3683,15 @@ function AdminPage() {
               </Field>
               <Field label="日生成量触发阈值">
                 <Input value={String(policyDraft.default_user_turnstile_daily_usage_threshold)} onChange={(v) => setPolicyDraft({ ...policyDraft, default_user_turnstile_daily_usage_threshold: Number(v || 0) })} />
+              </Field>
+              <Field label="图片访问基础额度">
+                <Input value={String(policyDraft.default_user_daily_image_access_limit)} onChange={(v) => setPolicyDraft({ ...policyDraft, default_user_daily_image_access_limit: Number(v || 0) })} />
+              </Field>
+              <Field label="图片访问验证加额">
+                <Input value={String(policyDraft.default_user_image_access_turnstile_bonus_quota)} onChange={(v) => setPolicyDraft({ ...policyDraft, default_user_image_access_turnstile_bonus_quota: Number(v || 0) })} />
+              </Field>
+              <Field label="图片访问硬上限">
+                <Input value={String(policyDraft.default_user_daily_image_access_hard_limit)} onChange={(v) => setPolicyDraft({ ...policyDraft, default_user_daily_image_access_hard_limit: Number(v || 0) })} />
               </Field>
             </div>
           ) : (
@@ -3548,7 +3724,7 @@ function AdminPage() {
                     </div>
                   </div>
                   <div className={cn("text-xs", item.user_id === selectedUserId ? "text-white/80 dark:text-zinc-700" : "text-zinc-500 dark:text-zinc-400")}>
-                    remaining {item.usage.remaining_images_today == null ? "unlimited" : item.usage.remaining_images_today}
+                    image hits {item.usage.image_accesses_today ?? 0}
                   </div>
                 </div>
               </button>
@@ -3599,6 +3775,15 @@ function AdminPage() {
                 <Field label="turnstile_daily_usage_threshold">
                   <Input value={editTurnstileDailyUsage} onChange={setEditTurnstileDailyUsage} placeholder="留空则禁用" />
                 </Field>
+                <Field label="daily_image_access_limit">
+                  <Input value={editImageAccessLimit} onChange={setEditImageAccessLimit} placeholder="留空使用默认值" />
+                </Field>
+                <Field label="image_access_turnstile_bonus_quota">
+                  <Input value={editImageAccessBonusQuota} onChange={setEditImageAccessBonusQuota} placeholder="留空使用默认值" />
+                </Field>
+                <Field label="daily_image_access_hard_limit">
+                  <Input value={editImageAccessHardLimit} onChange={setEditImageAccessHardLimit} placeholder="留空使用默认值" />
+                </Field>
               </div>
             )}
           </Card>
@@ -3635,6 +3820,15 @@ function AdminPage() {
               <Field label="turnstile_daily_usage_threshold">
                 <Input value={newTurnstileDailyUsage} onChange={setNewTurnstileDailyUsage} placeholder="留空使用默认值" />
               </Field>
+              <Field label="daily_image_access_limit">
+                <Input value={newImageAccessLimit} onChange={setNewImageAccessLimit} placeholder="留空使用默认值" />
+              </Field>
+              <Field label="image_access_turnstile_bonus_quota">
+                <Input value={newImageAccessBonusQuota} onChange={setNewImageAccessBonusQuota} placeholder="留空使用默认值" />
+              </Field>
+              <Field label="daily_image_access_hard_limit">
+                <Input value={newImageAccessHardLimit} onChange={setNewImageAccessHardLimit} placeholder="留空使用默认值" />
+              </Field>
             </div>
           </Card>
         </div>
@@ -3649,7 +3843,7 @@ function CreateJobPage() {
   const catalog = useModelCatalog();
   const { push } = useToast();
   const navigate = useNavigate();
-  const { session, user, usage, isAdmin } = useAuthSession();
+  const { session, user, isAdmin } = useAuthSession();
   const setSession = useAuthStore((s) => s.setSession);
   const settings = useSettingsStore((s) => s.settings);
   const setSettings = useSettingsStore((s) => s.setSettings);
@@ -3862,7 +4056,7 @@ function CreateJobPage() {
     return nextSession;
   };
 
-  const executeCreate = async (targetCountOverride?: number) => {
+  const executeCreate = async (targetCountOverride?: number, allowTurnstileRecovery = true) => {
     const err = validate();
     if (err) {
       push({ kind: "error", title: "表单校验失败", message: err });
@@ -3930,7 +4124,7 @@ function CreateJobPage() {
           job_access_token,
           model_cache: model,
           created_at: resp?.created_at || isoNow(),
-          status_cache: "QUEUED",
+          status_cache: (resp?.status as JobStatus) || "QUEUED",
           prompt_preview: toPreview(prompt),
           params_cache: {
             aspect_ratio: params.aspect_ratio,
@@ -3970,6 +4164,14 @@ function CreateJobPage() {
         navigate(`/history?job=${encodeURIComponent(created[0].job_id)}`);
       }
     } catch (e: any) {
+      if (allowTurnstileRecovery && e?.error?.code === "TURNSTILE_REQUIRED") {
+        const targetCount = clamp(Math.round(targetCountOverride ?? jobCount), 1, 12);
+        setPendingGenerationTargetCount(targetCount);
+        setGenerationTurnstileToken(null);
+        setGenerationTurnstileKey((v) => v + 1);
+        setGenerationModalOpen(true);
+        return;
+      }
       push({ kind: "error", title: "创建失败", message: e?.error?.message || "请检查后端/参数" });
     } finally {
       setLoading(false);
@@ -4007,7 +4209,7 @@ function CreateJobPage() {
       setGenerationModalOpen(false);
       setGenerationTurnstileToken(null);
       setPendingGenerationTargetCount(null);
-      await executeCreate(targetCount);
+      await executeCreate(targetCount, false);
     } catch (e: any) {
       setGenerationTurnstileKey((v) => v + 1);
       setGenerationTurnstileToken(null);
@@ -4027,6 +4229,7 @@ function CreateJobPage() {
         tokenKey={generationTurnstileKey}
         setToken={setGenerationTurnstileToken}
         loading={verifyingGenerationTurnstile}
+        confirmLabel="继续生成"
         onClose={() => {
           if (verifyingGenerationTurnstile) return;
           setGenerationModalOpen(false);
@@ -4044,9 +4247,7 @@ function CreateJobPage() {
             <div className="flex items-center gap-2">
               {user ? (
                 <div className="rounded-full border border-zinc-200 bg-white/70 px-3 py-2 text-xs font-semibold text-zinc-600 dark:border-white/10 dark:bg-zinc-900/40 dark:text-zinc-300">
-                  {isAdmin
-                    ? "管理员无限额"
-                    : `今日已消耗 ${usage?.quota_consumed_today ?? 0} 次 · 剩余 ${usage?.remaining_images_today ?? 0} 次`}
+                  工作区已连接
                 </div>
               ) : null}
               <Button variant="secondary" onClick={() => {
@@ -5117,6 +5318,7 @@ function JobList({
 
 function JobDetail({ rec, onUpdateToken }: { rec: JobRecord; onUpdateToken: (tok: string) => void }) {
   const client = useApiClient();
+  const { runWithImageAccessTurnstile } = useImageAccessGuard();
   const { push } = useToast();
   const navigate = useNavigate();
   const settings = useSettingsStore((s) => s.settings);
@@ -5198,7 +5400,9 @@ function JobDetail({ rec, onUpdateToken }: { rec: JobRecord; onUpdateToken: (tok
 
   const downloadImage = async (image_id: string) => {
     try {
-      const blob = await client.getImageBlob(rec.job_id, image_id, rec.job_access_token);
+      const blob = await runWithImageAccessTurnstile(() =>
+        client.getImageBlob(rec.job_id, image_id, rec.job_access_token)
+      );
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = url;
@@ -5214,7 +5418,9 @@ function JobDetail({ rec, onUpdateToken }: { rec: JobRecord; onUpdateToken: (tok
   const ensureThumb = async (image_id: string) => {
     if (imgUrls[image_id]) return;
     try {
-      const blob = await client.getImageBlob(rec.job_id, image_id, rec.job_access_token);
+      const blob = await runWithImageAccessTurnstile(() =>
+        client.getImageBlob(rec.job_id, image_id, rec.job_access_token)
+      );
       setImgBlobs((m) => ({ ...m, [image_id]: blob }));
       const url = URL.createObjectURL(blob);
       revokeRef.current.push(url);
@@ -5878,6 +6084,7 @@ function PickerPage() {
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
   const client = useApiClient();
+  const { runWithImageAccessTurnstile } = useImageAccessGuard();
   const settings = useSettingsStore((s) => s.settings);
   const jobs = useJobsStore((s) => s.jobs);
   const updateJob = useJobsStore((s) => s.updateJob);
@@ -6140,7 +6347,9 @@ function PickerPage() {
     setImageState((prev) => ({ ...prev, [key]: { ...prev[key], loading: true, error: undefined, code: undefined } }));
 
     try {
-      const blob = await client.getImageBlob(item.job_id, item.image_id, item.job_access_token, controller.signal);
+      const blob = await runWithImageAccessTurnstile(() =>
+        client.getImageBlob(item.job_id, item.image_id, item.job_access_token, controller.signal)
+      );
       if (!mountedRef.current) return;
       const url = URL.createObjectURL(blob);
       revokeRef.current.push(url);
@@ -6259,7 +6468,9 @@ function PickerPage() {
 
   const downloadOne = async (item: PickerSessionItem) => {
     try {
-      const blob = await client.getImageBlob(item.job_id, item.image_id, item.job_access_token);
+      const blob = await runWithImageAccessTurnstile(() =>
+        client.getImageBlob(item.job_id, item.image_id, item.job_access_token)
+      );
       const ext = blob.type.includes("jpeg") ? "jpg" : blob.type.includes("webp") ? "webp" : "png";
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
@@ -7080,7 +7291,7 @@ function SettingsPage() {
   const client = useApiClient();
   const catalog = useModelCatalog();
   const nav = useNavigate();
-  const { user, usage, isAdmin } = useAuthSession();
+  const { user, isAdmin } = useAuthSession();
   const settings = useSettingsStore((s) => s.settings);
   const setSettings = useSettingsStore((s) => s.setSettings);
   const resetSettings = useSettingsStore((s) => s.resetSettings);
@@ -7297,40 +7508,23 @@ function SettingsPage() {
           </div>
         </Card>
 
-        <Card className="lg:col-span-2">
-          <div className="text-sm font-bold text-zinc-900 dark:text-zinc-50">当前登录态</div>
-          {user ? (
-            <div className="mt-3 grid grid-cols-1 gap-3 md:grid-cols-2">
-              <div className="rounded-2xl border border-zinc-200 bg-white/60 p-3 dark:border-white/10 dark:bg-zinc-950/30">
-                <div className="text-xs font-semibold uppercase tracking-[0.18em] text-zinc-500 dark:text-zinc-400">Account</div>
-                <div className="mt-2 text-lg font-bold text-zinc-900 dark:text-zinc-50">{user.username}</div>
-                <div className="mt-1 text-sm text-zinc-600 dark:text-zinc-300">{user.role}</div>
-                <div className="mt-3 grid grid-cols-2 gap-2 text-xs">
-                  <KeyValue k="已消耗" v={String(usage?.quota_consumed_today ?? 0)} />
-                  <KeyValue k="剩余额度" v={user.role === "ADMIN" ? "unlimited" : String(usage?.remaining_images_today ?? 0)} />
-                  <KeyValue k="running" v={`${usage?.running_jobs ?? 0}/${user.policy.concurrent_jobs_limit}`} />
-                  <KeyValue k="queued" v={String(usage?.queued_jobs ?? 0)} />
+        {isAdmin ? (
+          <Card className="lg:col-span-2">
+            <div className="text-sm font-bold text-zinc-900 dark:text-zinc-50">控制台入口</div>
+            {user ? (
+              <div className="mt-3 flex items-center justify-between gap-3 rounded-2xl border border-zinc-200 bg-white/60 p-4 dark:border-white/10 dark:bg-zinc-950/30">
+                <div>
+                  <div className="text-xs font-semibold uppercase tracking-[0.18em] text-zinc-500 dark:text-zinc-400">Session</div>
+                  <div className="mt-2 text-lg font-bold text-zinc-900 dark:text-zinc-50">{user.username}</div>
+                  <div className="mt-1 text-sm text-zinc-600 dark:text-zinc-300">系统侧运行状态、用户和策略管理可在管理页查看。</div>
                 </div>
+                <Button variant="secondary" onClick={() => nav("/admin")}>前往 Admin 页面</Button>
               </div>
-              <div className="rounded-2xl border border-zinc-200 bg-white/60 p-3 dark:border-white/10 dark:bg-zinc-950/30">
-                <div className="text-xs font-semibold uppercase tracking-[0.18em] text-zinc-500 dark:text-zinc-400">Policy</div>
-                <div className="mt-3 grid grid-cols-2 gap-2 text-xs">
-                  <KeyValue k="daily_image_limit" v={user.policy.daily_image_limit == null ? "unlimited" : String(user.policy.daily_image_limit)} />
-                  <KeyValue k="concurrent_jobs_limit" v={String(user.policy.concurrent_jobs_limit)} />
-                  <KeyValue k="turnstile_job_count" v={user.policy.turnstile_job_count_threshold == null ? "-" : String(user.policy.turnstile_job_count_threshold)} />
-                  <KeyValue k="turnstile_daily_usage" v={user.policy.turnstile_daily_usage_threshold == null ? "-" : String(user.policy.turnstile_daily_usage_threshold)} />
-                </div>
-                {isAdmin ? (
-                  <div className="mt-4">
-                    <Button variant="secondary" onClick={() => nav("/admin")}>前往 Admin 页面</Button>
-                  </div>
-                ) : null}
-              </div>
-            </div>
-          ) : (
-            <div className="mt-3 text-sm text-zinc-600 dark:text-zinc-300">当前未登录。</div>
-          )}
-        </Card>
+            ) : (
+              <div className="mt-3 text-sm text-zinc-600 dark:text-zinc-300">当前未登录。</div>
+            )}
+          </Card>
+        ) : null}
 
         <Card>
           <div className="text-sm font-bold text-zinc-900 dark:text-zinc-50">轮询/性能</div>
@@ -7436,30 +7630,32 @@ export default function App() {
   return (
     <ToastProvider>
       <BrowserRouter>
-        <div className="min-h-screen bg-gradient-to-b from-zinc-50 to-white text-zinc-900 dark:from-zinc-950 dark:to-zinc-950 dark:text-zinc-50">
-          {loading ? (
-            <div className="flex min-h-screen items-center justify-center px-4">
-              <div className="rounded-[28px] border border-zinc-200 bg-white/80 px-8 py-10 text-center shadow-xl dark:border-white/10 dark:bg-zinc-950/70">
-                <div className="text-sm font-semibold uppercase tracking-[0.22em] text-zinc-500 dark:text-zinc-400">Session</div>
-                <div className="mt-3 text-2xl font-black text-zinc-950 dark:text-white">检查登录状态</div>
-                <div className="mt-3 flex items-center justify-center gap-2 text-sm text-zinc-600 dark:text-zinc-300">
-                  <span className="inline-block h-4 w-4 animate-spin rounded-full border-2 border-zinc-300 border-t-zinc-900 dark:border-zinc-700 dark:border-t-white" />
-                  正在同步后端 session…
+        <ImageAccessGuardProvider>
+          <div className="min-h-screen bg-gradient-to-b from-zinc-50 to-white text-zinc-900 dark:from-zinc-950 dark:to-zinc-950 dark:text-zinc-50">
+            {loading ? (
+              <div className="flex min-h-screen items-center justify-center px-4">
+                <div className="rounded-[28px] border border-zinc-200 bg-white/80 px-8 py-10 text-center shadow-xl dark:border-white/10 dark:bg-zinc-950/70">
+                  <div className="text-sm font-semibold uppercase tracking-[0.22em] text-zinc-500 dark:text-zinc-400">Session</div>
+                  <div className="mt-3 text-2xl font-black text-zinc-950 dark:text-white">检查登录状态</div>
+                  <div className="mt-3 flex items-center justify-center gap-2 text-sm text-zinc-600 dark:text-zinc-300">
+                    <span className="inline-block h-4 w-4 animate-spin rounded-full border-2 border-zinc-300 border-t-zinc-900 dark:border-zinc-700 dark:border-t-white" />
+                    正在同步后端 session…
+                  </div>
                 </div>
               </div>
-            </div>
-          ) : session ? (
-            <>
-              <TopNav />
-              <AnimatedRoutes />
-              <Footer />
-            </>
-          ) : (
-            <Routes>
-              <Route path="*" element={<LoginPage />} />
-            </Routes>
-          )}
-        </div>
+            ) : session ? (
+              <>
+                <TopNav />
+                <AnimatedRoutes />
+                <Footer />
+              </>
+            ) : (
+              <Routes>
+                <Route path="*" element={<LoginPage />} />
+              </Routes>
+            )}
+          </div>
+        </ImageAccessGuardProvider>
       </BrowserRouter>
     </ToastProvider>
   );

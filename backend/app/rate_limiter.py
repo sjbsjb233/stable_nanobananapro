@@ -10,6 +10,7 @@ from fastapi import Request, status
 from .config import settings
 from .errors import api_error
 from .schemas import ErrorCode
+from .user_store import user_store
 
 
 class InMemoryRateLimiter:
@@ -44,7 +45,12 @@ def get_client_ip(request: Request) -> str:
 
 
 def job_read_rate_limit(request: Request) -> None:
-    key = f"{get_client_ip(request)}:job-read"
+    session = request.scope.get("session")
+    user_id = session.get("user_id") if isinstance(session, dict) else None
+    if user_id and user_store.get_user_by_id(str(user_id)):
+        key = f"user:{user_id}:job-read"
+    else:
+        key = f"ip:{get_client_ip(request)}:job-read"
     if not limiter.hit(key):
         raise api_error(
             ErrorCode.RATE_LIMITED,

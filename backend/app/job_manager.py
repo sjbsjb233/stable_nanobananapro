@@ -293,14 +293,13 @@ class JobManager:
             "reference_images": reference_paths,
         }
 
-    def create_job(
+    def _initialize_job(
         self,
         req: CreateJobRequest,
         reference_images: list[ReferenceImage],
         owner: dict[str, Any],
-        requested_job_count: int = 1,
-        idempotency_key: str | None = None,
-    ) -> tuple[str, str | None, JobStatus, datetime]:
+        requested_job_count: int,
+    ) -> tuple[str, str | None, datetime, dict[str, Any]]:
         if len(reference_images) > settings.max_reference_images:
             raise api_error(
                 ErrorCode.INVALID_INPUT,
@@ -316,14 +315,6 @@ class JobManager:
                 "params": JobParams(**normalize_params_for_model(req.model, req.params.model_dump())),
             }
         )
-
-        if idempotency_key:
-            with self._idempotency_lock:
-                self._clean_idempotency()
-                found = self._idempotency.get(idempotency_key)
-                if found and storage.job_exists(found.job_id):
-                    meta = storage.load_meta(found.job_id)
-                    return found.job_id, found.job_access_token, JobStatus(meta["status"]), datetime.fromisoformat(meta["created_at"])
 
         job_id = new_job_id()
         created_at = self._utcnow()
@@ -405,6 +396,25 @@ class JobManager:
                 },
             },
         )
+        return job_id, access_token, created_at, meta
+
+    def create_job(
+        self,
+        req: CreateJobRequest,
+        reference_images: list[ReferenceImage],
+        owner: dict[str, Any],
+        requested_job_count: int = 1,
+        idempotency_key: str | None = None,
+    ) -> tuple[str, str | None, JobStatus, datetime]:
+        if idempotency_key:
+            with self._idempotency_lock:
+                self._clean_idempotency()
+                found = self._idempotency.get(idempotency_key)
+                if found and storage.job_exists(found.job_id):
+                    meta = storage.load_meta(found.job_id)
+                    return found.job_id, found.job_access_token, JobStatus(meta["status"]), datetime.fromisoformat(meta["created_at"])
+
+        job_id, access_token, created_at, _ = self._initialize_job(req, reference_images, owner, requested_job_count)
 
         try:
             self._queue.put_nowait(job_id)
@@ -425,6 +435,41 @@ class JobManager:
                 )
 
         return job_id, access_token, JobStatus.QUEUED, created_at
+
+    def create_failed_job(
+        self,
+        req: CreateJobRequest,
+        reference_images: list[ReferenceImage],
+        owner: dict[str, Any],
+        *,
+        requested_job_count: int = 1,
+        failure_message: str = "Job failed before execution",
+    ) -> tuple[str, str | None, JobStatus, datetime]:
+        job_id, access_token, created_at, meta = self._initialize_job(req, reference_images, owner, requested_job_count)
+        debug_id = str(uuid.uuid4())
+        meta["status"] = JobStatus.FAILED
+        meta["updated_at"] = created_at.isoformat()
+        meta["timing"] = {
+            "queued_at": created_at.isoformat(),
+            "started_at": None,
+            "finished_at": created_at.isoformat(),
+            "queue_wait_ms": 0,
+            "run_duration_ms": 0,
+        }
+        meta["error"] = {
+            "code": "DEGRADED_FAILURE",
+            "type": "UPSTREAM_ERROR",
+            "message": failure_message,
+            "retryable": False,
+            "debug_id": debug_id,
+            "details": {},
+        }
+        storage.save_meta(job_id, meta)
+        storage.write_job_log(job_id, failure_message)
+        if owner.get("user_id"):
+            user_store.record_job_created(str(owner["user_id"]))
+            user_store.record_job_failure(str(owner["user_id"]))
+        return job_id, access_token, JobStatus.FAILED, created_at
 
     def retry_job(
         self,

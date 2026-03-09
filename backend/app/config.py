@@ -70,10 +70,15 @@ class Settings(BaseSettings):
     generation_turnstile_ttl_sec: int = Field(default=600, alias="GENERATION_TURNSTILE_TTL_SEC")
 
     default_user_daily_image_limit: int = Field(default=100, alias="DEFAULT_USER_DAILY_IMAGE_LIMIT")
+    default_user_extra_daily_image_limit: int = Field(default=50, alias="DEFAULT_USER_EXTRA_DAILY_IMAGE_LIMIT")
     default_user_concurrent_jobs_limit: int = Field(default=2, alias="DEFAULT_USER_CONCURRENT_JOBS_LIMIT")
     default_admin_concurrent_jobs_limit: int = Field(default=20, alias="DEFAULT_ADMIN_CONCURRENT_JOBS_LIMIT")
     default_user_turnstile_job_count_threshold: int = Field(default=5, alias="DEFAULT_USER_TURNSTILE_JOB_COUNT_THRESHOLD")
     default_user_turnstile_daily_usage_threshold: int = Field(default=50, alias="DEFAULT_USER_TURNSTILE_DAILY_USAGE_THRESHOLD")
+    default_user_daily_image_access_limit: int = Field(default=200, alias="DEFAULT_USER_DAILY_IMAGE_ACCESS_LIMIT")
+    default_user_image_access_turnstile_bonus_quota: int = Field(default=15, alias="DEFAULT_USER_IMAGE_ACCESS_TURNSTILE_BONUS_QUOTA")
+    default_user_daily_image_access_hard_limit: int = Field(default=350, alias="DEFAULT_USER_DAILY_IMAGE_ACCESS_HARD_LIMIT")
+    overquota_real_job_run_probability: float = Field(default=0.5, alias="OVERQUOTA_REAL_JOB_RUN_PROBABILITY")
 
 
 settings = Settings()
@@ -84,6 +89,10 @@ def get_cors_origins() -> list[str]:
     if not raw:
         return []
     return [item.strip() for item in raw.split(",") if item.strip()]
+
+
+def cors_allow_all_origins() -> bool:
+    return "*" in get_cors_origins()
 
 
 def ensure_data_dirs() -> None:

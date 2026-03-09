@@ -25,6 +25,9 @@ USER_POLICY_KEYS = {
     "concurrent_jobs_limit",
     "turnstile_job_count_threshold",
     "turnstile_daily_usage_threshold",
+    "daily_image_access_limit",
+    "image_access_turnstile_bonus_quota",
+    "daily_image_access_hard_limit",
 }
 
 
@@ -71,6 +74,8 @@ def _default_daily_usage() -> dict[str, int]:
         "jobs_succeeded": 0,
         "jobs_failed": 0,
         "images_generated": 0,
+        "image_accesses": 0,
+        "image_access_bonus_quota": 0,
         "quota_resets": 0,
     }
 
@@ -83,10 +88,14 @@ class UserStore:
     def _default_policy(self) -> dict[str, int]:
         return {
             "default_user_daily_image_limit": int(settings.default_user_daily_image_limit),
+            "default_user_extra_daily_image_limit": int(settings.default_user_extra_daily_image_limit),
             "default_user_concurrent_jobs_limit": int(settings.default_user_concurrent_jobs_limit),
             "default_admin_concurrent_jobs_limit": int(settings.default_admin_concurrent_jobs_limit),
             "default_user_turnstile_job_count_threshold": int(settings.default_user_turnstile_job_count_threshold),
             "default_user_turnstile_daily_usage_threshold": int(settings.default_user_turnstile_daily_usage_threshold),
+            "default_user_daily_image_access_limit": int(settings.default_user_daily_image_access_limit),
+            "default_user_image_access_turnstile_bonus_quota": int(settings.default_user_image_access_turnstile_bonus_quota),
+            "default_user_daily_image_access_hard_limit": int(settings.default_user_daily_image_access_hard_limit),
         }
 
     def _default_document(self) -> dict[str, Any]:
@@ -275,6 +284,9 @@ class UserStore:
                 "concurrent_jobs_limit": policy["default_admin_concurrent_jobs_limit"],
                 "turnstile_job_count_threshold": None,
                 "turnstile_daily_usage_threshold": None,
+                "daily_image_access_limit": None,
+                "image_access_turnstile_bonus_quota": None,
+                "daily_image_access_hard_limit": None,
             }
         else:
             effective = {
@@ -282,6 +294,9 @@ class UserStore:
                 "concurrent_jobs_limit": policy["default_user_concurrent_jobs_limit"],
                 "turnstile_job_count_threshold": policy["default_user_turnstile_job_count_threshold"],
                 "turnstile_daily_usage_threshold": policy["default_user_turnstile_daily_usage_threshold"],
+                "daily_image_access_limit": policy["default_user_daily_image_access_limit"],
+                "image_access_turnstile_bonus_quota": policy["default_user_image_access_turnstile_bonus_quota"],
+                "daily_image_access_hard_limit": policy["default_user_daily_image_access_hard_limit"],
             }
 
         for key, value in overrides.items():
@@ -432,6 +447,22 @@ class UserStore:
             bucket = self._usage_bucket_locked(doc, user_id)
             bucket["jobs_failed"] += 1
             self._save_locked(doc)
+
+    def record_image_access(self, user_id: str, count: int = 1) -> dict[str, int]:
+        with self._lock:
+            doc = self._load_locked()
+            bucket = self._usage_bucket_locked(doc, user_id)
+            bucket["image_accesses"] += max(0, int(count))
+            self._save_locked(doc)
+            return deepcopy(bucket)
+
+    def grant_image_access_bonus(self, user_id: str, bonus_quota: int) -> dict[str, int]:
+        with self._lock:
+            doc = self._load_locked()
+            bucket = self._usage_bucket_locked(doc, user_id)
+            bucket["image_access_bonus_quota"] += max(0, int(bonus_quota))
+            self._save_locked(doc)
+            return deepcopy(bucket)
 
     def reset_daily_usage(self, user_id: str, date_key: str | None = None) -> dict[str, int]:
         with self._lock:
