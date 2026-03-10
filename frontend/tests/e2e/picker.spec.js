@@ -352,12 +352,134 @@ function buildImportDrawerFixtures() {
   };
 }
 
+function buildLayoutRegressionFixtures() {
+  const jobs = [];
+  const metas = {};
+  const pushJob = (job) => {
+    jobs.push(job);
+    metas[job.job_id] = {
+      job_id: job.job_id,
+      model: job.model_cache,
+      status: job.status_cache,
+      created_at: job.created_at,
+      updated_at: job.last_seen_at,
+      timing: { queued_at: job.created_at, started_at: job.created_at, finished_at: job.last_seen_at, queue_wait_ms: 200, run_duration_ms: 1200 },
+      result: { images: [{ image_id: "image_0", mime: "image/png", width: 1, height: 1 }] },
+    };
+  };
+
+  for (let idx = 0; idx < 10; idx += 1) {
+    pushJob(
+      pickerJob(`layout_film_${idx}`, {
+        first_image_id: "image_0",
+        image_count_cache: 1,
+        created_at: `2026-03-10T00:${String(idx).padStart(2, "0")}:00Z`,
+      })
+    );
+  }
+
+  for (let idx = 0; idx < 5; idx += 1) {
+    pushJob(
+      pickerJob(`layout_pref_${idx}`, {
+        first_image_id: "image_0",
+        image_count_cache: 1,
+        created_at: `2026-03-10T01:${String(idx).padStart(2, "0")}:00Z`,
+      })
+    );
+  }
+
+  return {
+    jobs,
+    metas,
+    sidebarPinned: true,
+    sessions: [
+      {
+        session_id: "pk_layout_a",
+        name: "test123",
+        created_at: "2026-03-10T00:00:00Z",
+        updated_at: "2026-03-10T00:00:00Z",
+        archived: false,
+        pinned: false,
+        items: [],
+        compare_mode: "FOUR",
+        layout_preset: "SYNC_ZOOM",
+        ui: { background: "light", showGrid: false, showInfo: false },
+        slots: [null, null, null, null],
+        focus_key: null,
+      },
+      {
+        session_id: "pk_layout_b",
+        name: "789432523",
+        created_at: "2026-03-10T00:00:00Z",
+        updated_at: "2026-03-10T00:00:00Z",
+        archived: false,
+        pinned: false,
+        items: [
+          ...Array.from({ length: 10 }, (_, idx) =>
+            pickerImageItem(`layout_film_${idx}`, {
+              reviewed: idx >= 5,
+              rating: idx >= 5 ? ((idx % 5) + 1) : undefined,
+            })
+          ),
+          ...Array.from({ length: 5 }, (_, idx) =>
+            pickerImageItem(`layout_pref_${idx}`, {
+              bucket: "PREFERRED",
+              reviewed: true,
+              rating: idx % 2 ? 4 : 5,
+            })
+          ),
+        ],
+        compare_mode: "FOUR",
+        layout_preset: "SYNC_ZOOM",
+        ui: { background: "light", showGrid: false, showInfo: false },
+        slots: [null, null, null, null],
+        focus_key: null,
+      },
+      {
+        session_id: "pk_layout_c",
+        name: "默认挑选会话",
+        created_at: "2026-03-09T00:00:00Z",
+        updated_at: "2026-03-09T00:00:00Z",
+        archived: false,
+        pinned: false,
+        items: [
+          ...Array.from({ length: 7 }, (_, idx) =>
+            pickerImageItem(`layout_film_${idx}`, {
+              reviewed: idx >= 3,
+              rating: idx >= 3 ? 4 : undefined,
+            })
+          ),
+          ...Array.from({ length: 2 }, (_, idx) =>
+            pickerImageItem(`layout_pref_${idx}`, {
+              bucket: "PREFERRED",
+              reviewed: true,
+              rating: 5,
+            })
+          ),
+        ],
+        compare_mode: "FOUR",
+        layout_preset: "SYNC_ZOOM",
+        ui: { background: "light", showGrid: false, showInfo: false },
+        slots: [null, null, null, null],
+        focus_key: null,
+      },
+    ],
+    previewBatchCalls: 0,
+    originalImageCalls: 0,
+    previewImageCalls: 0,
+    activeCalls: 0,
+  };
+}
+
 async function seedPickerState(page, fixtures, sessionId) {
   await page.addInitScript(
-    ([adminUserId, jobs, sessions, seedSessionId]) => {
+    ([adminUserId, jobs, sessions, seedSessionId, sidebarPinned]) => {
       window.localStorage.setItem("nbp_jobs_by_user_v2", JSON.stringify({ [adminUserId]: jobs }));
       window.localStorage.setItem("nbp_picker_sessions_v1", JSON.stringify(sessions));
       window.localStorage.setItem("nbp_picker_recent_v1", JSON.stringify({ last_session_id: seedSessionId, last_opened_at: new Date().toISOString() }));
+      if (sidebarPinned !== undefined) {
+        window.localStorage.setItem("nbp_picker_sidebar_pref_v1", JSON.stringify({ pinned: sidebarPinned }));
+      }
       window.localStorage.setItem(
         "nbp_settings_v1",
         JSON.stringify({
@@ -370,7 +492,7 @@ async function seedPickerState(page, fixtures, sessionId) {
         })
       );
     },
-    [ADMIN_USER_ID, fixtures.jobs, fixtures.sessions, sessionId]
+    [ADMIN_USER_ID, fixtures.jobs, fixtures.sessions, sessionId, fixtures.sidebarPinned]
   );
 }
 
@@ -643,7 +765,7 @@ test.describe.serial("Picker page", () => {
     expect(created.ui.background).toBe("light");
 
     await page.getByTestId(`picker-session-menu-${created.session_id}`).click();
-    await page.getByRole("button", { name: "归档会话" }).click();
+    await page.getByTestId(`picker-session-menu-panel-${created.session_id}`).getByRole("button", { name: "归档会话" }).click();
     await page.getByTestId("picker-sidebar-archived-toggle").click();
     await expect(page.getByTestId(`picker-session-item-${created.session_id}`)).toBeVisible();
   });
@@ -673,5 +795,76 @@ test.describe.serial("Picker page", () => {
 
     await page.getByRole("button", { name: "下一页" }).click();
     await expect(page.getByTestId("picker-import-page")).toHaveText("第 2 / 2 页");
+  });
+
+  test("fits the toolbar and 4-up stage above the fold and keeps filmstrip/preferred as equal horizontal scrollers", async ({ page }) => {
+    const fixtures = buildLayoutRegressionFixtures();
+    await page.setViewportSize({ width: 1366, height: 1100 });
+    await seedPickerState(page, fixtures, "pk_layout_b");
+    await installPickerMocks(page, fixtures);
+    await loginToPicker(page, "pk_layout_b");
+
+    const stageBox = await page.getByTestId("picker-stage").boundingBox();
+    expect(stageBox).toBeTruthy();
+    expect(stageBox.y + stageBox.height).toBeLessThanOrEqual(1100);
+
+    const filmPanel = await page.getByTestId("picker-filmstrip-panel").boundingBox();
+    const preferredPanel = await page.getByTestId("picker-preferred-panel").boundingBox();
+    expect(filmPanel).toBeTruthy();
+    expect(preferredPanel).toBeTruthy();
+    expect(Math.abs(filmPanel.width - preferredPanel.width)).toBeLessThanOrEqual(40);
+    expect(filmPanel.y).toBeGreaterThan(stageBox.y + stageBox.height - 4);
+    expect(preferredPanel.y).toBeGreaterThan(stageBox.y + stageBox.height - 4);
+
+    const filmScroll = await page.getByTestId("picker-filmstrip-scroll").evaluate((node) => ({
+      clientWidth: node.clientWidth,
+      scrollWidth: node.scrollWidth,
+      scrollHeight: node.scrollHeight,
+    }));
+    expect(filmScroll.scrollWidth).toBeGreaterThan(filmScroll.clientWidth);
+
+    const preferredScroll = await page.getByTestId("picker-preferred-scroll").evaluate((node) => ({
+      clientWidth: node.clientWidth,
+      scrollWidth: node.scrollWidth,
+      scrollHeight: node.scrollHeight,
+    }));
+    expect(preferredScroll.scrollWidth).toBeGreaterThan(preferredScroll.clientWidth);
+    expect(preferredScroll.scrollWidth).toBeGreaterThan(preferredScroll.scrollHeight);
+  });
+
+  test("switches sessions from the full card area and keeps the menu and sidebar toggle above surrounding cards", async ({ page }) => {
+    const fixtures = buildLayoutRegressionFixtures();
+    await seedPickerState(page, fixtures, "pk_layout_b");
+    await installPickerMocks(page, fixtures);
+    await loginToPicker(page, "pk_layout_b");
+
+    await page.getByTestId("picker-session-item-pk_layout_a").click({ position: { x: 48, y: 34 } });
+    await expect(page.getByText("当前会话 · test123")).toBeVisible();
+
+    await page.getByTestId("picker-session-item-pk_layout_b").click({ position: { x: 56, y: 72 } });
+    await expect(page.getByText("当前会话 · 789432523")).toBeVisible();
+
+    await page.getByTestId("picker-session-menu-pk_layout_b").click();
+    const menuPanel = page.getByTestId("picker-session-menu-panel-pk_layout_b");
+    await expect(menuPanel).toBeVisible();
+    await expect(menuPanel.getByRole("button", { name: "重命名" })).toBeVisible();
+    await expect(menuPanel.getByRole("button", { name: "置顶" })).toBeVisible();
+    await expect(menuPanel.getByRole("button", { name: "归档会话" })).toBeVisible();
+    await expect(menuPanel.getByRole("button", { name: "删除" })).toBeVisible();
+    await menuPanel.getByRole("button", { name: "置顶" }).click();
+    await expect(page.getByTestId("picker-session-item-pk_layout_b")).toContainText("置顶");
+
+    const layering = await page.evaluate(() => {
+      const toggle = document.querySelector('[data-testid="picker-sidebar-toggle"]');
+      if (!toggle) return { toggleOwnsCenter: false };
+      const toggleRect = toggle.getBoundingClientRect();
+      const toggleElement = document.elementFromPoint(toggleRect.left + toggleRect.width / 2, toggleRect.top + toggleRect.height / 2);
+      return {
+        toggleOwnsCenter: Boolean(
+          toggleElement && (toggle.contains(toggleElement) || toggleElement.contains(toggle))
+        ),
+      };
+    });
+    expect(layering.toggleOwnsCenter).toBe(true);
   });
 });

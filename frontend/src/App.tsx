@@ -10104,6 +10104,7 @@ function PickerCompareSlot({
   slotLabel,
   item,
   image,
+  compareMode,
   isBest,
   focused,
   showInfo,
@@ -10121,6 +10122,7 @@ function PickerCompareSlot({
   slotLabel: string;
   item: PickerSessionItem | null;
   image?: PickerImageState;
+  compareMode: PickerCompareMode;
   isBest: boolean;
   focused: boolean;
   showInfo: boolean;
@@ -10143,6 +10145,12 @@ function PickerCompareSlot({
   const notFound = image?.code === "404";
   const hasImage = pickerItemHasImage(item);
   const status = item ? pickerItemJobStatus(item, jobRec) : "UNKNOWN";
+  const mediaHeightClass =
+    compareMode === "FOUR"
+      ? "h-[210px] sm:h-[220px] md:h-[240px] xl:h-[255px] 2xl:h-[280px]"
+      : compareMode === "TWO"
+        ? "h-[260px] sm:h-[300px] md:h-[340px] xl:h-[400px]"
+        : "h-[320px] sm:h-[380px] md:h-[430px] xl:h-[500px]";
 
   return (
     <motion.div
@@ -10160,7 +10168,7 @@ function PickerCompareSlot({
         title="聚焦该图片"
         data-testid={`picker-focus-${slotLabel}`}
       />
-      <div className="relative h-[320px] w-full sm:h-[400px] md:h-[460px] xl:h-[500px]">
+      <div className={cn("relative w-full", mediaHeightClass)}>
         {!item ? (
           <div className="flex h-full items-center justify-center text-sm text-zinc-500 dark:text-zinc-400">空槽位 {slotLabel}</div>
         ) : !hasImage ? (
@@ -11008,13 +11016,14 @@ function PickerPage() {
         }}
         data-testid="picker-session-sidebar"
       >
-        <div className="absolute inset-y-8 -right-3 flex items-center">
+        <div className="absolute inset-y-8 -right-5 z-[70] flex items-center">
           <button
             type="button"
-            className="rounded-full border border-zinc-200 bg-white px-2 py-5 text-[10px] font-bold uppercase tracking-[0.22em] text-zinc-500 shadow-sm dark:border-white/10 dark:bg-zinc-950 dark:text-zinc-300"
+            className="rounded-full border border-zinc-200 bg-white px-3 py-4 text-[10px] font-bold uppercase tracking-[0.22em] text-zinc-500 shadow-[0_10px_30px_rgba(15,23,42,0.14)] dark:border-white/10 dark:bg-zinc-950 dark:text-zinc-300"
             onClick={() => setSidebarPinned((current) => !current)}
+            data-testid="picker-sidebar-toggle"
           >
-            {sidebarPinned ? "收" : "会话"}
+            {sidebarPinned ? "收起" : "会话"}
           </button>
         </div>
 
@@ -11052,7 +11061,7 @@ function PickerPage() {
         </div>
 
         <div
-          className="h-[calc(100%-132px)] overflow-y-auto pr-1"
+          className="h-[calc(100%-132px)] overflow-y-auto pr-2"
           onScroll={(e) => {
             const el = e.currentTarget;
             if (el.scrollTop + el.clientHeight >= el.scrollHeight - 72) {
@@ -11070,22 +11079,28 @@ function PickerPage() {
                   key={session.session_id}
                   data-testid={`picker-session-item-${session.session_id}`}
                   className={cn(
-                    "relative rounded-2xl border p-2.5 transition",
+                    "relative cursor-pointer overflow-visible rounded-2xl border p-2.5 transition",
+                    menuOpen ? "z-40" : "z-0",
                     active
                       ? "border-zinc-900 bg-zinc-900 text-white shadow-md dark:border-white dark:bg-white dark:text-zinc-900"
                       : "border-zinc-200 bg-white/80 hover:border-zinc-300 dark:border-white/10 dark:bg-zinc-900/60 dark:hover:border-white/20"
                   )}
-                >
-                  <button
-                    type="button"
-                    className="absolute inset-0 rounded-2xl"
-                    onClick={() => {
+                  role="button"
+                  tabIndex={0}
+                  onClick={() => {
+                    setCurrentSessionAndUrl(session.session_id);
+                    setSessionMenuId(null);
+                    setShowArchivedSessions(Boolean(session.archived));
+                  }}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter" || e.key === " ") {
+                      e.preventDefault();
                       setCurrentSessionAndUrl(session.session_id);
                       setSessionMenuId(null);
                       setShowArchivedSessions(Boolean(session.archived));
-                    }}
-                    aria-label={`切换会话 ${session.name}`}
-                  />
+                    }
+                  }}
+                >
                   <div className="relative z-10 flex items-start justify-between gap-2">
                     <div className="min-w-0">
                       <div className="truncate text-sm font-semibold">{session.name}</div>
@@ -11093,7 +11108,7 @@ function PickerPage() {
                         Filmstrip {counts.filmstrip} · 优选 {counts.preferred}
                       </div>
                     </div>
-                    <div className="relative">
+                    <div className="relative shrink-0">
                       <button
                         type="button"
                         className={cn(
@@ -11109,7 +11124,11 @@ function PickerPage() {
                         ...
                       </button>
                       {menuOpen ? (
-                        <div className="absolute right-0 top-9 z-30 w-40 rounded-2xl border border-zinc-200 bg-white p-1.5 shadow-xl dark:border-white/10 dark:bg-zinc-950">
+                        <div
+                          className="absolute right-0 top-11 z-[80] w-44 rounded-2xl border border-zinc-200/80 bg-white p-1.5 shadow-[0_24px_50px_rgba(15,23,42,0.2)] ring-1 ring-zinc-950/5 dark:border-white/10 dark:bg-zinc-950 dark:ring-white/10"
+                          data-testid={`picker-session-menu-panel-${session.session_id}`}
+                          onClick={(e) => e.stopPropagation()}
+                        >
                           <button type="button" className="w-full rounded-xl px-3 py-2 text-left text-xs hover:bg-zinc-100 dark:hover:bg-zinc-900" onClick={() => renameSessionFromSidebar(session)}>
                             重命名
                           </button>
@@ -11166,7 +11185,7 @@ function PickerPage() {
           }
         />
 
-        <div className="space-y-4">
+        <div className="space-y-3">
           <Card className="overflow-hidden border-none bg-[radial-gradient(circle_at_top_left,rgba(251,191,36,0.18),transparent_28%),radial-gradient(circle_at_top_right,rgba(56,189,248,0.16),transparent_26%),linear-gradient(180deg,rgba(255,255,255,0.98),rgba(244,244,245,0.96))] shadow-[0_14px_50px_rgba(15,23,42,0.08)] dark:bg-[radial-gradient(circle_at_top_left,rgba(251,191,36,0.14),transparent_24%),radial-gradient(circle_at_top_right,rgba(56,189,248,0.1),transparent_24%),linear-gradient(180deg,rgba(24,24,27,0.96),rgba(9,9,11,0.96))]">
             <div className="flex items-center gap-2 overflow-x-auto whitespace-nowrap pb-1" data-testid="picker-toolbar">
               <Button variant="secondary" onClick={() => setImportOpen(true)}>从历史导入</Button>
@@ -11205,15 +11224,15 @@ function PickerPage() {
             </div>
           </Card>
 
-          <Card className={cn("overflow-hidden border-none p-3 shadow-[0_22px_70px_rgba(15,23,42,0.16)]", darkStage ? "bg-zinc-950" : "bg-[linear-gradient(180deg,#fffdf7,#f8fafc)]")} testId="picker-stage">
-            <div className="mb-3 flex items-center justify-between gap-3">
+          <Card className={cn("overflow-hidden border-none p-2.5 shadow-[0_22px_70px_rgba(15,23,42,0.16)]", darkStage ? "bg-zinc-950" : "bg-[linear-gradient(180deg,#fffdf7,#f8fafc)]")} testId="picker-stage">
+            <div className="mb-2 flex items-center justify-between gap-3">
               <div>
                 <div className="text-sm font-bold text-zinc-900 dark:text-zinc-50">{currentSession.name}</div>
                 <div className="text-xs text-zinc-500 dark:text-zinc-400">审图主舞台默认突出展示，硬操作后立即补位。</div>
               </div>
               <div className="text-[11px] text-zinc-500 dark:text-zinc-400">{compareMode} · {darkStage ? "Dark Stage" : "Light Stage"}</div>
             </div>
-            <div className={cn("grid gap-3", compareMode === "FOUR" ? "grid-cols-1 xl:grid-cols-2" : "grid-cols-1")}>
+            <div className={cn("grid gap-2.5", compareMode === "FOUR" ? "grid-cols-1 xl:grid-cols-2" : "grid-cols-1")}>
               {stageSlots.map((slotKey, idx) => {
                 const item = slotKey ? itemMap.get(slotKey) || null : null;
                 const label = String.fromCharCode(65 + idx);
@@ -11223,6 +11242,7 @@ function PickerPage() {
                       slotLabel={label}
                       item={item}
                       image={slotKey ? imageState[slotKey] : undefined}
+                      compareMode={compareMode}
                       isBest={Boolean(slotKey && isPreferredKey(slotKey))}
                       focused={Boolean(slotKey && slotKey === focusKey)}
                       showInfo={currentSession.ui.showInfo}
@@ -11243,8 +11263,8 @@ function PickerPage() {
             </div>
           </Card>
 
-          <div className="grid gap-4 xl:grid-cols-[minmax(0,1.6fr)_minmax(330px,0.95fr)]">
-            <Card className="overflow-hidden">
+          <div className="grid gap-4 lg:grid-cols-2">
+            <Card className="min-w-0 overflow-hidden" testId="picker-filmstrip-panel">
               <div className="mb-3 flex items-center justify-between">
                 <div>
                   <div className="text-sm font-bold text-zinc-900 dark:text-zinc-50">Filmstrip</div>
@@ -11256,6 +11276,7 @@ function PickerPage() {
                 <EmptyHint text="暂无图片，点击“从历史导入”开始挑选" />
               ) : (
                 <div
+                  data-testid="picker-filmstrip-scroll"
                   className="flex gap-3 overflow-x-auto pb-2"
                   onWheel={(e) => {
                     if (Math.abs(e.deltaY) > Math.abs(e.deltaX)) {
@@ -11344,7 +11365,7 @@ function PickerPage() {
               )}
             </Card>
 
-            <Card className="overflow-hidden">
+            <Card className="min-w-0 overflow-hidden" testId="picker-preferred-panel">
               <div className="mb-3 flex items-center justify-between">
                 <div>
                   <div className="text-sm font-bold text-zinc-900 dark:text-zinc-50">优选池</div>
@@ -11357,7 +11378,15 @@ function PickerPage() {
                   还没有优选图片，可在 Filmstrip 中点击“移入优选”。
                 </div>
               ) : (
-                <div className="space-y-3">
+                <div
+                  data-testid="picker-preferred-scroll"
+                  className="flex gap-3 overflow-x-auto pb-2"
+                  onWheel={(e) => {
+                    if (Math.abs(e.deltaY) > Math.abs(e.deltaX)) {
+                      (e.currentTarget as HTMLDivElement).scrollLeft += e.deltaY;
+                    }
+                  }}
+                >
                   {preferredItems.map((item) => {
                     const key = pickerItemKey(item);
                     const active = key === focusKey;
@@ -11368,7 +11397,7 @@ function PickerPage() {
                         layout
                         key={`pref_${key}`}
                         className={cn(
-                          "overflow-hidden rounded-[24px] border",
+                          "w-64 flex-none overflow-hidden rounded-[24px] border",
                           active ? "border-amber-500 shadow-md dark:border-amber-300" : "border-zinc-200 dark:border-white/10"
                         )}
                       >
