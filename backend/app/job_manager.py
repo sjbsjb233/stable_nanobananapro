@@ -334,10 +334,111 @@ class JobManager:
                 return storage.load_result_image(job_id, image["filename"]), image.get("mime", "image/png")
         raise api_error(ErrorCode.IMAGE_NOT_FOUND, "Image not found", http_status=404)
 
+    def get_preview_image(self, job_id: str, token: str | None, image_id: str, user: dict[str, Any] | None = None) -> tuple[bytes, str]:
+        meta = self._load_or_404(job_id)
+        self._check_job_access(meta, token, user)
+
+        images = meta.get("result", {}).get("images", [])
+        for image in images:
+            if image.get("image_id") != image_id:
+                continue
+            preview = image.get("preview") if isinstance(image.get("preview"), dict) else {}
+            preview_filename = str(preview.get("filename") or "")
+            preview_mime = str(preview.get("mime") or "image/webp")
+            preview_path = storage.job_dir(job_id) / preview_filename if preview_filename else None
+            if preview_filename and preview_path and preview_path.exists():
+                return storage.load_result_image(job_id, preview_filename), preview_mime
+
+            original = storage.load_result_image(job_id, image["filename"])
+            preview_bytes, preview_width, preview_height = self._to_preview(original)
+            saved_filename = storage.save_preview_image(job_id, image_id, preview_bytes, "image/webp")
+            image["preview"] = {
+                "filename": saved_filename,
+                "mime": "image/webp",
+                "width": preview_width,
+                "height": preview_height,
+                "size_bytes": len(preview_bytes),
+            }
+            storage.save_meta(job_id, meta)
+            return preview_bytes, "image/webp"
+
+        raise api_error(ErrorCode.IMAGE_NOT_FOUND, "Image not found", http_status=404)
+
+    def get_input_reference(self, job_id: str, token: str | None, ref_filename: str, user: dict[str, Any] | None = None) -> tuple[bytes, str]:
+        meta = self._load_or_404(job_id)
+        self._check_job_access(meta, token, user)
+        request_data = storage.load_request(job_id)
+        refs = request_data.get("reference_images") if isinstance(request_data.get("reference_images"), list) else []
+        allowed = {
+            str(item.get("filename")): str(item.get("mime") or "application/octet-stream")
+            for item in refs
+            if isinstance(item, dict) and item.get("filename")
+        }
+        mime = allowed.get(ref_filename)
+        if not mime:
+            raise api_error(ErrorCode.IMAGE_NOT_FOUND, "Reference image not found", http_status=404)
+
+        path = (storage.job_dir(job_id) / ref_filename).resolve()
+        job_root = storage.job_dir(job_id).resolve()
+        if job_root not in path.parents:
+            raise api_error(ErrorCode.FORBIDDEN, "Invalid reference path", http_status=403)
+        if not path.exists() or not path.is_file():
+            raise api_error(ErrorCode.IMAGE_NOT_FOUND, "Reference image not found", http_status=404)
+        return path.read_bytes(), mime
+
     def delete_job(self, job_id: str, token: str | None, user: dict[str, Any] | None = None) -> None:
         meta = self._load_or_404(job_id)
         self._check_job_access(meta, token, user)
         storage.delete_job(job_id)
+
+    def cancel_job(self, job_id: str, token: str | None, user: dict[str, Any] | None = None) -> dict[str, Any]:
+        meta = self._load_or_404(job_id)
+        self._check_job_access(meta, token, user)
+        current_status = str(meta.get("status") or "")
+        if current_status != JobStatus.RUNNING.value:
+            raise api_error(ErrorCode.INVALID_INPUT, "Only RUNNING jobs can be cancelled", http_status=400)
+
+        finished_at = self._utcnow()
+        self._hydrate_finished_timing(meta, finished_at, 0)
+        debug_id = str(uuid.uuid4())
+        message = "Job was cancelled by user while running. Any later worker result will be discarded."
+        meta["status"] = JobStatus.CANCELLED
+        meta["updated_at"] = finished_at.isoformat()
+        meta["result"] = {"images": []}
+        meta["response"] = {
+            "latency_ms": 0,
+            "finish_reason": "CANCELLED",
+            "safety_ratings": [],
+        }
+        meta["error"] = {
+            "code": "JOB_CANCELLED",
+            "type": "USER_CANCELLED",
+            "message": message,
+            "retryable": False,
+            "debug_id": debug_id,
+            "details": {
+                "cancelled_at": finished_at.isoformat(),
+                "previous_status": current_status,
+            },
+        }
+        storage.save_response(
+            job_id,
+            {
+                "latency_ms": 0,
+                "finish_reason": "CANCELLED",
+                "safety_ratings": [],
+                "raw_summary": {
+                    "parts_count": 0,
+                    "has_inline_image": False,
+                },
+                "upstream_error": {
+                    "reason": "USER_CANCELLED",
+                },
+            },
+        )
+        storage.save_meta(job_id, meta)
+        storage.write_job_log(job_id, "Job cancelled by user")
+        return {"job_id": job_id, "cancelled": True, "status": JobStatus.CANCELLED.value}
 
     def _clean_idempotency(self) -> None:
         now = time.time()
@@ -727,12 +828,22 @@ class JobManager:
         ) from payload
 
     def _finalize_success(self, job_id: str, meta: dict[str, Any], output: dict[str, Any]) -> None:
+        try:
+            latest_meta = storage.load_meta(job_id)
+        except Exception:
+            return
+        if str(latest_meta.get("status") or "") == JobStatus.CANCELLED.value:
+            storage.write_job_log(job_id, "Worker result discarded because job was already cancelled")
+            return
+        meta = latest_meta
         image_metas: list[dict[str, Any]] = []
         for idx, image in enumerate(output["images"]):
             image_id = f"image_{idx}"
             image_bytes, width, height = self._to_png(image["bytes"])
             mime = "image/png"
             filename = storage.save_result_image(job_id, image_id, image_bytes, mime)
+            preview_bytes, preview_width, preview_height = self._to_preview(image_bytes)
+            preview_filename = storage.save_preview_image(job_id, image_id, preview_bytes, "image/webp")
 
             digest = hashlib.sha256(image_bytes).hexdigest()
 
@@ -744,6 +855,13 @@ class JobManager:
                     "width": width,
                     "height": height,
                     "sha256": digest,
+                    "preview": {
+                        "filename": preview_filename,
+                        "mime": "image/webp",
+                        "width": preview_width,
+                        "height": preview_height,
+                        "size_bytes": len(preview_bytes),
+                    },
                 }
             )
 
@@ -800,6 +918,14 @@ class JobManager:
         return "UPSTREAM_ERROR", False
 
     def _finalize_failure(self, job_id: str, meta: dict[str, Any], err: GeminiError | None) -> None:
+        try:
+            latest_meta = storage.load_meta(job_id)
+        except Exception:
+            return
+        if str(latest_meta.get("status") or "") == JobStatus.CANCELLED.value:
+            storage.write_job_log(job_id, "Worker failure ignored because job was already cancelled")
+            return
+        meta = latest_meta
         err = err or GeminiError(code="UNKNOWN", message="Unknown failure", retryable=False)
         error_type, retryable = self._error_code_to_meta(err.code)
         debug_id = str(uuid.uuid4())
@@ -890,6 +1016,23 @@ class JobManager:
             width, height = img.size
             out = io.BytesIO()
             img.save(out, format="PNG")
+            return out.getvalue(), width, height
+
+    def _to_preview(self, raw: bytes) -> tuple[bytes, int, int]:
+        with Image.open(io.BytesIO(raw)) as img:
+            preview = img.copy()
+            max_px = max(256, int(settings.preview_image_max_px))
+            preview.thumbnail((max_px, max_px), Image.Resampling.LANCZOS)
+            width, height = preview.size
+            out = io.BytesIO()
+            if preview.mode not in {"RGB", "RGBA"}:
+                preview = preview.convert("RGBA" if "A" in preview.getbands() else "RGB")
+            preview.save(
+                out,
+                format="WEBP",
+                quality=max(20, min(100, int(settings.preview_image_quality))),
+                method=6,
+            )
             return out.getvalue(), width, height
 
     def queue_size(self) -> int:

@@ -5,6 +5,7 @@ import math
 import random
 import time
 import uuid
+import base64
 from datetime import datetime, timedelta
 from typing import Any, AsyncIterator
 
@@ -34,6 +35,7 @@ from .rate_limiter import job_read_rate_limit
 from .logging_setup import get_logger, setup_logging
 from .schemas import (
     ActiveJobsRequest,
+    BatchPreviewRequest,
     BatchMetaRequest,
     BillingSummaryModelItem,
     CreateJobRequest,
@@ -1366,6 +1368,58 @@ async def get_job_response(
     return {"job_id": job_id, "response": job_manager.get_response(job_id, x_job_token, current_user)}
 
 
+@app.post(f"{settings.api_prefix}/jobs/previews/batch")
+async def jobs_batch_previews(
+    payload: BatchPreviewRequest,
+    request: Request,
+    current_user: dict[str, Any] = Depends(get_current_user),
+) -> dict[str, Any]:
+    job_read_rate_limit(request)
+    raw_images = payload.images[: max(1, int(settings.preview_batch_limit))]
+
+    items: list[dict[str, Any]] = []
+    forbidden: list[dict[str, str]] = []
+    not_found: list[dict[str, str]] = []
+    failed: list[dict[str, str]] = []
+
+    for item in raw_images:
+        job_id = str(item.job_id or "")
+        image_id = str(item.image_id or "")
+        token = item.job_access_token
+        if not validate_job_id(job_id) or not validate_image_id(image_id):
+            not_found.append({"job_id": job_id, "image_id": image_id})
+            continue
+        try:
+            image_bytes, mime = job_manager.get_preview_image(job_id, token, image_id, current_user)
+        except HTTPException as exc:
+            if exc.status_code == 403:
+                forbidden.append({"job_id": job_id, "image_id": image_id})
+            elif exc.status_code == 404:
+                not_found.append({"job_id": job_id, "image_id": image_id})
+            else:
+                failed.append({"job_id": job_id, "image_id": image_id, "message": str(exc.detail)})
+            continue
+        items.append(
+            {
+                "job_id": job_id,
+                "image_id": image_id,
+                "mime": mime,
+                "size_bytes": len(image_bytes),
+                "data_base64": base64.b64encode(image_bytes).decode("ascii"),
+            }
+        )
+
+    return {
+        "items": items,
+        "forbidden": forbidden,
+        "not_found": not_found,
+        "failed": failed,
+        "requested": len(raw_images),
+        "ok": len(items),
+        "limit": int(settings.preview_batch_limit),
+    }
+
+
 @app.get(f"{settings.api_prefix}/jobs/{{job_id}}/images/{{image_id}}", dependencies=[Depends(job_read_rate_limit)])
 async def get_job_image(
     job_id: str,
@@ -1393,6 +1447,39 @@ async def get_job_image(
     return Response(content=image_bytes, media_type=mime)
 
 
+@app.get(f"{settings.api_prefix}/jobs/{{job_id}}/images/{{image_id}}/preview", dependencies=[Depends(job_read_rate_limit)])
+async def get_job_preview_image(
+    job_id: str,
+    image_id: str,
+    x_job_token: str | None = Header(default=None, alias="X-Job-Token"),
+    current_user: dict[str, Any] = Depends(get_current_user),
+) -> Response:
+    if not validate_job_id(job_id):
+        raise api_error(ErrorCode.JOB_NOT_FOUND, "Job not found", http_status=404)
+    if not validate_image_id(image_id):
+        raise api_error(ErrorCode.IMAGE_NOT_FOUND, "Image not found", http_status=404)
+
+    image_bytes, mime = job_manager.get_preview_image(job_id, x_job_token, image_id, current_user)
+    return Response(
+        content=image_bytes,
+        media_type=mime,
+        headers={"Cache-Control": "private, max-age=86400"},
+    )
+
+
+@app.get(f"{settings.api_prefix}/jobs/{{job_id}}/references/{{ref_path:path}}", dependencies=[Depends(job_read_rate_limit)])
+async def get_job_reference_image(
+    job_id: str,
+    ref_path: str,
+    x_job_token: str | None = Header(default=None, alias="X-Job-Token"),
+    current_user: dict[str, Any] = Depends(get_current_user),
+) -> Response:
+    if not validate_job_id(job_id):
+        raise api_error(ErrorCode.JOB_NOT_FOUND, "Job not found", http_status=404)
+    image_bytes, mime = job_manager.get_input_reference(job_id, x_job_token, ref_path, current_user)
+    return Response(content=image_bytes, media_type=mime)
+
+
 async def _event_stream(job_id: str, token: str | None, user: dict[str, Any]) -> AsyncIterator[bytes]:
     last_status = None
     while True:
@@ -1415,7 +1502,7 @@ async def _event_stream(job_id: str, token: str | None, user: dict[str, Any]) ->
             yield f"event: status\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n".encode("utf-8")
             last_status = status_
 
-        if status_ in {"SUCCEEDED", "FAILED", "DELETED"}:
+        if status_ in {"SUCCEEDED", "FAILED", "CANCELLED", "DELETED"}:
             return
 
         import asyncio
@@ -1445,6 +1532,17 @@ async def delete_job(
         raise api_error(ErrorCode.JOB_NOT_FOUND, "Job not found", http_status=404)
     job_manager.delete_job(job_id, x_job_token, current_user)
     return {"job_id": job_id, "deleted": True}
+
+
+@app.post(f"{settings.api_prefix}/jobs/{{job_id}}/cancel")
+async def cancel_job(
+    job_id: str,
+    x_job_token: str | None = Header(default=None, alias="X-Job-Token"),
+    current_user: dict[str, Any] = Depends(get_current_user),
+) -> dict[str, Any]:
+    if not validate_job_id(job_id):
+        raise api_error(ErrorCode.JOB_NOT_FOUND, "Job not found", http_status=404)
+    return job_manager.cancel_job(job_id, x_job_token, current_user)
 
 
 @app.post(f"{settings.api_prefix}/jobs/{{job_id}}/retry", status_code=status.HTTP_201_CREATED)

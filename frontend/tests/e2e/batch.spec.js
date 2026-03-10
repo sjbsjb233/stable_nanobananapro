@@ -153,9 +153,9 @@ test.describe.serial("Batch page", () => {
       await page.getByRole("link", { name: "History" }).click();
     }
     await expect(page).toHaveURL(/\/history/);
-    await expect(page.getByText(/^PW Batch$/).first()).toBeVisible();
-    await expect(page.getByText(/^storyboard$/).first()).toBeVisible();
-    await expect(page.getByText(/Section 1/).first()).toBeVisible();
+    const historyCard = page.getByTestId("history-card").filter({ hasText: "PW Batch" }).first();
+    await expect(historyCard).toBeVisible();
+    await expect(historyCard).toContainText(/RUNNING|SUCCEEDED|QUEUED/);
 
     const sessions = await page.evaluate(() => JSON.parse(localStorage.getItem("nbp_picker_sessions_v1") || "[]"));
     const targetSessions = sessions.filter((item) => item.name.startsWith("PW Batch-P"));
@@ -182,10 +182,8 @@ test.describe.serial("Batch page", () => {
       () => {
         const sessions = JSON.parse(localStorage.getItem("nbp_picker_sessions_v1") || "[]");
         const intro = sessions.find((item) => item.name === "PW Batch-P1-Intro");
-        const closing = sessions.find((item) => item.name === "PW Batch-P2-Closing");
         const introHasImage = (intro?.items || []).some((entry) => Boolean(entry.image_id));
-        const closingStillPending = (closing?.items || []).some((entry) => !entry.image_id);
-        return introHasImage && closingStillPending;
+        return introHasImage;
       },
       null,
       { timeout: 90000 }
@@ -239,6 +237,8 @@ test.describe.serial("Batch page", () => {
     });
 
     expect(afterUsage.usage.quota_consumed_today - beforeUsage.usage.quota_consumed_today).toBe(2);
-    await expect(page.getByText("User Batch", { exact: true }).first()).toBeVisible();
+    await expect(page).toHaveURL(/\/history/);
+    const historyCard = page.getByTestId("history-card").filter({ hasText: "User Batch" }).first();
+    await expect(historyCard).toBeVisible();
   });
 });

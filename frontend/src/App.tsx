@@ -47,7 +47,7 @@ type JobAuthMode = "TOKEN" | "ID_ONLY";
 
 type ThemeMode = "system" | "dark" | "light";
 
-type JobStatus = "QUEUED" | "RUNNING" | "SUCCEEDED" | "FAILED" | "UNKNOWN";
+type JobStatus = "QUEUED" | "RUNNING" | "CANCELLED" | "SUCCEEDED" | "FAILED" | "UNKNOWN";
 
 type ModelId =
   | "gemini-3-pro-image-preview"
@@ -96,6 +96,11 @@ type SettingsV1 = {
     maxIntervalMs: number;
     concurrency: number;
   };
+  cache: {
+    enabled: boolean;
+    ttlDays: number;
+    maxBytes: number;
+  };
 };
 
 type JobRecord = {
@@ -105,12 +110,17 @@ type JobRecord = {
   created_at: string; // ISO
   status_cache?: JobStatus;
   prompt_preview?: string;
+  prompt_text?: string;
   params_cache?: Partial<DefaultParams>;
   run_started_at?: string;
   run_finished_at?: string;
   queue_wait_ms?: number;
   run_duration_ms?: number;
   last_seen_at?: string;
+  first_image_id?: string;
+  image_count_cache?: number;
+  error_code_cache?: string;
+  error_message_cache?: string;
   pinned?: boolean;
   tags?: string[];
   batch_id?: string;
@@ -123,6 +133,26 @@ type JobRecord = {
   linked_session_ids?: string[];
   auto_remove_failed_from_picker?: boolean;
   deleted?: boolean;
+};
+
+type ImageVariant = "preview" | "original";
+
+type PreviewBatchItem = {
+  job_id: string;
+  image_id: string;
+  mime: string;
+  size_bytes: number;
+  data_base64: string;
+};
+
+type PreviewBatchResponse = {
+  items: PreviewBatchItem[];
+  forbidden: Array<{ job_id: string; image_id: string }>;
+  not_found: Array<{ job_id: string; image_id: string }>;
+  failed: Array<{ job_id: string; image_id: string; message: string }>;
+  requested: number;
+  ok: number;
+  limit: number;
 };
 
 type BatchCollectionMode = "NONE" | "EXISTING" | "AUTO_NEW" | "AUTO_BATCH";
@@ -458,6 +488,9 @@ const KEY_DASH_CACHE = "nbp_dashboard_cache_v1";
 const KEY_PICKER_SESSIONS = "nbp_picker_sessions_v1";
 const KEY_PICKER_RECENT = "nbp_picker_recent_v1";
 const KEY_HISTORY_AUTO_REFRESH_PREF = "nbp_history_auto_refresh_pref_v1";
+const KEY_CREATE_CLONE_DRAFT = "nbp_create_clone_draft_v1";
+const IMAGE_CACHE_DB = "nbp_image_cache_v1";
+const IMAGE_CACHE_STORE = "images";
 
 // -----------------------------
 // Utils
@@ -589,6 +622,13 @@ function createBatchId() {
   return `batch_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
 }
 
+type CreateCloneDraft = {
+  prompt: string;
+  model: ModelId;
+  mode: JobMode;
+  params: Partial<DefaultParams>;
+};
+
 function createDraftId(prefix: string) {
   return `${prefix}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
 }
@@ -685,6 +725,21 @@ function jobTimingPatch(meta?: JobMeta | null): Partial<JobRecord> {
   return patch;
 }
 
+function jobMetaCachePatch(meta?: JobMeta | null): Partial<JobRecord> {
+  if (!meta) return {};
+  const imageIds = extractImageIdsFromResult(meta.result);
+  return {
+    model_cache: (meta.model as ModelId) || undefined,
+    status_cache: (meta.status || "UNKNOWN") as JobStatus,
+    params_cache: meta.params ? { ...meta.params } : undefined,
+    first_image_id: imageIds[0],
+    image_count_cache: imageIds.length,
+    error_code_cache: meta.error?.code,
+    error_message_cache: meta.error?.message,
+    ...jobTimingPatch(meta),
+  };
+}
+
 function computeFakeProgressPercent(job: JobRecord, nowMs: number, avgDurationMs: number) {
   const status = job.status_cache || "UNKNOWN";
   if (status === "SUCCEEDED") return 100;
@@ -716,6 +771,250 @@ function downloadJson(filename: string, data: unknown) {
   a.click();
   a.remove();
   URL.revokeObjectURL(url);
+}
+
+function formatBytes(bytes?: number | null) {
+  if (typeof bytes !== "number" || !Number.isFinite(bytes) || bytes < 0) return "-";
+  if (bytes < 1024) return `${bytes} B`;
+  const units = ["KB", "MB", "GB", "TB"];
+  let value = bytes / 1024;
+  let idx = 0;
+  while (value >= 1024 && idx < units.length - 1) {
+    value /= 1024;
+    idx += 1;
+  }
+  return `${value.toFixed(value >= 10 ? 1 : 2)} ${units[idx]}`;
+}
+
+function base64ToBlob(base64: string, mime: string) {
+  const binary = atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
+  return new Blob([bytes], { type: mime });
+}
+
+type CachedImageRecord = {
+  key: string;
+  scope: string;
+  job_id: string;
+  image_id: string;
+  variant: ImageVariant;
+  mime: string;
+  size: number;
+  created_at: number;
+  last_accessed_at: number;
+  expires_at: number;
+  blob: Blob;
+};
+
+type ImageCacheStats = {
+  count: number;
+  size: number;
+};
+
+let imageCacheDbPromise: Promise<IDBDatabase> | null = null;
+
+function openImageCacheDb() {
+  if (typeof indexedDB === "undefined") {
+    return Promise.reject(new Error("IndexedDB unavailable"));
+  }
+  if (!imageCacheDbPromise) {
+    imageCacheDbPromise = new Promise((resolve, reject) => {
+      const req = indexedDB.open(IMAGE_CACHE_DB, 1);
+      req.onupgradeneeded = () => {
+        const db = req.result;
+        if (!db.objectStoreNames.contains(IMAGE_CACHE_STORE)) {
+          const store = db.createObjectStore(IMAGE_CACHE_STORE, { keyPath: "key" });
+          store.createIndex("scope", "scope", { unique: false });
+          store.createIndex("expires_at", "expires_at", { unique: false });
+          store.createIndex("last_accessed_at", "last_accessed_at", { unique: false });
+        }
+      };
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error || new Error("Failed to open image cache"));
+    });
+  }
+  return imageCacheDbPromise;
+}
+
+function imageCacheKey(scope: string, baseUrl: string, jobId: string, imageId: string, variant: ImageVariant) {
+  return `${scope}::${baseUrl.replace(/\/$/, "")}::${jobId}::${imageId}::${variant}`;
+}
+
+function imageCacheRecordScope(scope: string) {
+  return scope || "__guest__";
+}
+
+function imageCacheGet(
+  scope: string,
+  baseUrl: string,
+  jobId: string,
+  imageId: string,
+  variant: ImageVariant
+): Promise<Blob | null> {
+  const normalizedScope = imageCacheRecordScope(scope);
+  return openImageCacheDb()
+    .then(
+      (db) =>
+        new Promise<Blob | null>((resolve, reject) => {
+          const tx = db.transaction(IMAGE_CACHE_STORE, "readwrite");
+          const store = tx.objectStore(IMAGE_CACHE_STORE);
+          const key = imageCacheKey(normalizedScope, baseUrl, jobId, imageId, variant);
+          const req = store.get(key);
+          req.onsuccess = () => {
+            const row = req.result as CachedImageRecord | undefined;
+            if (!row || row.expires_at <= Date.now()) {
+              if (row) store.delete(key);
+              resolve(null);
+              return;
+            }
+            row.last_accessed_at = Date.now();
+            store.put(row);
+            resolve(row.blob);
+          };
+          req.onerror = () => reject(req.error || new Error("Failed to read image cache"));
+        })
+    )
+    .catch(() => null);
+}
+
+async function imageCacheStats(scope: string): Promise<ImageCacheStats> {
+  try {
+    const db = await openImageCacheDb();
+    return await new Promise<ImageCacheStats>((resolve, reject) => {
+      const tx = db.transaction(IMAGE_CACHE_STORE, "readonly");
+      const store = tx.objectStore(IMAGE_CACHE_STORE);
+      const index = store.index("scope");
+      const req = index.getAll(IDBKeyRange.only(imageCacheRecordScope(scope)));
+      req.onsuccess = () => {
+        const rows = (req.result as CachedImageRecord[]) || [];
+        resolve({
+          count: rows.length,
+          size: rows.reduce((sum, row) => sum + (row.size || 0), 0),
+        });
+      };
+      req.onerror = () => reject(req.error || new Error("Failed to read cache stats"));
+    });
+  } catch {
+    return { count: 0, size: 0 };
+  }
+}
+
+async function imageCacheTrim(scope: string, ttlDays: number, maxBytes: number) {
+  try {
+    const db = await openImageCacheDb();
+    await new Promise<void>((resolve, reject) => {
+      const tx = db.transaction(IMAGE_CACHE_STORE, "readwrite");
+      const store = tx.objectStore(IMAGE_CACHE_STORE);
+      const index = store.index("scope");
+      const req = index.getAll(IDBKeyRange.only(imageCacheRecordScope(scope)));
+      req.onsuccess = () => {
+        const now = Date.now();
+        const minCreatedAt = now - ttlDays * 24 * 3600 * 1000;
+        const rows = ((req.result as CachedImageRecord[]) || []).sort((a, b) => a.last_accessed_at - b.last_accessed_at);
+        rows
+          .filter((row) => row.expires_at <= now || row.created_at < minCreatedAt)
+          .forEach((row) => store.delete(row.key));
+        const kept = rows.filter((row) => row.expires_at > now && row.created_at >= minCreatedAt);
+        let total = kept.reduce((sum, row) => sum + (row.size || 0), 0);
+        for (const row of kept) {
+          if (total <= maxBytes) break;
+          store.delete(row.key);
+          total -= row.size || 0;
+        }
+      };
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error || new Error("Failed to trim image cache"));
+      tx.onabort = () => reject(tx.error || new Error("Failed to trim image cache"));
+    });
+  } catch {
+    // ignore
+  }
+}
+
+async function imageCachePut(
+  scope: string,
+  baseUrl: string,
+  jobId: string,
+  imageId: string,
+  variant: ImageVariant,
+  blob: Blob,
+  config: SettingsV1["cache"]
+) {
+  if (!config.enabled) return;
+  const normalizedScope = imageCacheRecordScope(scope);
+  const now = Date.now();
+  const record: CachedImageRecord = {
+    key: imageCacheKey(normalizedScope, baseUrl, jobId, imageId, variant),
+    scope: normalizedScope,
+    job_id: jobId,
+    image_id: imageId,
+    variant,
+    mime: blob.type || "application/octet-stream",
+    size: blob.size || 0,
+    created_at: now,
+    last_accessed_at: now,
+    expires_at: now + config.ttlDays * 24 * 3600 * 1000,
+    blob,
+  };
+  try {
+    const db = await openImageCacheDb();
+    await new Promise<void>((resolve, reject) => {
+      const tx = db.transaction(IMAGE_CACHE_STORE, "readwrite");
+      tx.objectStore(IMAGE_CACHE_STORE).put(record);
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error || new Error("Failed to write image cache"));
+      tx.onabort = () => reject(tx.error || new Error("Failed to write image cache"));
+    });
+  } catch {
+    // ignore write errors
+  }
+  await imageCacheTrim(normalizedScope, config.ttlDays, config.maxBytes);
+}
+
+async function imageCacheClear(scope?: string) {
+  try {
+    const db = await openImageCacheDb();
+    await new Promise<void>((resolve, reject) => {
+      const tx = db.transaction(IMAGE_CACHE_STORE, "readwrite");
+      const store = tx.objectStore(IMAGE_CACHE_STORE);
+      if (!scope) {
+        store.clear();
+      } else {
+        const index = store.index("scope");
+        const req = index.getAllKeys(IDBKeyRange.only(imageCacheRecordScope(scope)));
+        req.onsuccess = () => {
+          for (const key of req.result as IDBValidKey[]) store.delete(key);
+        };
+        req.onerror = () => reject(req.error || new Error("Failed to clear image cache"));
+      }
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error || new Error("Failed to clear image cache"));
+      tx.onabort = () => reject(tx.error || new Error("Failed to clear image cache"));
+    });
+  } catch {
+    // ignore
+  }
+}
+
+async function readCachedImageOrFetch(args: {
+  scope: string;
+  baseUrl: string;
+  jobId: string;
+  imageId: string;
+  variant: ImageVariant;
+  config: SettingsV1["cache"];
+  fetcher: () => Promise<Blob>;
+}) {
+  if (args.config.enabled) {
+    const cached = await imageCacheGet(args.scope, args.baseUrl, args.jobId, args.imageId, args.variant);
+    if (cached) return { blob: cached, fromCache: true };
+  }
+  const blob = await args.fetcher();
+  if (args.config.enabled) {
+    await imageCachePut(args.scope, args.baseUrl, args.jobId, args.imageId, args.variant, blob, args.config);
+  }
+  return { blob, fromCache: false };
 }
 
 function pickStatus(meta?: JobMeta, rec?: JobRecord): JobStatus {
@@ -812,6 +1111,73 @@ function pickerDisplayName(item: PickerSessionItem, rec?: JobRecord) {
 
 function pickerItemJobStatus(item: PickerSessionItem, rec?: JobRecord): JobStatus {
   return (rec?.status_cache || item.status || (pickerItemHasImage(item) ? "SUCCEEDED" : "UNKNOWN")) as JobStatus;
+}
+
+function extractErrorSummary(meta?: JobMeta | null, rec?: JobRecord | null) {
+  return meta?.error?.message || rec?.error_message_cache || "";
+}
+
+function extractErrorCode(meta?: JobMeta | null, rec?: JobRecord | null) {
+  return meta?.error?.code || rec?.error_code_cache || "";
+}
+
+function extractFirstImageId(meta?: JobMeta | null, rec?: JobRecord | null) {
+  const fromMeta = extractImageIdsFromResult(meta?.result)[0];
+  if (fromMeta) return fromMeta;
+  return rec?.first_image_id;
+}
+
+function summarizeQueueOrFailure(meta?: JobMeta | null, rec?: JobRecord | null) {
+  const status = pickStatus(meta || undefined, rec || undefined);
+  if (status === "FAILED") return extractErrorSummary(meta, rec) || "任务失败";
+  if (status === "CANCELLED") return extractErrorSummary(meta, rec) || "任务已取消";
+  if (status === "QUEUED") {
+    const queueWait = meta?.timing?.queue_wait_ms ?? rec?.queue_wait_ms;
+    return typeof queueWait === "number" ? `排队中，已等待 ${formatDurationMs(queueWait)}` : "队列中，等待空闲 worker";
+  }
+  if (status === "RUNNING") return "图像生成中";
+  return "";
+}
+
+function saveCreateCloneDraft(draft: CreateCloneDraft) {
+  storageSet(KEY_CREATE_CLONE_DRAFT, JSON.stringify(draft));
+}
+
+function loadCreateCloneDraft(): CreateCloneDraft | null {
+  return safeJsonParse<CreateCloneDraft | null>(storageGet(KEY_CREATE_CLONE_DRAFT), null);
+}
+
+function clearCreateCloneDraft() {
+  storageRemove(KEY_CREATE_CLONE_DRAFT);
+}
+
+function invalidatePickerEntriesForDeletedJob(jobId: string) {
+  const picker = usePickerStore.getState();
+  const affected = picker.sessions.filter((session) => session.items.some((item) => item.job_id === jobId));
+  affected.forEach((session) => {
+    picker.patchSession(session.session_id, (current) => ({
+      ...current,
+      items: current.items.map((item) =>
+        item.job_id === jobId
+          ? {
+              ...item,
+              status: "FAILED",
+              notes: "源任务已删除，条目将自动清理",
+            }
+          : item
+      ),
+    }));
+  });
+  window.setTimeout(() => {
+    const latest = usePickerStore.getState();
+    latest.sessions
+      .filter((session) => session.items.some((item) => item.job_id === jobId))
+      .forEach((session) => {
+        session.items
+          .filter((item) => item.job_id === jobId)
+          .forEach((item) => latest.removeItem(session.session_id, pickerItemKey(item)));
+      });
+  }, 900);
 }
 
 function getPickerSessionCounts(session: PickerSession) {
@@ -975,6 +1341,11 @@ const DEFAULT_SETTINGS: SettingsV1 = {
     maxIntervalMs: 5000,
     concurrency: 5,
   },
+  cache: {
+    enabled: true,
+    ttlDays: 3,
+    maxBytes: 2 * 1024 * 1024 * 1024,
+  },
 };
 
 const FALLBACK_MODEL_CATALOG: ModelsPayload = {
@@ -1036,6 +1407,7 @@ function coerceSettings(raw: any): SettingsV1 {
     defaultParams: normalizeDefaultParams((raw || {}).defaultParams),
     ui: { ...DEFAULT_SETTINGS.ui, ...((raw || {}).ui || {}) },
     polling: { ...DEFAULT_SETTINGS.polling, ...((raw || {}).polling || {}) },
+    cache: { ...DEFAULT_SETTINGS.cache, ...((raw || {}).cache || {}) },
   } as SettingsV1;
 
   const rawByModel = (raw || {}).defaultParamsByModel;
@@ -1056,6 +1428,15 @@ function coerceSettings(raw: any): SettingsV1 {
     ...base,
     defaultParams: effectiveDefaultParams,
     defaultParamsByModel,
+    cache: {
+      enabled: Boolean(base.cache?.enabled ?? DEFAULT_SETTINGS.cache.enabled),
+      ttlDays: clamp(Number(base.cache?.ttlDays || DEFAULT_SETTINGS.cache.ttlDays), 1, 30),
+      maxBytes: clamp(
+        Number(base.cache?.maxBytes || DEFAULT_SETTINGS.cache.maxBytes),
+        128 * 1024 * 1024,
+        8 * 1024 * 1024 * 1024
+      ),
+    },
   };
 }
 
@@ -1122,6 +1503,7 @@ const useSettingsStore = create<SettingsStore>((set, get) => {
         defaultParamsByModel: { ...cur.defaultParamsByModel, ...((patch as any).defaultParamsByModel || {}) },
         ui: { ...cur.ui, ...(patch as any).ui },
         polling: { ...cur.polling, ...(patch as any).polling },
+        cache: { ...cur.cache, ...(patch as any).cache },
       });
       storageSet(KEY_SETTINGS, JSON.stringify(next));
       set({ settings: next });
@@ -1282,7 +1664,7 @@ function normalizePickerSession(raw: any): PickerSession {
                   : pickerPendingItemKey(String(it.job_id));
             if (!image_id && !item_key) return null;
             const rawStatus = String(it?.status || "");
-            const status = (["QUEUED", "RUNNING", "SUCCEEDED", "FAILED", "UNKNOWN"] as const).includes(rawStatus as any)
+            const status = (["QUEUED", "RUNNING", "CANCELLED", "SUCCEEDED", "FAILED", "UNKNOWN"] as const).includes(rawStatus as any)
               ? (rawStatus as JobStatus)
               : image_id
                 ? "SUCCEEDED"
@@ -1838,6 +2220,14 @@ class ApiClient {
     });
   }
 
+  cancelJob(job_id: string, jobToken?: string, signal?: AbortSignal) {
+    return this.request<any>(`/jobs/${encodeURIComponent(job_id)}/cancel`, {
+      method: "POST",
+      jobToken,
+      signal,
+    });
+  }
+
   retryJob(job_id: string, jobToken?: string, signal?: AbortSignal) {
     return this.request<any>(`/jobs/${encodeURIComponent(job_id)}/retry`, {
       method: "POST",
@@ -1875,6 +2265,54 @@ class ApiClient {
         status: r.status,
         elapsedMs: Math.round(performance.now() - startedAt),
       });
+      return r.blob();
+    });
+  }
+
+  getPreviewBlob(job_id: string, image_id: string, jobToken?: string, signal?: AbortSignal) {
+    const url = this.buildUrl(`/jobs/${encodeURIComponent(job_id)}/images/${encodeURIComponent(image_id)}/preview`);
+    const headers: Record<string, string> = {};
+    if (this.jobAuthMode === "TOKEN" && jobToken) headers["X-Job-Token"] = jobToken;
+    return fetch(url, { method: "GET", headers, signal, credentials: "include" }).then(async (r) => {
+      if (!r.ok) {
+        const contentType = r.headers.get("content-type") || "";
+        let err: ApiError = { error: { code: String(r.status), message: r.statusText || "Preview download failed" } };
+        if (contentType.includes("application/json")) {
+          const payload = (await r.json().catch(() => null)) as ApiError | null;
+          if (payload?.error?.code || payload?.error?.message) err = payload;
+        }
+        throw err;
+      }
+      return r.blob();
+    });
+  }
+
+  batchPreviewImages(
+    images: Array<{ job_id: string; image_id: string; job_access_token?: string }>,
+    signal?: AbortSignal
+  ) {
+    return this.request<PreviewBatchResponse>("/jobs/previews/batch", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ images }),
+      signal,
+    });
+  }
+
+  getReferenceBlob(job_id: string, refPath: string, jobToken?: string, signal?: AbortSignal) {
+    const url = this.buildUrl(`/jobs/${encodeURIComponent(job_id)}/references/${refPath.split("/").map(encodeURIComponent).join("/")}`);
+    const headers: Record<string, string> = {};
+    if (this.jobAuthMode === "TOKEN" && jobToken) headers["X-Job-Token"] = jobToken;
+    return fetch(url, { method: "GET", headers, signal, credentials: "include" }).then(async (r) => {
+      if (!r.ok) {
+        const contentType = r.headers.get("content-type") || "";
+        let err: ApiError = { error: { code: String(r.status), message: r.statusText || "Reference image download failed" } };
+        if (contentType.includes("application/json")) {
+          const payload = (await r.json().catch(() => null)) as ApiError | null;
+          if (payload?.error?.code || payload?.error?.message) err = payload;
+        }
+        throw err;
+      }
       return r.blob();
     });
   }
@@ -2074,6 +2512,7 @@ function Button({
   type,
   variant = "primary",
   title,
+  testId,
 }: {
   children: React.ReactNode;
   className?: string;
@@ -2082,6 +2521,7 @@ function Button({
   type?: "button" | "submit";
   variant?: "primary" | "ghost" | "danger" | "secondary";
   title?: string;
+  testId?: string;
 }) {
   const base =
     "inline-flex items-center justify-center gap-2 rounded-xl px-3 py-2 text-sm font-semibold transition active:scale-[0.98] disabled:cursor-not-allowed disabled:opacity-50";
@@ -2095,7 +2535,7 @@ function Button({
           : "bg-transparent text-zinc-800 hover:bg-zinc-100 dark:text-zinc-200 dark:hover:bg-zinc-800";
 
   return (
-    <button type={type || "button"} title={title} disabled={disabled} onClick={onClick} className={cn(base, styles, className)}>
+    <button data-testid={testId} type={type || "button"} title={title} disabled={disabled} onClick={onClick} className={cn(base, styles, className)}>
       {children}
     </button>
   );
@@ -2107,15 +2547,18 @@ function Input({
   placeholder,
   className,
   type,
+  testId,
 }: {
   value: string;
   onChange: (v: string) => void;
   placeholder?: string;
   className?: string;
   type?: string;
+  testId?: string;
 }) {
   return (
     <input
+      data-testid={testId}
       type={type || "text"}
       value={value}
       onChange={(e) => onChange(e.target.value)}
@@ -2134,15 +2577,18 @@ function TextArea({
   placeholder,
   className,
   rows = 5,
+  testId,
 }: {
   value: string;
   onChange: (v: string) => void;
   placeholder?: string;
   className?: string;
   rows?: number;
+  testId?: string;
 }) {
   return (
     <textarea
+      data-testid={testId}
       value={value}
       onChange={(e) => onChange(e.target.value)}
       placeholder={placeholder}
@@ -2160,14 +2606,17 @@ function Select({
   onChange,
   options,
   className,
+  testId,
 }: {
   value: string;
   onChange: (v: string) => void;
   options: Array<{ value: string; label: string }>;
   className?: string;
+  testId?: string;
 }) {
   return (
     <select
+      data-testid={testId}
       value={value}
       onChange={(e) => onChange(e.target.value)}
       className={cn(
@@ -2184,9 +2633,10 @@ function Select({
   );
 }
 
-function Switch({ value, onChange }: { value: boolean; onChange: (v: boolean) => void }) {
+function Switch({ value, onChange, testId }: { value: boolean; onChange: (v: boolean) => void; testId?: string }) {
   return (
     <button
+      data-testid={testId}
       onClick={() => onChange(!value)}
       className={cn(
         "relative h-7 w-12 rounded-full border transition",
@@ -2217,11 +2667,37 @@ function Skeleton({ className }: { className?: string }) {
   );
 }
 
+function LoadingSpinner({
+  className,
+  label,
+  tone = "neutral",
+}: {
+  className?: string;
+  label?: string;
+  tone?: "neutral" | "brand" | "sky";
+}) {
+  const toneClass =
+    tone === "brand"
+      ? "border-zinc-300 border-t-zinc-900 dark:border-zinc-700 dark:border-t-white"
+      : tone === "sky"
+        ? "border-sky-300 border-t-sky-600 dark:border-sky-800 dark:border-t-sky-300"
+        : "border-zinc-300 border-t-zinc-500 dark:border-zinc-700 dark:border-t-zinc-200";
+
+  return (
+    <div className={cn("flex flex-col items-center justify-center gap-3", className)}>
+      <div className={cn("h-9 w-9 animate-spin rounded-full border-2", toneClass)} />
+      {label ? <div className="text-xs font-semibold text-zinc-500 dark:text-zinc-300">{label}</div> : null}
+    </div>
+  );
+}
+
 function Badge({ status }: { status: JobStatus }) {
   const s = status;
   const style =
     s === "SUCCEEDED"
       ? "bg-emerald-500/15 text-emerald-700 border-emerald-200 dark:text-emerald-200 dark:border-emerald-900"
+      : s === "CANCELLED"
+        ? "bg-orange-500/15 text-orange-700 border-orange-200 dark:text-orange-200 dark:border-orange-900"
       : s === "FAILED"
         ? "bg-rose-500/15 text-rose-700 border-rose-200 dark:text-rose-200 dark:border-rose-900"
         : s === "RUNNING"
@@ -2236,6 +2712,7 @@ function Badge({ status }: { status: JobStatus }) {
         className={cn(
           "h-2 w-2 rounded-full",
           s === "SUCCEEDED" && "bg-emerald-500",
+          s === "CANCELLED" && "bg-orange-500",
           s === "FAILED" && "bg-rose-500",
           s === "RUNNING" && "bg-sky-500 animate-pulse",
           s === "QUEUED" && "bg-amber-500 animate-pulse",
@@ -2270,6 +2747,22 @@ function useTheme() {
     m?.addEventListener?.("change", on);
     return () => m?.removeEventListener?.("change", on);
   }, [theme]);
+}
+
+function ImageCacheJanitor() {
+  const settings = useSettingsStore((s) => s.settings);
+  const { user } = useAuthSession();
+  const scope = user?.user_id || "__guest__";
+
+  useEffect(() => {
+    if (!settings.cache.enabled) {
+      imageCacheClear(scope);
+      return;
+    }
+    imageCacheTrim(scope, settings.cache.ttlDays, settings.cache.maxBytes);
+  }, [scope, settings.cache.enabled, settings.cache.maxBytes, settings.cache.ttlDays]);
+
+  return null;
 }
 
 // -----------------------------
@@ -2369,8 +2862,8 @@ function NavButton({ to, label }: { to: string; label: string }) {
   );
 }
 
-function PageContainer({ children }: { children: React.ReactNode }) {
-  return <div className="mx-auto w-full max-w-6xl px-4 py-6">{children}</div>;
+function PageContainer({ children, className }: { children: React.ReactNode; className?: string }) {
+  return <div className={cn("mx-auto w-full max-w-6xl px-4 py-6", className)}>{children}</div>;
 }
 
 function PageTitle({ title, subtitle, right }: { title: string; subtitle?: string; right?: React.ReactNode }) {
@@ -2391,8 +2884,8 @@ function AnimatedRoutes() {
   const { isAdmin } = useAuthSession();
 
   return (
-    <AnimatePresence mode="wait" initial={false}>
-      <motion.div key={location.pathname + location.search} {...(page as any)} transition={transition}>
+    <AnimatePresence initial={false}>
+      <motion.div key={location.pathname} {...(page as any)} transition={transition}>
         <Routes location={location}>
           <Route path="/login" element={<Navigate to="/" replace />} />
           <Route path="/" element={<DashboardPage />} />
@@ -3180,10 +3673,8 @@ function useDashboardData() {
           (batch.items || []).forEach((it) => {
             byId.set(it.job_id, it.meta);
             useJobsStore.getState().updateJob(it.job_id, {
-              status_cache: (it.meta?.status || "UNKNOWN") as JobStatus,
-              model_cache: (it.meta?.model as ModelId) || undefined,
               last_seen_at: isoNow(),
-              ...jobTimingPatch(it.meta),
+              ...jobMetaCachePatch(it.meta),
             });
           });
           metas = subset.map((rec) => byId.get(rec.job_id) || null);
@@ -3196,9 +3687,8 @@ function useDashboardData() {
             try {
               const meta = await client.getJob(rec.job_id, rec.job_access_token);
               useJobsStore.getState().updateJob(rec.job_id, {
-                status_cache: (meta.status || rec.status_cache || "UNKNOWN") as JobStatus,
                 last_seen_at: isoNow(),
-                ...jobTimingPatch(meta),
+                ...jobMetaCachePatch(meta),
               });
               return meta;
             } catch (e: any) {
@@ -4683,6 +5173,7 @@ function BatchCreatePage() {
             created_at: resp?.created_at || isoNow(),
             status_cache: (resp?.status as JobStatus) || "QUEUED",
             prompt_preview: toPreview(finalPrompt),
+            prompt_text: finalPrompt,
             params_cache: {
               aspect_ratio: params.aspect_ratio,
               image_size: params.image_size,
@@ -4730,7 +5221,7 @@ function BatchCreatePage() {
             ? "所有计划任务都已写入队列"
             : `有 ${totalTargetCount - createdCount} 个任务没有成功提交（${firstError || "请检查后端日志"}）`,
       });
-      navigate(`/history?job=${encodeURIComponent(firstJobId)}`);
+      navigate("/history");
     } catch (e: any) {
       if (allowTurnstileRecovery && e?.error?.code === "TURNSTILE_REQUIRED") {
         setPendingGenerationTargetCount(totalTargetCount);
@@ -5394,6 +5885,26 @@ function CreateJobPage() {
   }, [catalog.models, currentModel, model]);
 
   useEffect(() => {
+    const draft = loadCreateCloneDraft();
+    if (!draft) return;
+    setPrompt(draft.prompt || "");
+    if (draft.model) {
+      setModel(draft.model);
+      hydratedModelRef.current = null;
+    }
+    if (draft.mode) setMode(draft.mode);
+    if (draft.params?.aspect_ratio) setAspect(draft.params.aspect_ratio as AspectRatio);
+    if (draft.params?.image_size) setSize(draft.params.image_size as ImageSize);
+    if (draft.params?.thinking_level !== undefined) setThinkingLevel(draft.params.thinking_level ?? null);
+    if (typeof draft.params?.temperature === "number") setTemperature(draft.params.temperature);
+    if (typeof draft.params?.timeout_sec === "number") setTimeoutSec(draft.params.timeout_sec);
+    if (typeof draft.params?.max_retries === "number") setMaxRetries(draft.params.max_retries);
+    clearCreateCloneDraft();
+    push({ kind: "info", title: "已导入历史任务参数", message: "参考图不会自动回填，请按需重新上传" });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  useEffect(() => {
     if (!currentModel) return;
     if (hydratedModelRef.current === model) return;
     const saved = getParamsForModel(settings, model, currentModel.default_params);
@@ -5670,6 +6181,7 @@ function CreateJobPage() {
           created_at: resp?.created_at || isoNow(),
           status_cache: (resp?.status as JobStatus) || "QUEUED",
           prompt_preview: toPreview(prompt),
+          prompt_text: prompt,
           params_cache: {
             aspect_ratio: params.aspect_ratio,
             image_size: params.image_size,
@@ -5703,7 +6215,7 @@ function CreateJobPage() {
 
       if (created.length === 1) {
         push({ kind: "success", title: "创建成功", message: `job_id: ${shortId(created[0].job_id)}` });
-        navigate(`/history?job=${encodeURIComponent(created[0].job_id)}`);
+        navigate("/history");
       } else {
         const failed = targetCount - created.length;
         push({
@@ -5711,7 +6223,7 @@ function CreateJobPage() {
           title: `批量创建完成：${created.length}/${targetCount}`,
           message: failed > 0 ? `有 ${failed} 个请求失败（${firstErr || "请检查后端日志"}）` : `已创建 ${created.length} 个任务`,
         });
-        navigate(`/history?job=${encodeURIComponent(created[0].job_id)}`);
+        navigate("/history");
       }
     } catch (e: any) {
       if (allowTurnstileRecovery && e?.error?.code === "TURNSTILE_REQUIRED") {
@@ -5838,6 +6350,7 @@ function CreateJobPage() {
             <div className="text-sm font-bold text-zinc-900 dark:text-zinc-50">Prompt</div>
             <div className="mt-2">
               <TextArea
+                testId="create-prompt"
                 value={prompt}
                 onChange={setPrompt}
                 rows={5}
@@ -6510,10 +7023,8 @@ function useJobLive(jobId: string | null, jobToken?: string) {
       const m = await client.getJob(jobId, jobToken);
       setMeta(m);
       useJobsStore.getState().updateJob(jobId, {
-        status_cache: (m.status || "UNKNOWN") as JobStatus,
-        model_cache: (m.model as ModelId) || undefined,
         last_seen_at: isoNow(),
-        ...jobTimingPatch(m),
+        ...jobMetaCachePatch(m),
       });
     } catch (e: any) {
       setError(e?.error?.message || "加载失败");
@@ -6550,7 +7061,7 @@ function useJobLive(jobId: string | null, jobToken?: string) {
                 last_seen_at: isoNow(),
               });
             }
-            if (data?.status === "SUCCEEDED" || data?.status === "FAILED") {
+            if (data?.status === "SUCCEEDED" || data?.status === "FAILED" || data?.status === "CANCELLED") {
               es.close();
               sseRef.current = null;
               // fetch full meta once
@@ -6583,7 +7094,7 @@ function useJobLive(jobId: string | null, jobToken?: string) {
       while (!stopRef.current) {
         await fetchOnce();
         const st = (useJobsStore.getState().jobs.find((j) => j.job_id === jobId)?.status_cache || meta?.status || "") as JobStatus;
-        if (st === "SUCCEEDED" || st === "FAILED") break;
+        if (st === "SUCCEEDED" || st === "FAILED" || st === "CANCELLED") break;
         await new Promise((r) => setTimeout(r, interval));
         interval = Math.min(maxInterval, Math.round(interval * 1.25));
       }
@@ -6602,13 +7113,152 @@ function useJobLive(jobId: string | null, jobToken?: string) {
   return { meta, loading, error, refresh: fetchOnce };
 }
 
+type HistoryPreviewEntry = {
+  src?: string;
+  loading: boolean;
+  failed?: boolean;
+};
+
+function useHistoryPreviewMap(records: JobRecord[]) {
+  const client = useApiClient();
+  const settings = useSettingsStore((s) => s.settings);
+  const { user } = useAuthSession();
+  const scope = user?.user_id || "__guest__";
+  const [previewMap, setPreviewMap] = useState<Record<string, HistoryPreviewEntry>>({});
+  const revokeRef = useRef<string[]>([]);
+  const recordsKey = useMemo(
+    () => records.map((rec) => `${rec.job_id}:${rec.first_image_id || ""}:${rec.status_cache || ""}`).join("|"),
+    [records]
+  );
+  const targets = useMemo(
+    () =>
+      records.map((rec) => ({
+        job_id: rec.job_id,
+        job_access_token: rec.job_access_token,
+        status_cache: rec.status_cache,
+        first_image_id: rec.first_image_id,
+      })),
+    [recordsKey]
+  );
+
+  useEffect(() => {
+    return () => {
+      revokeRef.current.forEach((url) => URL.revokeObjectURL(url));
+      revokeRef.current = [];
+    };
+  }, []);
+
+  useEffect(() => {
+    let stopped = false;
+    const controller = new AbortController();
+    revokeRef.current.forEach((url) => URL.revokeObjectURL(url));
+    revokeRef.current = [];
+
+    const successful = targets.filter((rec) => rec.status_cache === "SUCCEEDED" && rec.first_image_id);
+    setPreviewMap((current) => {
+      const next: Record<string, HistoryPreviewEntry> = {};
+      targets.forEach((rec) => {
+        const key = rec.job_id;
+        if (rec.status_cache === "SUCCEEDED" && rec.first_image_id) {
+          next[key] = { loading: true, failed: false };
+        }
+      });
+      return next;
+    });
+
+    if (!successful.length) return () => controller.abort();
+
+    (async () => {
+      const cachedResults = await Promise.all(
+        successful.map(async (rec) => {
+          const imageId = rec.first_image_id as string;
+          const blob = settings.cache.enabled
+            ? await imageCacheGet(scope, settings.baseUrl, rec.job_id, imageId, "preview")
+            : null;
+          return { rec, imageId, blob };
+        })
+      );
+      if (stopped) return;
+
+      const misses: Array<{ job_id: string; image_id: string; job_access_token?: string }> = [];
+      const nextState: Record<string, HistoryPreviewEntry> = {};
+      cachedResults.forEach(({ rec, imageId, blob }) => {
+        if (blob) {
+          const url = URL.createObjectURL(blob);
+          revokeRef.current.push(url);
+          nextState[rec.job_id] = { src: url, loading: false, failed: false };
+        } else {
+          misses.push({ job_id: rec.job_id, image_id: imageId, job_access_token: rec.job_access_token });
+          nextState[rec.job_id] = { loading: true, failed: false };
+        }
+      });
+      setPreviewMap((current) => ({ ...current, ...nextState }));
+      if (!misses.length) return;
+
+      try {
+        const payload = await client.batchPreviewImages(misses.slice(0, 72), controller.signal);
+        if (stopped) return;
+        const byJobId = new Map(payload.items.map((item) => [item.job_id, item]));
+        const merged: Record<string, HistoryPreviewEntry> = {};
+        await Promise.all(
+          misses.map(async (miss) => {
+            const item = byJobId.get(miss.job_id);
+            if (!item) {
+              merged[miss.job_id] = { loading: false, failed: true };
+              return;
+            }
+            const blob = base64ToBlob(item.data_base64, item.mime);
+            if (settings.cache.enabled) {
+              await imageCachePut(scope, settings.baseUrl, miss.job_id, miss.image_id, "preview", blob, settings.cache);
+            }
+            const url = URL.createObjectURL(blob);
+            revokeRef.current.push(url);
+            merged[miss.job_id] = { src: url, loading: false, failed: false };
+          })
+        );
+        if (!stopped) {
+          setPreviewMap((current) => ({ ...current, ...merged }));
+        }
+      } catch {
+        if (!stopped) {
+          setPreviewMap((current) => {
+            const next = { ...current };
+            misses.forEach((miss) => {
+              next[miss.job_id] = { loading: false, failed: true };
+            });
+            return next;
+          });
+        }
+      }
+    })();
+
+    return () => {
+      stopped = true;
+      controller.abort();
+    };
+  }, [
+    client,
+    recordsKey,
+    scope,
+    settings.baseUrl,
+    settings.cache.enabled,
+    settings.cache.maxBytes,
+    settings.cache.ttlDays,
+    targets,
+  ]);
+
+  return previewMap;
+}
+
 // -----------------------------
 // History Page
 // -----------------------------
 
-type SortKey = "latest" | "cost" | "latency";
+type SortKey = "created_desc" | "created_asc" | "duration_desc";
 
-type DateRange = "today" | "7d" | "custom" | "all";
+type DateRange = "today" | "7d" | "30d" | "custom" | "all";
+
+type HistoryDensity = "cozy" | "compact";
 
 type HistoryBatchGroup = {
   key: string;
@@ -6617,14 +7267,12 @@ type HistoryBatchGroup = {
 };
 
 function HistoryPage() {
-  const { push } = useToast();
   const client = useApiClient();
   const catalog = useModelCatalog();
-  const navigate = useNavigate();
   const settings = useSettingsStore((s) => s.settings);
   const jobs = useJobsStore((s) => s.jobs);
   const updateJob = useJobsStore((s) => s.updateJob);
-  const removeJob = useJobsStore((s) => s.removeJob);
+  const pickerSessions = usePickerStore((s) => s.sessions);
 
   const [searchParams, setSearchParams] = useSearchParams();
   const selectedJobId = searchParams.get("job");
@@ -6632,28 +7280,53 @@ function HistoryPage() {
 
   const [q, setQ] = useState("");
   const qd = useDebounced(q, 150);
-
   const [statusFilter, setStatusFilter] = useState<JobStatus | "ALL">("ALL");
   const [range, setRange] = useState<DateRange>("all");
   const [from, setFrom] = useState("");
   const [to, setTo] = useState("");
   const [modelFilter, setModelFilter] = useState<ModelId | "ALL">("ALL");
-  const [size, setSize] = useState<ImageSize | "ALL">("ALL");
-  const [aspect, setAspect] = useState<AspectRatio | "ALL">("ALL");
-  const [sort, setSort] = useState<SortKey>("latest");
+  const [batchFilter, setBatchFilter] = useState("ALL");
+  const [sessionFilter, setSessionFilter] = useState("ALL");
+  const [failedOnly, setFailedOnly] = useState(false);
+  const [density, setDensity] = useState<HistoryDensity>("cozy");
+  const [sort, setSort] = useState<SortKey>("created_desc");
   const [manualAutoRefresh, setManualAutoRefresh] = useState(false);
   const [disableActiveAutoRefresh, setDisableActiveAutoRefresh] = useState<boolean>(() =>
     safeJsonParse<boolean>(storageGet(KEY_HISTORY_AUTO_REFRESH_PREF), false)
   );
-  const [pageSize, setPageSize] = useState<number>(20);
-  const [page, setPage] = useState<number>(1);
-  const [progressNowMs, setProgressNowMs] = useState<number>(() => Date.now());
+  const [pageSize, setPageSize] = useState(24);
+  const [page, setPage] = useState(1);
+
+  const sessionNameById = useMemo(() => new Map(pickerSessions.map((session) => [session.session_id, session.name])), [pickerSessions]);
+  const jobSessionIds = useMemo(() => {
+    const map = new Map<string, Set<string>>();
+    jobs.forEach((job) => {
+      (job.linked_session_ids || []).forEach((sessionId) => {
+        if (!map.has(job.job_id)) map.set(job.job_id, new Set());
+        map.get(job.job_id)!.add(sessionId);
+      });
+    });
+    pickerSessions.forEach((session) => {
+      session.items.forEach((item) => {
+        if (!map.has(item.job_id)) map.set(item.job_id, new Set());
+        map.get(item.job_id)!.add(session.session_id);
+      });
+    });
+    return map;
+  }, [jobs, pickerSessions]);
+
+  const batchNames = useMemo(
+    () =>
+      Array.from(new Set(jobs.map((job) => job.batch_name).filter((name): name is string => Boolean(name))))
+        .sort((a, b) => a.localeCompare(b)),
+    [jobs]
+  );
 
   const filtered = useMemo(() => {
     const now = new Date();
     const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
     const d7 = new Date(daysAgoISO(7)).getTime();
-
+    const d30 = new Date(daysAgoISO(30)).getTime();
     const tokens = qd.trim().toLowerCase();
 
     const inDateRange = (j: JobRecord) => {
@@ -6661,6 +7334,7 @@ function HistoryPage() {
       if (!Number.isFinite(t)) return true;
       if (range === "today") return t >= todayStart;
       if (range === "7d") return t >= d7;
+      if (range === "30d") return t >= d30;
       if (range === "custom") {
         const a = from ? new Date(from).getTime() : -Infinity;
         const b = to ? new Date(to).getTime() + 24 * 3600 * 1000 - 1 : Infinity;
@@ -6673,7 +7347,23 @@ function HistoryPage() {
 
     if (tokens) {
       list = list.filter((j) => {
-        const hay = `${j.job_id} ${j.model_cache || ""} ${(j.prompt_preview || "")} ${(j.tags || []).join(" ")} ${j.batch_name || ""} ${j.batch_note || ""} ${j.section_title || ""} ${j.section_index || ""}`.toLowerCase();
+        const sessionNames = Array.from(jobSessionIds.get(j.job_id) || [])
+          .map((sessionId) => sessionNameById.get(sessionId) || "")
+          .join(" ");
+        const hay = [
+          j.job_id,
+          j.model_cache || "",
+          j.prompt_preview || "",
+          j.prompt_text || "",
+          j.batch_name || "",
+          j.batch_note || "",
+          j.section_title || "",
+          j.error_message_cache || "",
+          j.error_code_cache || "",
+          sessionNames,
+        ]
+          .join(" ")
+          .toLowerCase();
         return hay.includes(tokens);
       });
     }
@@ -6681,118 +7371,50 @@ function HistoryPage() {
     if (statusFilter !== "ALL") {
       list = list.filter((j) => (j.status_cache || "UNKNOWN") === statusFilter);
     }
-
     if (modelFilter !== "ALL") {
       list = list.filter((j) => (j.model_cache || "") === modelFilter);
     }
-
-    if (size !== "ALL") {
-      list = list.filter((j) => (j.params_cache?.image_size || "") === size);
+    if (batchFilter !== "ALL") {
+      list = list.filter((j) => (j.batch_name || "") === batchFilter);
     }
-
-    if (aspect !== "ALL") {
-      list = list.filter((j) => (j.params_cache?.aspect_ratio || "") === aspect);
+    if (sessionFilter !== "ALL") {
+      list = list.filter((j) => {
+        const ids = Array.from(jobSessionIds.get(j.job_id) || []);
+        if (sessionFilter === "NONE") return ids.length === 0;
+        return ids.includes(sessionFilter);
+      });
+    }
+    if (failedOnly) {
+      list = list.filter((j) => ["FAILED", "CANCELLED"].includes(j.status_cache || "UNKNOWN"));
     }
 
     list = list.filter(inDateRange);
-
-    // sort
-    if (sort === "latest") {
-      list.sort((a, b) => {
-        const ap = a.pinned ? 1 : 0;
-        const bp = b.pinned ? 1 : 0;
-        if (ap !== bp) return bp - ap;
-        return (new Date(b.created_at).getTime() || 0) - (new Date(a.created_at).getTime() || 0);
-      });
-    } else if (sort === "cost") {
-      // we only have cached fields; use status_cache for quick ordering; real cost shown in detail
-      // Put pinned on top still
-      list.sort((a, b) => {
-        const ap = a.pinned ? 1 : 0;
-        const bp = b.pinned ? 1 : 0;
-        if (ap !== bp) return bp - ap;
-        // fallback: newer first
-        return (new Date(b.created_at).getTime() || 0) - (new Date(a.created_at).getTime() || 0);
-      });
-    } else {
-      list.sort((a, b) => {
-        const ap = a.pinned ? 1 : 0;
-        const bp = b.pinned ? 1 : 0;
-        if (ap !== bp) return bp - ap;
+    list.sort((a, b) => {
+      if (sort === "created_asc") {
+        return (new Date(a.created_at).getTime() || 0) - (new Date(b.created_at).getTime() || 0);
+      }
+      if (sort === "duration_desc") {
         const ad = typeof a.run_duration_ms === "number" ? a.run_duration_ms : -1;
         const bd = typeof b.run_duration_ms === "number" ? b.run_duration_ms : -1;
         if (ad !== bd) return bd - ad;
-        return (new Date(b.created_at).getTime() || 0) - (new Date(a.created_at).getTime() || 0);
-      });
-    }
-
+      }
+      return (new Date(b.created_at).getTime() || 0) - (new Date(a.created_at).getTime() || 0);
+    });
     return list;
-  }, [jobs, qd, statusFilter, range, from, to, modelFilter, size, aspect, sort]);
+  }, [jobs, qd, statusFilter, range, from, to, modelFilter, batchFilter, sessionFilter, failedOnly, sort, jobSessionIds, sessionNameById]);
 
-  const hasActiveJobs = useMemo(
-    () => filtered.some((j) => isActiveJobStatus(j.status_cache || "UNKNOWN")),
-    [filtered]
-  );
+  const hasActiveJobs = useMemo(() => filtered.some((j) => isActiveJobStatus(j.status_cache || "UNKNOWN")), [filtered]);
   const autoRefresh = manualAutoRefresh || (hasActiveJobs && !disableActiveAutoRefresh);
-
-  const recentSuccessAvgDurationMs = useMemo(() => {
-    const succeeded = [...jobs]
-      .filter((j) => !j.deleted && (j.status_cache || "UNKNOWN") === "SUCCEEDED" && typeof j.run_duration_ms === "number")
-      .sort((a, b) => {
-        const at = new Date(a.run_finished_at || a.created_at).getTime() || 0;
-        const bt = new Date(b.run_finished_at || b.created_at).getTime() || 0;
-        return bt - at;
-      })
-      .slice(0, 10)
-      .map((j) => j.run_duration_ms as number)
-      .filter((v) => Number.isFinite(v) && v >= 0);
-    return succeeded.length ? mean(succeeded) : 45000;
-  }, [jobs]);
-
   const totalPages = Math.max(1, Math.ceil(filtered.length / pageSize));
   const safePage = clamp(page, 1, totalPages);
-  const pagedItems = useMemo(() => {
-    const start = (safePage - 1) * pageSize;
-    return filtered.slice(start, start + pageSize);
-  }, [filtered, safePage, pageSize]);
+  const pagedItems = useMemo(() => filtered.slice((safePage - 1) * pageSize, safePage * pageSize), [filtered, safePage, pageSize]);
+  const previewMap = useHistoryPreviewMap(pagedItems);
+  const pagedIdsKey = useMemo(() => pagedItems.map((item) => item.job_id).join("|"), [pagedItems]);
+  const filteredActiveCount = filtered.filter((j) => isActiveJobStatus(j.status_cache || "UNKNOWN")).length;
   const autoRefreshTargets = useMemo(() => {
-    if (hasActiveJobs) {
-      return filtered.filter((j) => isActiveJobStatus(j.status_cache || "UNKNOWN")).slice(0, 50);
-    }
-    return pagedItems.slice(0, Math.max(15, Math.min(pageSize, 50)));
+    if (hasActiveJobs) return filtered.filter((j) => isActiveJobStatus(j.status_cache || "UNKNOWN")).slice(0, 72);
+    return pagedItems.slice(0, Math.max(24, Math.min(pageSize, 72)));
   }, [hasActiveJobs, filtered, pagedItems, pageSize]);
-  const groupedPagedItems = useMemo<HistoryBatchGroup[]>(() => {
-    const grouped = new Map<string, HistoryBatchGroup>();
-    for (const rec of pagedItems) {
-      const batchId = rec.batch_id && (rec.batch_size || 0) > 1 ? rec.batch_id : null;
-      const key = batchId ? `batch:${batchId}` : `single:${rec.job_id}`;
-      const found = grouped.get(key);
-      if (found) {
-        found.items.push(rec);
-      } else {
-        grouped.set(key, { key, batchId, items: [rec] });
-      }
-    }
-    return Array.from(grouped.values()).map((group) => ({
-      ...group,
-      items: [...group.items].sort((a, b) => {
-        const ai = typeof a.batch_index === "number" ? a.batch_index : Number.MAX_SAFE_INTEGER;
-        const bi = typeof b.batch_index === "number" ? b.batch_index : Number.MAX_SAFE_INTEGER;
-        if (ai !== bi) return ai - bi;
-        return (new Date(a.created_at).getTime() || 0) - (new Date(b.created_at).getTime() || 0);
-      }),
-    }));
-  }, [pagedItems]);
-  const batchedGroupCount = useMemo(
-    () => groupedPagedItems.filter((g) => g.batchId && g.items.length > 1).length,
-    [groupedPagedItems]
-  );
-  const batchedJobCount = useMemo(
-    () => groupedPagedItems
-      .filter((g) => g.batchId && g.items.length > 1)
-      .reduce((sum, g) => sum + g.items.length, 0),
-    [groupedPagedItems]
-  );
 
   useEffect(() => {
     if (page !== safePage) setPage(safePage);
@@ -6800,17 +7422,104 @@ function HistoryPage() {
 
   useEffect(() => {
     setPage(1);
-  }, [qd, statusFilter, range, from, to, modelFilter, size, aspect, sort, pageSize]);
+  }, [qd, statusFilter, range, from, to, modelFilter, batchFilter, sessionFilter, failedOnly, sort, density, pageSize]);
 
   useEffect(() => {
     storageSet(KEY_HISTORY_AUTO_REFRESH_PREF, JSON.stringify(disableActiveAutoRefresh));
   }, [disableActiveAutoRefresh]);
 
   useEffect(() => {
-    if (!hasActiveJobs) return;
-    const t = setInterval(() => setProgressNowMs(Date.now()), 500);
-    return () => clearInterval(t);
-  }, [hasActiveJobs]);
+    if (!pagedItems.length) return;
+    const controller = new AbortController();
+    const refs: JobAccessRef[] = pagedItems.map((rec) => ({ job_id: rec.job_id, job_access_token: rec.job_access_token }));
+    client
+      .batchMeta(refs, ["job_id", "status", "model", "created_at", "updated_at", "params", "timing", "error", "result"], controller.signal)
+      .then((batch) => {
+        (batch.items || []).forEach((item) => {
+          updateJob(item.job_id, {
+            created_at: item.meta?.created_at || pagedItems.find((rec) => rec.job_id === item.job_id)?.created_at || isoNow(),
+            ...jobMetaCachePatch(item.meta),
+          });
+        });
+      })
+      .catch(() => null);
+    return () => controller.abort();
+  }, [client, pagedIdsKey, updateJob]);
+
+  useEffect(() => {
+    if (!autoRefresh) return;
+    const controller = new AbortController();
+    const tick = async () => {
+      if (!autoRefreshTargets.length) return;
+      const refs: JobAccessRef[] = autoRefreshTargets.map((rec) => ({
+        job_id: rec.job_id,
+        job_access_token: rec.job_access_token,
+      }));
+      const applySnap = (snap: JobStatusSnapshot) => {
+        const rec = autoRefreshTargets.find((item) => item.job_id === snap.job_id);
+        updateJob(snap.job_id, {
+          status_cache: (snap.status || rec?.status_cache || "UNKNOWN") as JobStatus,
+          model_cache: (snap.model as ModelId) || rec?.model_cache,
+          last_seen_at: isoNow(),
+          ...jobTimingPatch({ job_id: snap.job_id, timing: snap.timing || {} } as JobMeta),
+        });
+      };
+
+      try {
+        const payload = await client.activeJobs(refs, 120, controller.signal);
+        (payload.active || []).forEach(applySnap);
+        (payload.settled || []).forEach(applySnap);
+        return;
+      } catch {
+        // ignore and fallback
+      }
+
+      try {
+        const batch = await client.batchMeta(refs, ["job_id", "status", "model", "timing", "error", "result"], controller.signal);
+        (batch.items || []).forEach((item) => {
+          updateJob(item.job_id, {
+            last_seen_at: isoNow(),
+            ...jobMetaCachePatch(item.meta),
+          });
+        });
+      } catch {
+        await mapLimit(autoRefreshTargets, clamp(settings.polling.concurrency || 5, 1, 12), async (rec) => {
+          try {
+            const meta = await client.getJob(rec.job_id, rec.job_access_token, controller.signal);
+            updateJob(rec.job_id, {
+              last_seen_at: isoNow(),
+              ...jobMetaCachePatch(meta),
+            });
+          } catch {
+            // ignore
+          }
+        });
+      }
+    };
+
+    tick();
+    const timer = window.setInterval(tick, clamp(settings.polling.intervalMs || 1200, 300, 10000));
+    return () => {
+      controller.abort();
+      window.clearInterval(timer);
+    };
+  }, [autoRefresh, autoRefreshTargets, client, settings.polling.concurrency, settings.polling.intervalMs, updateJob]);
+
+  const openJob = (jobId: string) => {
+    setSearchParams((prev) => {
+      const next = new URLSearchParams(prev);
+      next.set("job", jobId);
+      return next;
+    });
+  };
+
+  const closeJob = () => {
+    setSearchParams((prev) => {
+      const next = new URLSearchParams(prev);
+      next.delete("job");
+      return next;
+    });
+  };
 
   const onToggleAutoRefresh = (next: boolean) => {
     if (hasActiveJobs) {
@@ -6825,334 +7534,207 @@ function HistoryPage() {
     setManualAutoRefresh(next);
   };
 
-  // Auto refresh statuses with batch API.
-  useEffect(() => {
-    if (!autoRefresh) return;
-
-    const controller = new AbortController();
-    const tick = async () => {
-      if (!autoRefreshTargets.length) return;
-
-      const refs: JobAccessRef[] = autoRefreshTargets.map((rec) => ({
-        job_id: rec.job_id,
-        job_access_token: rec.job_access_token,
-      }));
-
-      const applySnap = (snap: JobStatusSnapshot) => {
-        const rec = autoRefreshTargets.find((x) => x.job_id === snap.job_id);
-        updateJob(snap.job_id, {
-          status_cache: (snap.status || rec?.status_cache || "UNKNOWN") as JobStatus,
-          model_cache: (snap.model as ModelId) || rec?.model_cache,
-          last_seen_at: isoNow(),
-          ...jobTimingPatch({ job_id: snap.job_id, timing: snap.timing || {} } as JobMeta),
-        });
-      };
-
-      try {
-        const payload = await client.activeJobs(refs, 100, controller.signal);
-        (payload.active || []).forEach(applySnap);
-        (payload.settled || []).forEach(applySnap);
-        return;
-      } catch {
-        // backward compatibility: old backend without active batch endpoint
-      }
-
-      try {
-        const batch = await client.batchMeta(refs, ["job_id", "status", "model", "timing"], controller.signal);
-        (batch.items || []).forEach((it) => {
-          applySnap({
-            job_id: it.job_id,
-            status: it.meta?.status,
-            model: it.meta?.model,
-            timing: it.meta?.timing,
-          });
-        });
-        return;
-      } catch {
-        // backward compatibility: old backend without batch endpoint
-      }
-
-      await mapLimit(autoRefreshTargets, clamp(settings.polling.concurrency || 5, 1, 12), async (rec) => {
-        try {
-          const meta = await client.getJob(rec.job_id, rec.job_access_token, controller.signal);
-          updateJob(rec.job_id, {
-            status_cache: (meta.status || "UNKNOWN") as JobStatus,
-            model_cache: (meta.model as ModelId) || rec.model_cache,
-            last_seen_at: isoNow(),
-            ...jobTimingPatch(meta),
-          });
-        } catch {
-          // ignore
-        }
-      });
-    };
-
-    tick();
-    const t = setInterval(tick, clamp(settings.polling.intervalMs || 1200, 300, 10000));
-    return () => {
-      controller.abort();
-      clearInterval(t);
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [autoRefresh, autoRefreshTargets, settings.baseUrl, settings.polling.intervalMs, settings.polling.concurrency]);
-
-  const selectJob = (id: string) => {
-    setSearchParams((prev) => {
-      const next = new URLSearchParams(prev);
-      next.set("job", id);
-      return next;
-    });
-  };
-
-  const onDeleteLocal = (id: string) => {
-    removeJob(id);
-    push({ kind: "success", title: "已删除本地记录" });
-    if (selectedJobId === id) {
-      setSearchParams((prev) => {
-        const next = new URLSearchParams(prev);
-        next.delete("job");
-        return next;
-      });
-    }
-  };
-
-  const onTogglePin = (id: string, v: boolean) => {
-    updateJob(id, { pinned: v });
-  };
-
-  const onAddTag = (id: string) => {
-    const tag = prompt("输入 tag（逗号分隔可多标签）：");
-    if (!tag) return;
-    const tags = tag
-      .split(",")
-      .map((x) => x.trim())
-      .filter(Boolean);
-    const cur = jobs.find((j) => j.job_id === id);
-    const next = Array.from(new Set([...(cur?.tags || []), ...tags]));
-    updateJob(id, { tags: next });
-    push({ kind: "success", title: "已添加标签" });
-  };
-
-  const filteredActiveCount = filtered.filter((j) => isActiveJobStatus(j.status_cache || "UNKNOWN")).length;
-  const pageFrom = filtered.length ? (safePage - 1) * pageSize + 1 : 0;
-  const pageTo = Math.min(filtered.length, safePage * pageSize);
+  const galleryCols =
+    density === "compact"
+      ? "grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-4"
+      : "grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-4";
 
   return (
-    <PageContainer>
+    <PageContainer className="max-w-[1880px] px-5 2xl:px-8">
       <PageTitle
         title="History"
-        subtitle="只读浏览器本地历史（localStorage）。支持按同批次创建任务聚合展示，便于快速识别同一套 Prompt 的多 job。"
-        right={
-          <div className="flex items-center gap-2">
-            <div className="flex items-center gap-2 rounded-2xl border border-zinc-200 bg-white/60 px-3 py-2 text-sm dark:border-white/10 dark:bg-zinc-900/40">
-              <span className="text-xs font-semibold text-zinc-600 dark:text-zinc-300">自动刷新</span>
-              <Switch value={autoRefresh} onChange={onToggleAutoRefresh} />
-              {hasActiveJobs ? (
-                <span className="rounded-full bg-emerald-500/15 px-2 py-0.5 text-[10px] font-bold text-emerald-700 dark:text-emerald-200">
-                  RUNNING 默认开启
-                </span>
-              ) : null}
-            </div>
-          </div>
-        }
+        subtitle="本地历史画廊。支持批次识别、全文搜索、筛选和 Notion 风格详情模态。"
       />
 
-      <div className="grid grid-cols-1 gap-3 xl:grid-cols-[320px_minmax(0,1fr)]">
-        <Card className="h-fit xl:sticky xl:top-20">
-          <div className="text-sm font-bold text-zinc-900 dark:text-zinc-50">筛选</div>
-          <div className="mt-3 space-y-3">
-            <Field label="搜索（prompt / tag / job_id / batch / section）">
-              <Input value={q} onChange={setQ} placeholder="输入关键词…" />
+      <div className="grid grid-cols-1 gap-5 xl:grid-cols-[248px_minmax(0,1fr)_208px] 2xl:grid-cols-[260px_minmax(0,1fr)_220px]">
+        <Card className="h-fit xl:sticky xl:top-24" hover={false}>
+          <div className="text-xs font-semibold uppercase tracking-[0.18em] text-zinc-500 dark:text-zinc-400">Browse</div>
+          <div className="mt-2 text-lg font-bold text-zinc-900 dark:text-zinc-50">Search & Filter</div>
+          <div className="mt-4 space-y-3">
+            <Field label="Search">
+              <Input testId="history-search" value={q} onChange={setQ} placeholder="job id / prompt / batch / section / error / model" />
             </Field>
-
-            <div className="grid grid-cols-2 gap-3">
-              <Field label="状态">
-                <Select
-                  value={statusFilter}
-                  onChange={(v) => setStatusFilter(v as any)}
-                  options={[
-                    { value: "ALL", label: "全部" },
-                    { value: "SUCCEEDED", label: "SUCCEEDED" },
-                    { value: "FAILED", label: "FAILED" },
-                    { value: "RUNNING", label: "RUNNING" },
-                    { value: "QUEUED", label: "QUEUED" },
-                  ]}
-                />
-              </Field>
-              <Field label="日期范围">
-                <Select
-                  value={range}
-                  onChange={(v) => setRange(v as any)}
-                  options={[
-                    { value: "all", label: "全部" },
-                    { value: "today", label: "今天" },
-                    { value: "7d", label: "近 7 天" },
-                    { value: "custom", label: "自定义" },
-                  ]}
-                />
-              </Field>
-            </div>
-
-            {range === "custom" ? (
-              <div className="grid grid-cols-2 gap-3">
-                <Field label="From">
-                  <Input value={from} onChange={setFrom} type="date" />
-                </Field>
-                <Field label="To">
-                  <Input value={to} onChange={setTo} type="date" />
-                </Field>
-              </div>
-            ) : null}
-
-            <div className="grid grid-cols-2 gap-3">
-              <Field label="model">
-                <Select
-                  value={String(modelFilter)}
-                  onChange={(v) => setModelFilter(v as any)}
-                  options={[
-                    { value: "ALL", label: "全部" },
-                    ...catalog.models.map((m) => ({ value: m.model_id, label: m.label })),
-                  ]}
-                />
-              </Field>
-              <Field label="image_size">
-                <Select
-                  value={String(size)}
-                  onChange={(v) => setSize(v as any)}
-                  options={[
-                    { value: "ALL", label: "全部" },
-                    { value: "AUTO", label: "AUTO" },
-                    { value: "512", label: "512" },
-                    { value: "1K", label: "1K" },
-                    { value: "2K", label: "2K" },
-                    { value: "4K", label: "4K" },
-                  ]}
-                />
-              </Field>
-              <Field label="aspect_ratio">
-                <Select
-                  value={String(aspect)}
-                  onChange={(v) => setAspect(v as any)}
-                  options={[
-                    { value: "ALL", label: "全部" },
-                    { value: "1:1", label: "1:1" },
-                    { value: "1:4", label: "1:4" },
-                    { value: "1:8", label: "1:8" },
-                    { value: "4:1", label: "4:1" },
-                    { value: "8:1", label: "8:1" },
-                    { value: "21:9", label: "21:9" },
-                    { value: "4:3", label: "4:3" },
-                    { value: "3:4", label: "3:4" },
-                    { value: "16:9", label: "16:9" },
-                    { value: "9:16", label: "9:16" },
-                    { value: "2:3", label: "2:3" },
-                    { value: "3:2", label: "3:2" },
-                    { value: "4:5", label: "4:5" },
-                    { value: "5:4", label: "5:4" },
-                  ]}
-                />
-              </Field>
-            </div>
-
-            <Field label="排序">
+            <Field label="Status">
               <Select
-                value={sort}
-                onChange={(v) => setSort(v as any)}
+                testId="history-status-filter"
+                value={statusFilter}
+                onChange={(v) => setStatusFilter(v as JobStatus | "ALL")}
                 options={[
-                  { value: "latest", label: "最新" },
-                  { value: "cost", label: "成本优先" },
-                  { value: "latency", label: "最耗时" },
+                  { value: "ALL", label: "All Statuses" },
+                  { value: "QUEUED", label: "Queued" },
+                  { value: "RUNNING", label: "Running" },
+                  { value: "SUCCEEDED", label: "Success" },
+                  { value: "FAILED", label: "Failed" },
+                  { value: "CANCELLED", label: "Cancelled" },
                 ]}
               />
             </Field>
-
-            <Divider />
-
-            <div className="text-xs text-zinc-500 dark:text-zinc-400">
-              说明：后端不提供用户级历史列表，列表完全来自浏览器 localStorage。
+            <Field label="Model">
+              <Select
+                testId="history-model-filter"
+                value={String(modelFilter)}
+                onChange={(v) => setModelFilter(v as ModelId | "ALL")}
+                options={[
+                  { value: "ALL", label: "All Models" },
+                  ...catalog.models.map((m) => ({ value: m.model_id, label: m.label })),
+                ]}
+              />
+            </Field>
+            <Field label="Date Range">
+              <Select
+                testId="history-range-filter"
+                value={range}
+                onChange={(v) => setRange(v as DateRange)}
+                options={[
+                  { value: "all", label: "All Time" },
+                  { value: "today", label: "Today" },
+                  { value: "7d", label: "Last 7 Days" },
+                  { value: "30d", label: "Last 30 Days" },
+                  { value: "custom", label: "Custom" },
+                ]}
+              />
+            </Field>
+            {range === "custom" ? (
+              <div className="grid grid-cols-2 gap-3">
+                <Field label="From">
+                  <Input testId="history-range-from" value={from} onChange={setFrom} type="date" />
+                </Field>
+                <Field label="To">
+                  <Input testId="history-range-to" value={to} onChange={setTo} type="date" />
+                </Field>
+              </div>
+            ) : null}
+            <Field label="Batch">
+              <Select
+                testId="history-batch-filter"
+                value={batchFilter}
+                onChange={setBatchFilter}
+                options={[
+                  { value: "ALL", label: "All Batches" },
+                  ...batchNames.map((name) => ({ value: name, label: name })),
+                ]}
+              />
+            </Field>
+            <Field label="Session">
+              <Select
+                testId="history-session-filter"
+                value={sessionFilter}
+                onChange={setSessionFilter}
+                options={[
+                  { value: "ALL", label: "All Sessions" },
+                  { value: "NONE", label: "No Session" },
+                  ...pickerSessions.map((session) => ({ value: session.session_id, label: session.name })),
+                ]}
+              />
+            </Field>
+            <Field label="Sort">
+              <Select
+                testId="history-sort-filter"
+                value={sort}
+                onChange={(v) => setSort(v as SortKey)}
+                options={[
+                  { value: "created_desc", label: "Created Desc" },
+                  { value: "created_asc", label: "Created Asc" },
+                  { value: "duration_desc", label: "Longest First" },
+                ]}
+              />
+            </Field>
+            <Field label="Density">
+              <Select
+                testId="history-density-filter"
+                value={density}
+                onChange={(v) => setDensity(v as HistoryDensity)}
+                options={[
+                  { value: "cozy", label: "Cozy" },
+                  { value: "compact", label: "Compact" },
+                ]}
+              />
+            </Field>
+            <div className="flex items-center justify-between rounded-2xl border border-zinc-200 bg-zinc-50/80 px-3 py-2 dark:border-white/10 dark:bg-zinc-950/30">
+              <div>
+                <div className="text-sm font-semibold text-zinc-900 dark:text-zinc-50">Only Failed</div>
+                <div className="text-[11px] text-zinc-500 dark:text-zinc-400">Failed + cancelled</div>
+              </div>
+              <Switch testId="history-failed-only" value={failedOnly} onChange={setFailedOnly} />
+            </div>
+            <div className="flex items-center justify-between rounded-2xl border border-zinc-200 bg-zinc-50/80 px-3 py-2 dark:border-white/10 dark:bg-zinc-950/30">
+              <div>
+                <div className="text-sm font-semibold text-zinc-900 dark:text-zinc-50">Auto Refresh</div>
+                <div className="text-[11px] text-zinc-500 dark:text-zinc-400">Keep running/queued cards fresh</div>
+              </div>
+              <Switch testId="history-auto-refresh" value={autoRefresh} onChange={onToggleAutoRefresh} />
             </div>
           </div>
         </Card>
 
-        <div className="space-y-3">
-          <Card className="p-3">
-            <div className="flex flex-wrap items-center justify-between gap-3">
-              <div className="flex flex-wrap items-center gap-3 text-xs text-zinc-600 dark:text-zinc-300">
-                <span className="rounded-full border border-zinc-200 bg-white/60 px-2 py-1 dark:border-white/10 dark:bg-zinc-900/40">
-                  总计 {filtered.length} 条
-                </span>
-                <span className="rounded-full border border-zinc-200 bg-white/60 px-2 py-1 dark:border-white/10 dark:bg-zinc-900/40">
-                  活跃 {filteredActiveCount} 条
-                </span>
-                <span className="rounded-full border border-zinc-200 bg-white/60 px-2 py-1 dark:border-white/10 dark:bg-zinc-900/40">
-                  平均耗时(近10成功) {formatDurationMs(recentSuccessAvgDurationMs)}
-                </span>
-                <span className="rounded-full border border-sky-200 bg-sky-50/80 px-2 py-1 text-sky-700 dark:border-sky-800/60 dark:bg-sky-950/40 dark:text-sky-200">
-                  同批生成 {batchedGroupCount} 组 / {batchedJobCount} 条
-                </span>
-                <span className="rounded-full border border-zinc-200 bg-white/60 px-2 py-1 dark:border-white/10 dark:bg-zinc-900/40">
-                  当前 {pageFrom}-{pageTo}
-                </span>
-              </div>
-              <div className="flex flex-wrap items-center gap-2">
-                <Select
-                  value={String(pageSize)}
-                  onChange={(v) => setPageSize(clamp(Number(v), 10, 100))}
-                  options={[
-                    { value: "10", label: "10 / 页" },
-                    { value: "20", label: "20 / 页" },
-                    { value: "50", label: "50 / 页" },
-                    { value: "100", label: "100 / 页" },
-                  ]}
-                  className="!w-24"
-                />
-                <Button variant="ghost" onClick={() => setPage((p) => clamp(p - 1, 1, totalPages))} disabled={safePage <= 1}>
-                  上一页
-                </Button>
-                <span className="text-xs font-semibold text-zinc-600 dark:text-zinc-300">
-                  {safePage} / {totalPages}
-                </span>
-                <Button variant="ghost" onClick={() => setPage((p) => clamp(p + 1, 1, totalPages))} disabled={safePage >= totalPages}>
-                  下一页
-                </Button>
-              </div>
+        <div className="space-y-4">
+          <Card hover={false} className="rounded-[28px] px-4 py-3">
+            <div className="flex flex-wrap items-center gap-2 text-xs text-zinc-600 dark:text-zinc-300">
+              <span className="rounded-full border border-zinc-200 bg-white px-3 py-1 dark:border-white/10 dark:bg-zinc-950/40">Total {filtered.length}</span>
+              <span className="rounded-full border border-zinc-200 bg-white px-3 py-1 dark:border-white/10 dark:bg-zinc-950/40">Active {filteredActiveCount}</span>
+              <span className="rounded-full border border-zinc-200 bg-white px-3 py-1 dark:border-white/10 dark:bg-zinc-950/40">Page {safePage} / {totalPages}</span>
+              <span className="rounded-full border border-zinc-200 bg-white px-3 py-1 dark:border-white/10 dark:bg-zinc-950/40">
+                Showing {filtered.length ? (safePage - 1) * pageSize + 1 : 0}-{Math.min(filtered.length, safePage * pageSize)}
+              </span>
             </div>
           </Card>
 
-          <div className="grid grid-cols-1 gap-3 2xl:grid-cols-[minmax(360px,420px)_minmax(0,1fr)]">
-            <Card>
-              <div className="flex items-center justify-between">
-                <div className="text-sm font-bold text-zinc-900 dark:text-zinc-50">任务列表</div>
-                <div className="text-xs text-zinc-500 dark:text-zinc-400">
-                  第 {safePage} 页 · {pagedItems.length} 条
-                </div>
-              </div>
-              <Divider />
-              <JobList
-                groups={groupedPagedItems}
-                selectedId={selectedJobId}
-                onSelect={selectJob}
-                onDeleteLocal={onDeleteLocal}
-                onTogglePin={onTogglePin}
-                onAddTag={onAddTag}
-                onAddToPicker={(id) => navigate(`/picker?job=${encodeURIComponent(id)}`)}
-                progressNowMs={progressNowMs}
-                avgDurationMs={recentSuccessAvgDurationMs}
-              />
+          {pagedItems.length ? (
+            <div className={cn("grid gap-5", galleryCols)}>
+              {pagedItems.map((rec) => (
+                <HistoryGalleryCard
+                  key={rec.job_id}
+                  rec={rec}
+                  density={density}
+                  preview={previewMap[rec.job_id]}
+                  onOpen={() => openJob(rec.job_id)}
+                />
+              ))}
+            </div>
+          ) : (
+            <Card hover={false}>
+              <EmptyHint text="没有匹配的历史任务" />
             </Card>
-
-            <Card>
-              <div className="text-sm font-bold text-zinc-900 dark:text-zinc-50">详情</div>
-              <Divider />
-              {selectedRec ? (
-                <JobDetail rec={selectedRec} onUpdateToken={(tok) => updateJob(selectedRec.job_id, { job_access_token: tok })} />
-              ) : (
-                <EmptyHint text="从列表中选择一个 job" />
-              )}
-            </Card>
-          </div>
+          )}
         </div>
+
+        <Card className="h-fit xl:sticky xl:top-24" hover={false}>
+          <div className="text-xs font-semibold uppercase tracking-[0.18em] text-zinc-500 dark:text-zinc-400">Pager</div>
+          <div className="mt-2 text-lg font-bold text-zinc-900 dark:text-zinc-50">Page Controls</div>
+          <div className="mt-4 space-y-3">
+            <Field label="Per Page">
+              <Select
+                testId="history-page-size"
+                value={String(pageSize)}
+                onChange={(v) => setPageSize(clamp(Number(v), 24, 72))}
+                options={[
+                  { value: "24", label: "24" },
+                  { value: "48", label: "48" },
+                  { value: "72", label: "72" },
+                ]}
+              />
+            </Field>
+            <div className="rounded-2xl border border-zinc-200 bg-zinc-50/80 p-3 dark:border-white/10 dark:bg-zinc-950/30">
+              <div className="text-sm font-semibold text-zinc-900 dark:text-zinc-50">Totals</div>
+              <div className="mt-2 space-y-1 text-sm text-zinc-600 dark:text-zinc-300">
+                <div>Total cards: {filtered.length}</div>
+                <div>Current page: {safePage}</div>
+                <div>Total pages: {totalPages}</div>
+              </div>
+            </div>
+            <div className="grid grid-cols-2 gap-2">
+              <Button testId="history-prev-page" variant="ghost" onClick={() => setPage((p) => clamp(p - 1, 1, totalPages))} disabled={safePage <= 1}>
+                Prev
+              </Button>
+              <Button testId="history-next-page" variant="ghost" onClick={() => setPage((p) => clamp(p + 1, 1, totalPages))} disabled={safePage >= totalPages}>
+                Next
+              </Button>
+            </div>
+          </div>
+        </Card>
       </div>
+
+      <HistoryDetailModal rec={selectedRec} onClose={closeJob} />
     </PageContainer>
   );
 }
@@ -7373,15 +7955,225 @@ function JobList({
   );
 }
 
-function JobDetail({ rec, onUpdateToken }: { rec: JobRecord; onUpdateToken: (tok: string) => void }) {
+function HistoryGalleryCard({
+  rec,
+  density,
+  preview,
+  onOpen,
+}: {
+  rec: JobRecord;
+  density: HistoryDensity;
+  preview?: HistoryPreviewEntry;
+  onOpen: () => void;
+}) {
+  const status = rec.status_cache || "UNKNOWN";
+  const reason = summarizeQueueOrFailure(null, rec);
+  const previewHeight = density === "compact" ? "aspect-square" : "aspect-[4/5]";
+
+  return (
+    <button
+      type="button"
+      onClick={onOpen}
+      data-testid="history-card"
+      className="group overflow-hidden rounded-[28px] border border-zinc-200/90 bg-white text-left shadow-sm transition hover:-translate-y-1 hover:shadow-xl dark:border-white/10 dark:bg-zinc-950/60"
+    >
+      <div className="relative">
+        <HistoryPreviewTile rec={rec} preview={preview} className={previewHeight} />
+        <div className="pointer-events-none absolute inset-x-0 top-0 flex items-start justify-between gap-2 p-3">
+          {rec.batch_name ? (
+            <span className="max-w-[72%] truncate rounded-full bg-white/90 px-2.5 py-1 text-[10px] font-semibold text-emerald-700 shadow-sm backdrop-blur dark:bg-zinc-950/80 dark:text-emerald-200">
+              {rec.batch_name}
+            </span>
+          ) : <span />}
+          <Badge status={status} />
+        </div>
+      </div>
+      <div className="space-y-2.5 px-3.5 py-3">
+        <div className="flex items-center justify-between gap-3 text-[11px] text-zinc-500 dark:text-zinc-400">
+          <span className="truncate">{formatLocal(rec.created_at)}</span>
+          <span className="truncate font-mono">{shortId(rec.job_id, 6)}</span>
+        </div>
+        <div className="line-clamp-2 text-sm font-semibold leading-5 text-zinc-900 dark:text-zinc-50">
+          {rec.prompt_preview || shortId(rec.job_id)}
+        </div>
+        <div className="line-clamp-2 min-h-[2rem] text-[11px] leading-5 text-zinc-500 dark:text-zinc-400">
+          {reason || (rec.section_title ? `Section · ${rec.section_title}` : `job_id · ${shortId(rec.job_id, 8)}`)}
+        </div>
+      </div>
+    </button>
+  );
+}
+
+function HistoryPreviewTile({
+  rec,
+  preview,
+  className,
+}: {
+  rec: JobRecord;
+  preview?: HistoryPreviewEntry;
+  className?: string;
+}) {
+  const [imageReady, setImageReady] = useState(false);
+  const status = rec.status_cache || "UNKNOWN";
+  const src = preview?.src || "";
+  const loadFailed = Boolean(preview?.failed);
+
+  useEffect(() => {
+    setImageReady(false);
+  }, [src]);
+
+  if (status === "SUCCEEDED" && src) {
+    return (
+      <div className={cn("relative overflow-hidden bg-[linear-gradient(145deg,rgba(250,250,249,0.95),rgba(228,228,231,0.7))] dark:bg-[linear-gradient(145deg,rgba(24,24,27,0.95),rgba(39,39,42,0.75))]", className)}>
+        <div className="absolute inset-0 bg-[radial-gradient(circle_at_top,_rgba(255,255,255,0.8),_transparent_55%)] dark:bg-[radial-gradient(circle_at_top,_rgba(255,255,255,0.08),_transparent_55%)]" />
+        <div className="relative flex h-full items-center justify-center p-4">
+          <img
+            src={src}
+            alt={rec.prompt_preview || rec.job_id}
+            className={cn(
+              "h-full w-full object-contain transition duration-300",
+              imageReady ? "opacity-100" : "opacity-0"
+            )}
+            onLoad={() => setImageReady(true)}
+            onError={() => {
+              setLoadFailed(true);
+              setSrc("");
+            }}
+          />
+          {!imageReady ? (
+            <div className="absolute inset-0 flex items-center justify-center">
+              <LoadingSpinner label="Loading preview" tone="brand" />
+            </div>
+          ) : null}
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className={cn("relative flex w-full items-center justify-center overflow-hidden bg-zinc-100 dark:bg-zinc-900", className)}>
+      <div className="absolute inset-0 bg-[radial-gradient(circle_at_top,_rgba(255,255,255,0.75),_transparent_55%),linear-gradient(135deg,rgba(24,24,27,0.08),rgba(24,24,27,0.02))] dark:bg-[radial-gradient(circle_at_top,_rgba(255,255,255,0.08),_transparent_55%),linear-gradient(135deg,rgba(255,255,255,0.04),rgba(255,255,255,0.01))]" />
+      {status === "RUNNING" ? (
+        <div className="relative z-10 flex flex-col items-center gap-3 text-sky-700 dark:text-sky-200">
+          <LoadingSpinner tone="sky" />
+          <div className="text-xs font-semibold">Generating</div>
+        </div>
+      ) : status === "QUEUED" ? (
+        <div className="relative z-10 flex flex-col items-center gap-2 text-amber-700 dark:text-amber-200">
+          <div className="rounded-full border border-amber-300 bg-white/70 px-3 py-1 text-lg dark:border-amber-700/60 dark:bg-amber-950/30">Q</div>
+          <div className="text-xs font-semibold">Queued</div>
+        </div>
+      ) : status === "FAILED" ? (
+        <div className="relative z-10 flex flex-col items-center gap-2 text-rose-700 dark:text-rose-200">
+          <div className="rounded-full border border-rose-300 bg-white/70 px-3 py-1 text-lg dark:border-rose-800/60 dark:bg-rose-950/30">!</div>
+          <div className="text-xs font-semibold">Failed</div>
+        </div>
+      ) : status === "CANCELLED" ? (
+        <div className="relative z-10 flex flex-col items-center gap-2 text-orange-700 dark:text-orange-200">
+          <div className="rounded-full border border-orange-300 bg-white/70 px-3 py-1 text-lg dark:border-orange-800/60 dark:bg-orange-950/30">×</div>
+          <div className="text-xs font-semibold">Cancelled</div>
+        </div>
+      ) : loadFailed ? (
+        <div className="relative z-10 text-xs font-semibold text-zinc-500 dark:text-zinc-400">Preview unavailable</div>
+      ) : (
+        <div className="relative z-10">
+          <LoadingSpinner label={preview?.loading ? "Loading preview" : "Preparing preview"} />
+        </div>
+      )}
+    </div>
+  );
+}
+
+function HistoryDetailModal({ rec, onClose }: { rec: JobRecord | null; onClose: () => void }) {
+  const navigate = useNavigate();
+
+  useEffect(() => {
+    if (!rec) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose, rec]);
+
+  return (
+    <AnimatePresence>
+      {rec ? (
+        <motion.div
+          className="fixed inset-0 z-50"
+          initial={{ opacity: 0 }}
+          animate={{ opacity: 1 }}
+          exit={{ opacity: 0 }}
+        >
+          <motion.button
+            type="button"
+            aria-label="Close history detail overlay"
+            data-testid="history-detail-backdrop"
+            className="absolute inset-0 bg-black/60 backdrop-blur-sm"
+            onClick={onClose}
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+          />
+          <div className="pointer-events-none relative z-10 flex h-full items-start justify-center overflow-y-auto px-4 py-10">
+          <motion.div
+            initial={{ opacity: 0, y: 20, scale: 0.98 }}
+            animate={{ opacity: 1, y: 0, scale: 1 }}
+            exit={{ opacity: 0, y: 20, scale: 0.98 }}
+            transition={{ duration: 0.2 }}
+            className="pointer-events-auto w-full max-w-6xl rounded-[32px] border border-white/20 bg-[#f8f6f1] p-5 shadow-2xl dark:border-white/10 dark:bg-zinc-950"
+            role="dialog"
+            aria-modal="true"
+            aria-label="History detail modal"
+            onClick={(e) => e.stopPropagation()}
+          >
+              <div className="mb-4 flex items-center justify-between gap-3 border-b border-zinc-200/80 pb-4 dark:border-white/10">
+                <div>
+                  <div className="text-xs font-semibold uppercase tracking-[0.2em] text-zinc-500 dark:text-zinc-400">Task Detail</div>
+                  <div className="mt-1 text-lg font-bold text-zinc-900 dark:text-zinc-50">{rec.prompt_preview || rec.job_id}</div>
+              </div>
+              <Button variant="ghost" onClick={onClose}>
+                Close
+              </Button>
+            </div>
+            <JobDetail
+              rec={rec}
+              onNavigateToCreate={() => {
+                onClose();
+                window.setTimeout(() => navigate("/create"), 0);
+              }}
+              onUpdateToken={(tok) => useJobsStore.getState().updateJob(rec.job_id, { job_access_token: tok })}
+            />
+          </motion.div>
+          </div>
+        </motion.div>
+      ) : null}
+    </AnimatePresence>
+  );
+}
+
+function JobDetail({
+  rec,
+  onUpdateToken,
+  onNavigateToCreate,
+}: {
+  rec: JobRecord;
+  onUpdateToken: (tok: string) => void;
+  onNavigateToCreate?: () => void;
+}) {
   const client = useApiClient();
   const { runWithImageAccessTurnstile } = useImageAccessGuard();
   const { push } = useToast();
   const navigate = useNavigate();
   const settings = useSettingsStore((s) => s.settings);
   const updateJob = useJobsStore((s) => s.updateJob);
+  const pickerSessions = usePickerStore((s) => s.sessions);
+  const createPickerSession = usePickerStore((s) => s.createSession);
+  const addPickerItems = usePickerStore((s) => s.addItems);
+  const { user } = useAuthSession();
 
   const hasToken = Boolean(rec.job_access_token);
+  const cacheScope = user?.user_id || "__guest__";
 
   // live meta
   const { meta, loading, error, refresh } = useJobLive(rec.job_id, rec.job_access_token);
@@ -7391,15 +8183,37 @@ function JobDetail({ rec, onUpdateToken }: { rec: JobRecord; onUpdateToken: (tok
   const [debugOpen, setDebugOpen] = useState(false);
   const [reqSnap, setReqSnap] = useState<any | null>(null);
   const [respSnap, setRespSnap] = useState<any | null>(null);
-  const [imgUrls, setImgUrls] = useState<Record<string, string>>({});
-  const [imgBlobs, setImgBlobs] = useState<Record<string, Blob>>({});
-  const revokeRef = useRef<string[]>([]);
+  const [previewUrls, setPreviewUrls] = useState<Record<string, string>>({});
+  const [fullUrls, setFullUrls] = useState<Record<string, string>>({});
+  const [fullBlobs, setFullBlobs] = useState<Record<string, Blob>>({});
+  const previewRevokeRef = useRef<string[]>([]);
+  const fullRevokeRef = useRef<string[]>([]);
+  const refRevokeRef = useRef<string[]>([]);
   const [selectedImageId, setSelectedImageId] = useState<string | null>(null);
   const [imgLoadError, setImgLoadError] = useState<string | null>(null);
+  const [refUrls, setRefUrls] = useState<Record<string, string>>({});
+  const [thumbLoadedIds, setThumbLoadedIds] = useState<Record<string, boolean>>({});
+  const [mainLoadedImageId, setMainLoadedImageId] = useState<string | null>(null);
+  const [sessionSearch, setSessionSearch] = useState("");
+  const [newSessionName, setNewSessionName] = useState("");
+  const [targetSessionId, setTargetSessionId] = useState("");
 
   const imageIds = useMemo(() => {
     return extractImageIdsFromResult(meta?.result);
   }, [meta?.result]);
+  const filteredSessions = useMemo(() => {
+    const query = sessionSearch.trim().toLowerCase();
+    if (!query) return pickerSessions;
+    return pickerSessions.filter((session) => session.name.toLowerCase().includes(query));
+  }, [pickerSessions, sessionSearch]);
+  const requestPrompt = reqSnap?.request?.prompt || rec.prompt_text || rec.prompt_preview || "";
+  const requestRefs = Array.isArray(reqSnap?.request?.reference_images) ? reqSnap.request.reference_images : [];
+  const timelineRows = [
+    { label: "Created", value: meta?.created_at || rec.created_at },
+    { label: "Queued", value: meta?.timing?.queued_at || rec.created_at },
+    { label: "Started", value: meta?.timing?.started_at || rec.run_started_at },
+    { label: status === "CANCELLED" ? "Cancelled" : "Finished", value: meta?.timing?.finished_at || rec.run_finished_at },
+  ].filter((row) => row.value);
 
   useEffect(() => {
     if (!imageIds.length) {
@@ -7412,10 +8226,18 @@ function JobDetail({ rec, onUpdateToken }: { rec: JobRecord; onUpdateToken: (tok
   }, [imageIds.join("|"), selectedImageId]);
 
   useEffect(() => {
+    setMainLoadedImageId(null);
+  }, [selectedImageId]);
+
+  useEffect(() => {
     return () => {
       // cleanup object urls
-      revokeRef.current.forEach((u) => URL.revokeObjectURL(u));
-      revokeRef.current = [];
+      previewRevokeRef.current.forEach((u) => URL.revokeObjectURL(u));
+      previewRevokeRef.current = [];
+      fullRevokeRef.current.forEach((u) => URL.revokeObjectURL(u));
+      fullRevokeRef.current = [];
+      refRevokeRef.current.forEach((u) => URL.revokeObjectURL(u));
+      refRevokeRef.current = [];
     };
   }, []);
 
@@ -7428,22 +8250,46 @@ function JobDetail({ rec, onUpdateToken }: { rec: JobRecord; onUpdateToken: (tok
     push({ kind: "success", title: "已保存 token（本地）" });
   };
 
-  const loadDebug = async () => {
+  const loadDebug = async (silent = false) => {
     if (!canRead) {
-      push({ kind: "error", title: "缺少 token", message: "TOKEN 模式下读取详情必须带 X-Job-Token" });
+      if (!silent) {
+        push({ kind: "error", title: "缺少 token", message: "TOKEN 模式下读取详情必须带 X-Job-Token" });
+      }
       return;
     }
-    try {
-      const [r1, r2] = await Promise.all([
-        client.getJobRequest(rec.job_id, rec.job_access_token).catch((e) => ({ __error: e })),
-        client.getJobResponse(rec.job_id, rec.job_access_token).catch((e) => ({ __error: e })),
-      ]);
-      setReqSnap(r1);
-      setRespSnap(r2);
+    const requestTask = client
+      .getJobRequest(rec.job_id, rec.job_access_token)
+      .then((payload) => {
+        setReqSnap(payload);
+        return { ok: true as const };
+      })
+      .catch((e) => {
+        setReqSnap({ __error: e });
+        return { ok: false as const, message: e?.error?.message || "request 加载失败" };
+      });
+
+    const responseTask = client
+      .getJobResponse(rec.job_id, rec.job_access_token)
+      .then((payload) => {
+        setRespSnap(payload);
+        return { ok: true as const };
+      })
+      .catch((e) => {
+        setRespSnap({ __error: e });
+        return { ok: false as const, message: e?.error?.message || "response 加载失败" };
+      });
+
+    const [requestResult, responseResult] = await Promise.all([requestTask, responseTask]);
+    if (silent) return;
+    if (requestResult.ok || responseResult.ok) {
       push({ kind: "success", title: "已加载调试信息" });
-    } catch (e: any) {
-      push({ kind: "error", title: "加载失败", message: e?.error?.message || "" });
+      return;
     }
+    push({
+      kind: "error",
+      title: "加载失败",
+      message: requestResult.message || responseResult.message || "",
+    });
   };
 
   const copyJson = async (obj: any) => {
@@ -7457,9 +8303,20 @@ function JobDetail({ rec, onUpdateToken }: { rec: JobRecord; onUpdateToken: (tok
 
   const downloadImage = async (image_id: string) => {
     try {
-      const blob = await runWithImageAccessTurnstile(() =>
-        client.getImageBlob(rec.job_id, image_id, rec.job_access_token)
-      );
+      const existing = fullBlobs[image_id];
+      const blob =
+        existing ||
+        (
+          await readCachedImageOrFetch({
+            scope: cacheScope,
+            baseUrl: settings.baseUrl,
+            jobId: rec.job_id,
+            imageId: image_id,
+            variant: "original",
+            config: settings.cache,
+            fetcher: () => runWithImageAccessTurnstile(() => client.getImageBlob(rec.job_id, image_id, rec.job_access_token)),
+          })
+        ).blob;
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = url;
@@ -7472,37 +8329,46 @@ function JobDetail({ rec, onUpdateToken }: { rec: JobRecord; onUpdateToken: (tok
     }
   };
 
-  const ensureThumb = async (image_id: string) => {
-    if (imgUrls[image_id]) return;
+  const ensurePreviewImage = async (image_id: string) => {
+    if (previewUrls[image_id]) return;
     try {
-      const blob = await runWithImageAccessTurnstile(() =>
-        client.getImageBlob(rec.job_id, image_id, rec.job_access_token)
-      );
-      setImgBlobs((m) => ({ ...m, [image_id]: blob }));
+      const { blob } = await readCachedImageOrFetch({
+        scope: cacheScope,
+        baseUrl: settings.baseUrl,
+        jobId: rec.job_id,
+        imageId: image_id,
+        variant: "preview",
+        config: settings.cache,
+        fetcher: () => client.getPreviewBlob(rec.job_id, image_id, rec.job_access_token),
+      });
       const url = URL.createObjectURL(blob);
-      revokeRef.current.push(url);
-      setImgUrls((m) => ({ ...m, [image_id]: url }));
+      previewRevokeRef.current.push(url);
+      setPreviewUrls((m) => ({ ...m, [image_id]: url }));
     } catch (e: any) {
-      setImgLoadError(e?.error?.message || "图片拉取失败（可能缺少 token / CORS / 后端未返回该 image_id）");
+      setImgLoadError(e?.error?.message || "预览图拉取失败");
     }
   };
 
-  const fallbackToDataUrl = async (image_id: string) => {
-    const blob = imgBlobs[image_id];
-    if (!blob) return;
+  const ensureOriginalImage = async (image_id: string) => {
+    if (fullUrls[image_id]) return fullBlobs[image_id] || null;
     try {
-      const dataUrl = await blobToDataURL(blob);
-      const old = imgUrls[image_id];
-      if (old?.startsWith("blob:")) {
-        try {
-          URL.revokeObjectURL(old);
-        } catch {
-          // ignore
-        }
-      }
-      setImgUrls((m) => ({ ...m, [image_id]: dataUrl }));
-    } catch {
-      setImgLoadError("图片预览被在线预览环境的 CSP/沙箱策略拦截（blob/data URL）。建议本地 Vite 运行或调整平台 CSP。 ");
+      const { blob } = await readCachedImageOrFetch({
+        scope: cacheScope,
+        baseUrl: settings.baseUrl,
+        jobId: rec.job_id,
+        imageId: image_id,
+        variant: "original",
+        config: settings.cache,
+        fetcher: () => runWithImageAccessTurnstile(() => client.getImageBlob(rec.job_id, image_id, rec.job_access_token)),
+      });
+      setFullBlobs((m) => ({ ...m, [image_id]: blob }));
+      const url = URL.createObjectURL(blob);
+      fullRevokeRef.current.push(url);
+      setFullUrls((m) => ({ ...m, [image_id]: url }));
+      return blob;
+    } catch (e: any) {
+      setImgLoadError(e?.error?.message || "原图拉取失败");
+      return null;
     }
   };
 
@@ -7524,6 +8390,7 @@ function JobDetail({ rec, onUpdateToken }: { rec: JobRecord; onUpdateToken: (tok
         created_at: isoNow(),
         status_cache: "QUEUED",
         prompt_preview: rec.prompt_preview,
+        prompt_text: rec.prompt_text,
         params_cache: rec.params_cache,
         last_seen_at: isoNow(),
         pinned: false,
@@ -7541,45 +8408,323 @@ function JobDetail({ rec, onUpdateToken }: { rec: JobRecord; onUpdateToken: (tok
   };
 
   const onDelete = async () => {
-    const alsoServer = confirm("是否同时删除服务端 job？\n确定=同时删除服务端，取消=仅删除本地");
-
-    // always delete local
-    useJobsStore.getState().removeJob(rec.job_id);
-    push({ kind: "success", title: "已删除本地记录" });
-
-    if (alsoServer) {
+    if (status === "RUNNING") {
       if (!canRead) {
-        push({ kind: "error", title: "缺少 token", message: "TOKEN 模式下删除服务端需要 X-Job-Token" });
+        push({ kind: "error", title: "缺少 token", message: "TOKEN 模式下取消运行中任务需要 X-Job-Token" });
         return;
       }
       try {
-        await client.deleteJob(rec.job_id, rec.job_access_token);
-        push({ kind: "success", title: "已删除服务端 job" });
+        await client.cancelJob(rec.job_id, rec.job_access_token);
+        updateJob(rec.job_id, {
+          status_cache: "CANCELLED",
+          error_code_cache: "JOB_CANCELLED",
+          error_message_cache: "Job was cancelled by user while running. Any later worker result will be discarded.",
+          last_seen_at: isoNow(),
+        });
+        push({ kind: "success", title: "运行中任务已取消" });
+        await refresh();
       } catch (e: any) {
-        push({ kind: "error", title: "删除服务端失败", message: e?.error?.message || "" });
+        push({ kind: "error", title: "取消失败", message: e?.error?.message || "" });
       }
+      return;
     }
+
+    if (
+      !confirm(
+        status === "QUEUED"
+          ? "删除排队任务？它会从历史和服务端目录中一起移除。"
+          : "删除这条历史任务？服务端原图与本地 session 关联条目也会被清理。"
+      )
+    ) {
+      return;
+    }
+
+    useJobsStore.getState().removeJob(rec.job_id);
+    invalidatePickerEntriesForDeletedJob(rec.job_id);
+    push({ kind: "success", title: status === "QUEUED" ? "排队任务已移除" : "历史任务已删除" });
+
+    if (!canRead) {
+      push({ kind: "info", title: "仅删除了本地记录", message: "缺少 token，未同步删除服务端文件" });
+      return;
+    }
+
+    try {
+      await client.deleteJob(rec.job_id, rec.job_access_token);
+      push({ kind: "success", title: "服务端文件已删除" });
+    } catch (e: any) {
+      push({ kind: "error", title: "删除服务端失败", message: e?.error?.message || "" });
+    }
+  };
+
+  const addImagesToSession = (sessionId: string) => {
+    if (!sessionId) return;
+    if (!imageIds.length) {
+      push({ kind: "error", title: "暂无可加入 session 的图片" });
+      return;
+    }
+    addPickerItems(
+      sessionId,
+      imageIds.map((imageId) => ({
+        job_id: rec.job_id,
+        job_access_token: rec.job_access_token,
+        image_id: imageId,
+        status: "SUCCEEDED",
+        added_at: isoNow(),
+      }))
+    );
+    push({ kind: "success", title: "已加入 session", message: `${imageIds.length} 张图片` });
+  };
+
+  const onCreateSessionAndAdd = () => {
+    const sessionId = createPickerSession(newSessionName.trim() || undefined);
+    setTargetSessionId(sessionId);
+    setNewSessionName("");
+    addImagesToSession(sessionId);
+  };
+
+  const copyParamsToCreate = async () => {
+    const params = meta?.params || rec.params_cache || {};
+    saveCreateCloneDraft({
+      prompt: requestPrompt,
+      model: (meta?.model || rec.model_cache || settings.defaultModel) as ModelId,
+      mode: (meta?.mode || "IMAGE_ONLY") as JobMode,
+      params: {
+        aspect_ratio: params.aspect_ratio,
+        image_size: params.image_size,
+        thinking_level: params.thinking_level,
+        temperature: params.temperature,
+        timeout_sec: params.timeout_sec,
+        max_retries: params.max_retries,
+      },
+    });
+    try {
+      await navigator.clipboard.writeText(requestPrompt);
+    } catch {
+      // ignore clipboard failures
+    }
+    if (onNavigateToCreate) {
+      onNavigateToCreate();
+      return;
+    }
+    navigate("/create");
   };
 
   useEffect(() => {
     // update status cache on meta change
     if (meta?.status) {
       updateJob(rec.job_id, {
-        status_cache: meta.status,
-        model_cache: (meta.model as ModelId) || rec.model_cache,
         last_seen_at: isoNow(),
-        ...jobTimingPatch(meta),
+        ...jobMetaCachePatch(meta),
       });
     }
-  }, [meta?.status, meta?.model, rec.job_id, rec.model_cache, updateJob]);
+  }, [meta, rec.job_id, updateJob]);
+
+  useEffect(() => {
+    if (!canRead) return;
+    loadDebug(true);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [canRead, rec.job_id, rec.job_access_token]);
 
   useEffect(() => {
     if (!canRead) return;
     setImgLoadError(null);
-    // 预加载：最多 12 张（避免一次性拉太多）
-    imageIds.slice(0, 12).forEach((id) => ensureThumb(id));
+    imageIds.slice(0, 12).forEach((id) => ensurePreviewImage(id));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [canRead, imageIds.join("|")]);
+
+  useEffect(() => {
+    if (!canRead || !selectedImageId) return;
+    ensureOriginalImage(selectedImageId);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [canRead, selectedImageId]);
+
+  useEffect(() => {
+    refRevokeRef.current.forEach((u) => URL.revokeObjectURL(u));
+    refRevokeRef.current = [];
+    setRefUrls({});
+    if (!canRead || !requestRefs.length) return;
+    const controller = new AbortController();
+    requestRefs.forEach((item: any) => {
+      const filename = String(item?.filename || "");
+      if (!filename) return;
+      client
+        .getReferenceBlob(rec.job_id, filename, rec.job_access_token, controller.signal)
+        .then((blob) => {
+          const url = URL.createObjectURL(blob);
+          refRevokeRef.current.push(url);
+          setRefUrls((current) => ({ ...current, [filename]: url }));
+        })
+        .catch(() => null);
+    });
+    return () => controller.abort();
+  }, [canRead, client, rec.job_access_token, rec.job_id, requestRefs]);
+
+  const markThumbLoaded = (imageId: string) => {
+    setThumbLoadedIds((current) => (current[imageId] ? current : { ...current, [imageId]: true }));
+  };
+
+  const activeImageLoaded = selectedImageId ? mainLoadedImageId === selectedImageId : false;
+  const resultPreviewCard = (
+    <Card hover={false} className="overflow-hidden p-0">
+      <div className="flex flex-wrap items-center justify-between gap-3 border-b border-zinc-200/80 px-4 py-3 dark:border-white/10">
+        <div>
+          <div className="text-sm font-bold text-zinc-900 dark:text-zinc-50">结果预览</div>
+          <div className="text-xs text-zinc-600 dark:text-zinc-300">
+            尽量把结果图放在首屏，切图和下载都放在这里。
+          </div>
+        </div>
+        {selectedImageId ? (
+          <div className="flex flex-wrap items-center gap-2">
+            <Button
+              variant="ghost"
+              className="!px-2 !py-1 text-xs"
+              onClick={() => navigate(`/picker?job=${encodeURIComponent(rec.job_id)}`)}
+            >
+              去挑选对比
+            </Button>
+            <Button
+              variant="secondary"
+              className="!px-2 !py-1 text-xs"
+              onClick={() => downloadImage(selectedImageId)}
+            >
+              下载选中
+            </Button>
+            {fullUrls[selectedImageId] || previewUrls[selectedImageId] ? (
+              <Button
+                variant="ghost"
+                className="!px-2 !py-1 text-xs"
+                onClick={() => window.open(fullUrls[selectedImageId] || previewUrls[selectedImageId], "_blank")}
+              >
+                新窗口
+              </Button>
+            ) : null}
+          </div>
+        ) : null}
+      </div>
+
+      {!canRead ? (
+        <div className="px-4 py-4 text-xs text-zinc-500 dark:text-zinc-400">缺少 token，无法拉取图片。</div>
+      ) : imageIds.length ? (
+        <div className="space-y-4 p-4">
+          <div className="overflow-hidden rounded-[24px] border border-zinc-200 bg-zinc-50 dark:border-white/10 dark:bg-zinc-950/30">
+            <div className="relative h-[320px] w-full bg-[linear-gradient(145deg,rgba(250,250,249,0.95),rgba(228,228,231,0.6))] sm:h-[420px] lg:h-[520px] dark:bg-[linear-gradient(145deg,rgba(24,24,27,0.95),rgba(39,39,42,0.72))]">
+              {selectedImageId && (previewUrls[selectedImageId] || fullUrls[selectedImageId]) ? (
+                <>
+                  {previewUrls[selectedImageId] ? (
+                    <img
+                      src={previewUrls[selectedImageId]}
+                      alt={`${selectedImageId}-preview`}
+                      className="absolute inset-0 h-full w-full object-contain p-4 opacity-100"
+                    />
+                  ) : null}
+                  {fullUrls[selectedImageId] ? (
+                    <img
+                      src={fullUrls[selectedImageId]}
+                      alt={selectedImageId}
+                      className={cn(
+                        "relative h-full w-full object-contain p-4 transition duration-300",
+                        activeImageLoaded ? "opacity-100" : "opacity-0"
+                      )}
+                      onLoad={() => setMainLoadedImageId(selectedImageId)}
+                    />
+                  ) : null}
+                  {!activeImageLoaded || !fullUrls[selectedImageId] ? (
+                    <div className="absolute inset-0 flex items-center justify-center">
+                      <LoadingSpinner label={previewUrls[selectedImageId] ? "Loading original" : "Loading preview"} tone="brand" />
+                    </div>
+                  ) : null}
+                </>
+              ) : (
+                <div className="flex h-full w-full items-center justify-center">
+                  <LoadingSpinner label={selectedImageId ? "Loading image" : "Waiting for result"} tone="brand" />
+                </div>
+              )}
+
+              {selectedImageId ? (
+                <div className="absolute bottom-0 left-0 right-0 flex items-center justify-between gap-2 bg-black/45 p-2 text-[11px] text-white">
+                  <span className="truncate">{shortId(selectedImageId, 10)}</span>
+                  <button
+                    className="rounded-full bg-white/20 px-2 py-1 font-bold hover:bg-white/30"
+                    onClick={() => {
+                      navigator.clipboard
+                        .writeText(selectedImageId)
+                        .then(() => push({ kind: "success", title: "已复制 image_id" }))
+                        .catch(() => push({ kind: "error", title: "复制失败" }));
+                    }}
+                  >
+                    复制 image_id
+                  </button>
+                </div>
+              ) : null}
+            </div>
+          </div>
+
+          {imgLoadError ? (
+            <div className="rounded-2xl border border-amber-200 bg-amber-50 p-3 text-xs text-amber-900 dark:border-amber-900 dark:bg-amber-950/30 dark:text-amber-100">
+              {imgLoadError}
+            </div>
+          ) : null}
+
+          <div className="flex gap-2 overflow-x-auto pb-1">
+            {imageIds.map((id) => {
+              const active = id === selectedImageId;
+              const u = previewUrls[id];
+              const thumbLoaded = Boolean(thumbLoadedIds[id]);
+              return (
+                <button
+                  key={id}
+                  type="button"
+                  onClick={() => {
+                    setSelectedImageId(id);
+                    ensurePreviewImage(id);
+                  }}
+                  className={cn(
+                    "relative overflow-hidden rounded-2xl border transition",
+                    active
+                      ? "border-zinc-900 shadow-sm dark:border-white"
+                      : "border-zinc-200 hover:-translate-y-0.5 hover:shadow-sm dark:border-white/10"
+                  )}
+                  title={id}
+                >
+                  {u ? (
+                    <>
+                      <img
+                        src={u}
+                        alt={id}
+                        className={cn(
+                          "h-20 w-28 object-cover transition duration-300",
+                          thumbLoaded ? "opacity-100" : "opacity-0"
+                        )}
+                        onLoad={() => markThumbLoaded(id)}
+                      />
+                      {!thumbLoaded ? (
+                        <div className="absolute inset-0 flex items-center justify-center bg-zinc-100/85 dark:bg-zinc-950/80">
+                          <LoadingSpinner className="gap-1.5" />
+                        </div>
+                      ) : null}
+                    </>
+                  ) : (
+                    <div className="flex h-20 w-28 items-center justify-center bg-zinc-100 dark:bg-zinc-900">
+                      <LoadingSpinner className="gap-1.5" />
+                    </div>
+                  )}
+                  <div className="absolute bottom-1 left-1 rounded-full bg-black/50 px-2 py-0.5 text-[10px] font-bold text-white">
+                    {shortId(id, 6)}
+                  </div>
+                </button>
+              );
+            })}
+          </div>
+        </div>
+      ) : (
+        <div className="px-4 py-4 text-xs text-zinc-500 dark:text-zinc-400">
+          {status === "SUCCEEDED"
+            ? "未检测到图片列表字段（result.images / result.image_ids），请对齐后端返回结构"
+            : "尚无输出"}
+        </div>
+      )}
+    </Card>
+  );
 
   return (
     <div className="space-y-3">
@@ -7611,6 +8756,39 @@ function JobDetail({ rec, onUpdateToken }: { rec: JobRecord; onUpdateToken: (tok
         <Card hover={false} className="p-3">
           <div className="text-xs font-semibold text-zinc-500 dark:text-zinc-400">Updated</div>
           <div className="mt-1 text-sm font-bold text-zinc-900 dark:text-zinc-50">{formatLocal(meta?.updated_at || rec.last_seen_at)}</div>
+        </Card>
+      </div>
+
+      {resultPreviewCard}
+
+      <Card hover={false} className="p-3">
+        <div className="text-sm font-bold text-zinc-900 dark:text-zinc-50">Prompt</div>
+        <div className="mt-2 whitespace-pre-wrap text-sm leading-6 text-zinc-700 dark:text-zinc-200">{requestPrompt || "-"}</div>
+      </Card>
+
+      <div className="grid gap-3 lg:grid-cols-2">
+        <Card hover={false} className="p-3">
+          <div className="text-sm font-bold text-zinc-900 dark:text-zinc-50">Batch Info</div>
+          <div className="mt-2 grid grid-cols-2 gap-2 text-xs">
+            <KeyValue k="batch_name" v={rec.batch_name || "-"} />
+            <KeyValue k="batch_index" v={rec.batch_index ?? "-"} />
+            <KeyValue k="batch_size" v={rec.batch_size ?? "-"} />
+            <KeyValue k="section_index" v={rec.section_index ?? "-"} />
+            <KeyValue k="section_title" v={rec.section_title || "-"} />
+            <KeyValue k="batch_note" v={rec.batch_note || "-"} />
+          </div>
+        </Card>
+
+        <Card hover={false} className="p-3">
+          <div className="text-sm font-bold text-zinc-900 dark:text-zinc-50">Status Timeline</div>
+          <div className="mt-2 space-y-2">
+            {timelineRows.map((row) => (
+              <div key={row.label} className="flex items-center justify-between rounded-2xl border border-zinc-200 bg-white/60 px-3 py-2 text-xs dark:border-white/10 dark:bg-zinc-950/30">
+                <span className="font-semibold text-zinc-600 dark:text-zinc-300">{row.label}</span>
+                <span className="text-zinc-900 dark:text-zinc-50">{formatLocal(String(row.value))}</span>
+              </div>
+            ))}
+          </div>
         </Card>
       </div>
 
@@ -7669,9 +8847,11 @@ function JobDetail({ rec, onUpdateToken }: { rec: JobRecord; onUpdateToken: (tok
         ) : null}
       </Card>
 
-      {status === "FAILED" ? (
+      {(status === "FAILED" || status === "CANCELLED") ? (
         <Card hover={false} className="p-3">
-          <div className="text-sm font-bold text-rose-700 dark:text-rose-200">失败信息</div>
+          <div className={cn("text-sm font-bold", status === "CANCELLED" ? "text-orange-700 dark:text-orange-200" : "text-rose-700 dark:text-rose-200")}>
+            {status === "CANCELLED" ? "取消信息" : "失败信息"}
+          </div>
           <div className="mt-2 text-xs text-zinc-700 dark:text-zinc-200">
             <div>
               <span className="font-semibold">code：</span>
@@ -7706,165 +8886,91 @@ function JobDetail({ rec, onUpdateToken }: { rec: JobRecord; onUpdateToken: (tok
       <Card hover={false} className="p-3">
         <div className="flex items-center justify-between">
           <div>
-            <div className="text-sm font-bold text-zinc-900 dark:text-zinc-50">结果预览</div>
-            <div className="text-xs text-zinc-600 dark:text-zinc-300">
-              预览会通过 /v1/jobs/{"{job_id}"}/images/{"{image_id}"} 拉取 blob（TOKEN 模式会带 X-Job-Token）。
-            </div>
+            <div className="text-sm font-bold text-zinc-900 dark:text-zinc-50">Reference Images</div>
+            <div className="text-xs text-zinc-600 dark:text-zinc-300">按请求顺序展示固定参考图 / 当前任务参考图。</div>
           </div>
-          {selectedImageId ? (
-            <div className="flex items-center gap-2">
-              <Button
-                variant="ghost"
-                className="!px-2 !py-1 text-xs"
-                onClick={() => navigate(`/picker?job=${encodeURIComponent(rec.job_id)}`)}
-              >
-                去挑选对比
-              </Button>
-              <Button
-                variant="secondary"
-                className="!px-2 !py-1 text-xs"
-                onClick={() => downloadImage(selectedImageId)}
-              >
-                下载选中
-              </Button>
-              {imgUrls[selectedImageId] ? (
-                <Button
-                  variant="ghost"
-                  className="!px-2 !py-1 text-xs"
-                  onClick={() => window.open(imgUrls[selectedImageId], "_blank")}
-                >
-                  新窗口
-                </Button>
-              ) : null}
-            </div>
-          ) : null}
+          <span className="text-xs text-zinc-500 dark:text-zinc-400">{requestRefs.length} refs</span>
         </div>
-
-        {!canRead ? (
-          <div className="mt-3 text-xs text-zinc-500 dark:text-zinc-400">缺少 token，无法拉取图片。</div>
-        ) : imageIds.length ? (
-          <div className="mt-3 space-y-3">
-            <div className="overflow-hidden rounded-2xl border border-zinc-200 bg-zinc-50 dark:border-white/10 dark:bg-zinc-950/30">
-              <div className="relative h-[360px] w-full sm:h-[420px] md:h-[500px]">
-                {selectedImageId && imgUrls[selectedImageId] ? (
-                  <img
-                    src={imgUrls[selectedImageId]}
-                    alt={selectedImageId}
-                    className="h-full w-full object-contain opacity-0 blur-sm transition duration-300"
-                    onLoad={(e) => {
-                      const el = e.currentTarget;
-                      el.classList.remove("opacity-0", "blur-sm");
-                      el.classList.add("opacity-100");
-                    }}
-                    onError={(e) => {
-                      const el = e.currentTarget;
-                      el.classList.remove("opacity-0", "blur-sm");
-                      el.classList.add("opacity-100");
-                      fallbackToDataUrl(selectedImageId);
-                    }}
-                  />
-                ) : (
-                  <div className="h-full w-full">
-                    <Skeleton className="h-full w-full" />
+        {requestRefs.length ? (
+          <div className="mt-3 grid grid-cols-2 gap-3 md:grid-cols-4">
+            {requestRefs.map((item: any, idx: number) => {
+              const filename = String(item?.filename || "");
+              const src = refUrls[filename];
+              return (
+                <div key={filename || idx} className="overflow-hidden rounded-2xl border border-zinc-200 bg-white/60 dark:border-white/10 dark:bg-zinc-950/30">
+                  <div className="relative h-28 w-full bg-zinc-100 dark:bg-zinc-900">
+                    {src ? <img src={src} alt={filename} className="h-full w-full object-cover" /> : <Skeleton className="h-full w-full rounded-none" />}
+                    <div className="absolute left-2 top-2 rounded-full bg-black/60 px-2 py-0.5 text-[10px] font-bold text-white">#{idx + 1}</div>
                   </div>
-                )}
-
-                {selectedImageId ? (
-                  <div className="absolute bottom-0 left-0 right-0 flex items-center justify-between gap-2 bg-black/45 p-2 text-[11px] text-white">
-                    <span className="truncate">{shortId(selectedImageId, 10)}</span>
-                    <button
-                      className="rounded-full bg-white/20 px-2 py-1 font-bold hover:bg-white/30"
-                      onClick={() => {
-                        navigator.clipboard
-                          .writeText(selectedImageId)
-                          .then(() => push({ kind: "success", title: "已复制 image_id" }))
-                          .catch(() => push({ kind: "error", title: "复制失败" }));
-                      }}
-                    >
-                      复制 image_id
-                    </button>
-                  </div>
-                ) : null}
-              </div>
-            </div>
-
-            {imgLoadError ? (
-              <div className="rounded-2xl border border-amber-200 bg-amber-50 p-3 text-xs text-amber-900 dark:border-amber-900 dark:bg-amber-950/30 dark:text-amber-100">
-                {imgLoadError}
-              </div>
-            ) : null}
-
-            <div className="flex gap-2 overflow-x-auto pb-1">
-              {imageIds.map((id) => {
-                const active = id === selectedImageId;
-                const u = imgUrls[id];
-                return (
-                  <button
-                    key={id}
-                    type="button"
-                    onClick={() => {
-                      setSelectedImageId(id);
-                      ensureThumb(id);
-                    }}
-                    className={cn(
-                      "relative overflow-hidden rounded-2xl border transition",
-                      active
-                        ? "border-zinc-900 shadow-sm dark:border-white"
-                        : "border-zinc-200 hover:-translate-y-0.5 hover:shadow-sm dark:border-white/10"
-                    )}
-                    title={id}
-                  >
-                    {u ? (
-                      <img
-                        src={u}
-                        alt={id}
-                        className="h-20 w-28 object-cover opacity-0 blur-sm transition duration-300"
-                        onLoad={(e) => {
-                          const el = e.currentTarget;
-                          el.classList.remove("opacity-0", "blur-sm");
-                          el.classList.add("opacity-100");
-                        }}
-                        onError={(e) => {
-                          const el = e.currentTarget;
-                          el.classList.remove("opacity-0", "blur-sm");
-                          el.classList.add("opacity-100");
-                          fallbackToDataUrl(id);
-                        }}
-                      />
-                    ) : (
-                      <div className="h-20 w-28">
-                        <Skeleton className="h-full w-full" />
-                      </div>
-                    )}
-                    <div className="absolute bottom-1 left-1 rounded-full bg-black/50 px-2 py-0.5 text-[10px] font-bold text-white">
-                      {shortId(id, 6)}
-                    </div>
-                  </button>
-                );
-              })}
-            </div>
+                  <div className="truncate px-3 py-2 text-[11px] text-zinc-600 dark:text-zinc-300">{filename || `reference_${idx}`}</div>
+                </div>
+              );
+            })}
           </div>
         ) : (
-          <div className="mt-3 text-xs text-zinc-500 dark:text-zinc-400">
-            {status === "SUCCEEDED"
-              ? "未检测到图片列表字段（result.images / result.image_ids），请对齐后端返回结构"
-              : "尚无输出"}
-          </div>
+          <div className="mt-3 text-xs text-zinc-500 dark:text-zinc-400">没有参考图</div>
         )}
       </Card>
 
       <Card hover={false} className="p-3">
         <div className="flex items-center justify-between">
           <div>
+            <div className="text-sm font-bold text-zinc-900 dark:text-zinc-50">Add To Session</div>
+            <div className="text-xs text-zinc-600 dark:text-zinc-300">把当前任务输出加入已有 session，或即时创建一个新的 session。</div>
+          </div>
+          <Button variant="ghost" className="!px-2 !py-1 text-xs" onClick={copyParamsToCreate}>
+            复制参数并前往快速生成
+          </Button>
+        </div>
+        <div className="mt-3 grid gap-3 lg:grid-cols-[minmax(0,1fr)_220px]">
+          <div className="space-y-2">
+            <Input value={sessionSearch} onChange={setSessionSearch} placeholder="Search session name" />
+            <div className="max-h-40 space-y-2 overflow-auto rounded-2xl border border-zinc-200 bg-white/60 p-2 dark:border-white/10 dark:bg-zinc-950/30">
+              {filteredSessions.length ? (
+                filteredSessions.map((session) => (
+                  <label key={session.session_id} className="flex cursor-pointer items-center gap-2 rounded-xl px-2 py-2 text-sm hover:bg-zinc-100 dark:hover:bg-zinc-900">
+                    <input
+                      type="radio"
+                      name={`history-session-${rec.job_id}`}
+                      checked={targetSessionId === session.session_id}
+                      onChange={() => setTargetSessionId(session.session_id)}
+                    />
+                    <span className="min-w-0 truncate">{session.name}</span>
+                  </label>
+                ))
+              ) : (
+                <div className="px-2 py-2 text-xs text-zinc-500 dark:text-zinc-400">没有匹配的 session</div>
+              )}
+            </div>
+          </div>
+          <div className="space-y-2">
+            <Button variant="secondary" onClick={() => addImagesToSession(targetSessionId)} disabled={!targetSessionId || !imageIds.length}>
+              加入选中 Session
+            </Button>
+            <Input value={newSessionName} onChange={setNewSessionName} placeholder="Create session now" />
+            <Button variant="ghost" onClick={onCreateSessionAndAdd} disabled={!imageIds.length}>
+              新建 Session 并加入
+            </Button>
+          </div>
+        </div>
+      </Card>
+
+      <Card hover={false} className="p-3">
+        <div className="flex items-center justify-between">
+          <div>
             <div className="text-sm font-bold text-zinc-900 dark:text-zinc-50">任务操作</div>
-            <div className="text-xs text-zinc-600 dark:text-zinc-300">Retry / Delete</div>
+            <div className="text-xs text-zinc-600 dark:text-zinc-300">
+              {status === "RUNNING" ? "Cancel running task" : status === "QUEUED" ? "Delete queued task" : "Retry / Delete history"}
+            </div>
           </div>
           <div className="flex items-center gap-2">
-            <Button variant="secondary" onClick={onRetry} disabled={!canRead}>
-              Retry
-            </Button>
+            {status !== "RUNNING" ? (
+              <Button variant="secondary" onClick={onRetry} disabled={!canRead}>
+                Retry
+              </Button>
+            ) : null}
             <Button variant="danger" onClick={onDelete}>
-              Delete
+              {status === "RUNNING" ? "Cancel" : "Delete"}
             </Button>
           </div>
         </div>
@@ -9486,6 +10592,10 @@ function SettingsPage() {
   const [intervalMs, setIntervalMs] = useState(settings.polling.intervalMs);
   const [maxIntervalMs, setMaxIntervalMs] = useState(settings.polling.maxIntervalMs);
   const [concurrency, setConcurrency] = useState(settings.polling.concurrency);
+  const [cacheEnabled, setCacheEnabled] = useState(settings.cache.enabled);
+  const [cacheTtlDays, setCacheTtlDays] = useState(settings.cache.ttlDays);
+  const [cacheMaxGb, setCacheMaxGb] = useState(Number((settings.cache.maxBytes / (1024 * 1024 * 1024)).toFixed(2)));
+  const [cacheStatsState, setCacheStatsState] = useState<ImageCacheStats>({ count: 0, size: 0 });
 
   const [health, setHealth] = useState<any | null>(null);
   const [testing, setTesting] = useState(false);
@@ -9500,7 +10610,15 @@ function SettingsPage() {
     setIntervalMs(settings.polling.intervalMs);
     setMaxIntervalMs(settings.polling.maxIntervalMs);
     setConcurrency(settings.polling.concurrency);
+    setCacheEnabled(settings.cache.enabled);
+    setCacheTtlDays(settings.cache.ttlDays);
+    setCacheMaxGb(Number((settings.cache.maxBytes / (1024 * 1024 * 1024)).toFixed(2)));
   }, [catalog.default_model, settings]);
+
+  useEffect(() => {
+    const scope = user?.user_id || "__guest__";
+    imageCacheStats(scope).then(setCacheStatsState).catch(() => setCacheStatsState({ count: 0, size: 0 }));
+  }, [user?.user_id, settings.cache.enabled, settings.cache.maxBytes, settings.cache.ttlDays]);
 
   const save = () => {
     const next: Partial<SettingsV1> = {
@@ -9516,6 +10634,11 @@ function SettingsPage() {
         intervalMs,
         maxIntervalMs,
         concurrency,
+      },
+      cache: {
+        enabled: cacheEnabled,
+        ttlDays: cacheTtlDays,
+        maxBytes: Math.round(cacheMaxGb * 1024 * 1024 * 1024),
       },
     };
     setSettings(next);
@@ -9740,6 +10863,65 @@ function SettingsPage() {
           </div>
         </Card>
 
+        <Card className="lg:col-span-2">
+          <div className="text-sm font-bold text-zinc-900 dark:text-zinc-50">图片缓存</div>
+          <div className="mt-2 text-xs text-zinc-600 dark:text-zinc-300">
+            History 画廊预览图和 Task Detail 原图会优先命中浏览器缓存。缓存按当前登录用户隔离，默认保留 3 天且总上限 2 GB。
+          </div>
+          <div className="mt-3 grid grid-cols-1 gap-3 md:grid-cols-3">
+            <div className="flex items-center justify-between rounded-2xl border border-zinc-200 bg-white/60 p-3 dark:border-white/10 dark:bg-zinc-950/30">
+              <div>
+                <div className="text-sm font-semibold text-zinc-900 dark:text-zinc-50">启用缓存</div>
+                <div className="text-xs text-zinc-600 dark:text-zinc-300">命中后直接显示，不再请求服务器。</div>
+              </div>
+              <Switch testId="settings-cache-enabled" value={cacheEnabled} onChange={setCacheEnabled} />
+            </div>
+            <Field label={`保留天数 (${cacheTtlDays}d)`}>
+              <input
+                data-testid="settings-cache-ttl"
+                type="range"
+                min={1}
+                max={30}
+                step={1}
+                value={cacheTtlDays}
+                onChange={(e) => setCacheTtlDays(Number(e.target.value))}
+                className="w-full"
+              />
+            </Field>
+            <Field label={`缓存上限 (${cacheMaxGb.toFixed(1)} GB)`}>
+              <input
+                data-testid="settings-cache-max"
+                type="range"
+                min={0.25}
+                max={8}
+                step={0.25}
+                value={cacheMaxGb}
+                onChange={(e) => setCacheMaxGb(Number(e.target.value))}
+                className="w-full"
+              />
+            </Field>
+          </div>
+          <div className="mt-3 flex flex-wrap items-center gap-2 text-xs text-zinc-600 dark:text-zinc-300">
+            <span className="rounded-full border border-zinc-200 bg-white px-3 py-1 dark:border-white/10 dark:bg-zinc-950/40">
+              Cached items {cacheStatsState.count}
+            </span>
+            <span className="rounded-full border border-zinc-200 bg-white px-3 py-1 dark:border-white/10 dark:bg-zinc-950/40">
+              Used {formatBytes(cacheStatsState.size)}
+            </span>
+            <Button
+              variant="ghost"
+              testId="settings-clear-cache"
+              onClick={async () => {
+                await imageCacheClear(user?.user_id || "__guest__");
+                setCacheStatsState({ count: 0, size: 0 });
+                push({ kind: "success", title: "已清空当前用户图片缓存" });
+              }}
+            >
+              清空当前缓存
+            </Button>
+          </div>
+        </Card>
+
         <Card>
           <div className="text-sm font-bold text-zinc-900 dark:text-zinc-50">数据管理</div>
           <div className="mt-3 space-y-2">
@@ -9805,6 +10987,7 @@ export default function App() {
     <ToastProvider>
       <BrowserRouter>
         <ImageAccessGuardProvider>
+          <ImageCacheJanitor />
           <div className="min-h-screen bg-gradient-to-b from-zinc-50 to-white text-zinc-900 dark:from-zinc-950 dark:to-zinc-950 dark:text-zinc-50">
             {loading ? (
               <div className="flex min-h-screen items-center justify-center px-4">

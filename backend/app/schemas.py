@@ -20,6 +20,7 @@ ModelId = Literal[
 class JobStatus(str, Enum):
     QUEUED = "QUEUED"
     RUNNING = "RUNNING"
+    CANCELLED = "CANCELLED"
     SUCCEEDED = "SUCCEEDED"
     FAILED = "FAILED"
     DELETED = "DELETED"
@@ -130,6 +131,7 @@ class ImageMeta(BaseModel):
     width: int
     height: int
     sha256: str
+    preview: dict[str, Any] | None = None
 
 
 class UsageMeta(BaseModel):
@@ -256,6 +258,16 @@ class ModelsResponse(BaseModel):
 class JobAccessRef(BaseModel):
     job_id: str
     job_access_token: str | None = None
+
+
+class PreviewImageRef(BaseModel):
+    job_id: str
+    image_id: str | None = None
+    job_access_token: str | None = None
+
+
+class BatchPreviewRequest(BaseModel):
+    images: list[PreviewImageRef] = Field(default_factory=list)
 
 
 class BatchMetaRequest(BaseModel):

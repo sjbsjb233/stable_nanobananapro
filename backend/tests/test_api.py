@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import base64
+import io
 import threading
 import time
 from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
+from PIL import Image
 
 from app.config import settings
 from app.gemini_client import GeminiError
@@ -20,6 +22,20 @@ from app.user_store import user_store
 PNG_1X1 = base64.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO7m6XQAAAAASUVORK5CYII="
 )
+
+
+def make_png(width: int = 2200, height: int = 1600, color: tuple[int, int, int] = (52, 120, 210)) -> bytes:
+    image = Image.new("RGB", (width, height), color)
+    out = io.BytesIO()
+    image.save(out, format="PNG")
+    return out.getvalue()
+
+
+def make_webp(width: int = 1200, height: int = 900, color: tuple[int, int, int] = (52, 120, 210)) -> bytes:
+    image = Image.new("RGB", (width, height), color)
+    out = io.BytesIO()
+    image.save(out, format="WEBP", quality=72, method=6)
+    return out.getvalue()
 
 
 @pytest.fixture
@@ -216,10 +232,188 @@ def test_job_lifecycle(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> N
     assert img.status_code == 200
     assert img.headers["content-type"].startswith("image/")
 
+    preview = client.get(f"/v1/jobs/{job_id}/images/image_0/preview")
+    assert preview.status_code == 200
+    assert preview.headers["content-type"].startswith("image/webp")
+    assert preview.headers["cache-control"] == "private, max-age=86400"
+
     deleted = client.delete(f"/v1/jobs/{job_id}")
     assert deleted.status_code == 200
     not_found = client.get(f"/v1/jobs/{job_id}")
     assert not_found.status_code == 404
+
+
+def test_preview_access_does_not_consume_original_image_quota_and_supports_batch_fetch(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    large_png = make_png()
+
+    def fake_generate_image(prompt, model, mode, params, reference_images):
+        return {
+            "raw": {"candidates": []},
+            "images": [{"mime": "image/png", "bytes": large_png}],
+            "usage_metadata": {"totalTokenCount": 10},
+            "finish_reason": "STOP",
+            "safety_ratings": [],
+            "latency_ms": 50,
+        }
+
+    monkeypatch.setattr("app.gemini_client.gemini_client.generate_image", fake_generate_image)
+    login(client)
+
+    updated_policy = client.patch(
+        "/v1/admin/policy",
+        json={
+            "default_user_daily_image_access_limit": 0,
+            "default_user_image_access_turnstile_bonus_quota": 0,
+            "default_user_daily_image_access_hard_limit": 0,
+        },
+    )
+    assert updated_policy.status_code == 200
+
+    created = client.post(
+        "/v1/admin/users",
+        json={
+            "username": "previewuser",
+            "password": "previewpass123",
+            "role": "USER",
+            "enabled": True,
+        },
+    )
+    assert created.status_code == 201
+
+    client.post("/v1/auth/logout")
+    login(client, username="previewuser", password="previewpass123")
+
+    created_job = client.post(
+        "/v1/jobs",
+        json={
+            "prompt": "preview prompt",
+            "params": {
+                "aspect_ratio": "16:9",
+                "image_size": "1K",
+                "temperature": 0.7,
+                "timeout_sec": 60,
+                "max_retries": 0,
+            },
+            "mode": "IMAGE_ONLY",
+        },
+    )
+    assert created_job.status_code == 201
+    body = created_job.json()
+    job_id = body["job_id"]
+    job_token = body["job_access_token"]
+
+    meta = None
+    for _ in range(30):
+        rr = client.get(f"/v1/jobs/{job_id}", headers={"X-Job-Token": job_token})
+        assert rr.status_code == 200
+        meta = rr.json()
+        if meta["status"] == "SUCCEEDED":
+            break
+        time.sleep(0.1)
+    assert meta is not None
+    assert meta["status"] == "SUCCEEDED"
+    assert meta["result"]["images"][0]["preview"]["mime"] == "image/webp"
+
+    preview = client.get(f"/v1/jobs/{job_id}/images/image_0/preview", headers={"X-Job-Token": job_token})
+    assert preview.status_code == 200
+    assert preview.headers["content-type"].startswith("image/webp")
+
+    preview_user = user_store.get_user_by_username("previewuser")
+    assert preview_user is not None
+    assert user_store.get_daily_usage(str(preview_user["user_id"]))["image_accesses"] == 0
+
+    batch_preview = client.post(
+        "/v1/jobs/previews/batch",
+        json={
+            "images": [
+                {
+                    "job_id": job_id,
+                    "job_access_token": job_token,
+                    "image_id": "image_0",
+                }
+            ]
+        },
+    )
+    assert batch_preview.status_code == 200
+    batch_body = batch_preview.json()
+    assert batch_body["ok"] == 1
+    assert batch_body["items"][0]["image_id"] == "image_0"
+    assert batch_body["items"][0]["mime"] == "image/webp"
+    assert batch_body["items"][0]["size_bytes"] <= len(large_png)
+
+    raw = client.get(f"/v1/jobs/{job_id}/images/image_0", headers={"X-Job-Token": job_token})
+    assert raw.status_code == 429
+    assert raw.json()["error"]["code"] == "QUOTA_EXCEEDED"
+
+
+def test_batch_preview_limit_caps_response_size(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(settings, "preview_batch_limit", 3)
+    login(client)
+
+    for idx in range(5):
+        job_id = f"{idx + 1:032d}"
+        storage.create_job_dirs(job_id)
+        image_bytes = make_png(1200, 900, (40 + idx * 20, 80, 160))
+        preview_bytes = make_webp(1200, 900, (40 + idx * 20, 80, 160))
+        original_filename = storage.save_result_image(job_id, "image_0", image_bytes, "image/png")
+        preview_filename = storage.save_preview_image(job_id, "image_0", preview_bytes, "image/webp")
+        storage.save_request(job_id, {"prompt": f"prompt {idx}", "reference_images": []})
+        storage.save_response(job_id, {"latency_ms": 10})
+        storage.save_meta(
+            job_id,
+            {
+                "job_id": job_id,
+                "created_at": "2026-03-10T00:00:00+00:00",
+                "updated_at": "2026-03-10T00:00:00+00:00",
+                "status": "SUCCEEDED",
+                "model": "gemini-3.1-flash-image-preview",
+                "mode": "IMAGE_ONLY",
+                "params": {
+                    "aspect_ratio": "1:1",
+                    "image_size": "1K",
+                    "temperature": 0.7,
+                    "timeout_sec": 60,
+                    "max_retries": 0,
+                },
+                "timing": {},
+                "result": {
+                    "images": [
+                        {
+                            "image_id": "image_0",
+                            "filename": original_filename,
+                            "mime": "image/png",
+                            "width": 1200,
+                            "height": 900,
+                            "sha256": f"hash-{idx}",
+                            "preview": {
+                                "filename": preview_filename,
+                                "mime": "image/webp",
+                                "width": 1200,
+                                "height": 900,
+                                "size_bytes": len(preview_bytes),
+                            },
+                        }
+                    ]
+                },
+                "usage": {},
+                "billing": {},
+                "response": {},
+                "error": None,
+                "owner": {"user_id": "admin", "username": "admin", "role": "ADMIN"},
+            },
+        )
+
+    resp = client.post(
+        "/v1/jobs/previews/batch",
+        json={"images": [{"job_id": f"{idx + 1:032d}", "image_id": "image_0"} for idx in range(5)]},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["requested"] == 3
+    assert body["ok"] == 3
 
 
 def test_model_validation_after_login(client: TestClient) -> None:

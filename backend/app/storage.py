@@ -26,6 +26,7 @@ class JobStorage:
     def create_job_dirs(self, job_id: str) -> Path:
         root = self.job_dir(job_id)
         (root / "result").mkdir(parents=True, exist_ok=True)
+        (root / "preview").mkdir(parents=True, exist_ok=True)
         (root / "logs").mkdir(parents=True, exist_ok=True)
         (root / "input").mkdir(parents=True, exist_ok=True)
         return root
@@ -85,6 +86,17 @@ class JobStorage:
             "image/webp": "webp",
         }.get(mime, "png")
         relative = f"result/{image_id}.{ext}"
+        path = self.job_dir(job_id) / relative
+        path.write_bytes(content)
+        return relative
+
+    def save_preview_image(self, job_id: str, image_id: str, content: bytes, mime: str) -> str:
+        ext = {
+            "image/png": "png",
+            "image/jpeg": "jpg",
+            "image/webp": "webp",
+        }.get(mime, "webp")
+        relative = f"preview/{image_id}.{ext}"
         path = self.job_dir(job_id) / relative
         path.write_bytes(content)
         return relative

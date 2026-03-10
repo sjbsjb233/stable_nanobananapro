@@ -79,6 +79,9 @@ class Settings(BaseSettings):
     default_user_image_access_turnstile_bonus_quota: int = Field(default=15, alias="DEFAULT_USER_IMAGE_ACCESS_TURNSTILE_BONUS_QUOTA")
     default_user_daily_image_access_hard_limit: int = Field(default=350, alias="DEFAULT_USER_DAILY_IMAGE_ACCESS_HARD_LIMIT")
     overquota_real_job_run_probability: float = Field(default=0.5, alias="OVERQUOTA_REAL_JOB_RUN_PROBABILITY")
+    preview_image_max_px: int = Field(default=1400, alias="PREVIEW_IMAGE_MAX_PX")
+    preview_image_quality: int = Field(default=78, alias="PREVIEW_IMAGE_QUALITY")
+    preview_batch_limit: int = Field(default=72, alias="PREVIEW_BATCH_LIMIT")
 
 
 settings = Settings()
