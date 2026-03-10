@@ -78,6 +78,14 @@ type DefaultParams = {
   max_retries: number;
 };
 
+type PickerCompareMode = "ONE" | "TWO" | "FOUR";
+
+type PickerBucket = "FILMSTRIP" | "PREFERRED" | "DELETED";
+
+type PickerScheduleMode = "REVIEW_NEW" | "RESOLVE_FILMSTRIP" | "POLISH_PICKED" | "EMPTY";
+
+type PickerGenStatus = "succeeded" | "running" | "queued" | "failed";
+
 type SettingsV1 = {
   baseUrl: string;
   defaultModel: ModelId;
@@ -100,6 +108,15 @@ type SettingsV1 = {
     enabled: boolean;
     ttlDays: number;
     maxBytes: number;
+  };
+  pickerScheduler: {
+    moveCooldownTurns: number;
+    recentHistory: Record<PickerCompareMode, number>;
+    newArrivalBonus: number;
+    justCompletedBonus: number;
+    unseenBonus: number;
+    resolveUrgencyWeight: number;
+    polishRatingWeight: number;
   };
 };
 
@@ -176,8 +193,6 @@ type BatchSection = {
   enabled: boolean;
 };
 
-type PickerCompareMode = "TWO" | "FOUR" | "FILMSTRIP";
-
 type PickerLayoutPreset = "SYNC_ZOOM" | "FREE_ZOOM";
 
 type PickerItemRef = {
@@ -190,13 +205,28 @@ type PickerSessionItem = {
   job_id: string;
   job_access_token?: string;
   image_id?: string;
+  bucket?: PickerBucket;
   pool?: "FILMSTRIP" | "PREFERRED";
   label?: string;
   rating?: number;
+  reviewed?: boolean;
   picked?: boolean;
   notes?: string;
   status?: JobStatus;
   added_at: string;
+  show_count_total?: number;
+  show_count_by_mode?: Partial<Record<PickerCompareMode, number>>;
+  last_shown_at?: string | null;
+  first_shown_at?: string | null;
+  last_rated_at?: string | null;
+  last_hard_action_at?: string | null;
+  cooldown_until_turn?: number | null;
+  arrival_seq?: number;
+  arrival_turn?: number;
+  last_status_changed_at?: string | null;
+  just_completed_at?: string | null;
+  just_completed_turn?: number | null;
+  cluster_id?: string | null;
 };
 
 type PickerSession = {
@@ -216,6 +246,13 @@ type PickerSession = {
   };
   slots: Array<string | null>;
   focus_key?: string | null;
+  scheduler: {
+    turn: number;
+    next_arrival_seq: number;
+    recent_history: Record<PickerCompareMode, string[]>;
+    last_mode: PickerScheduleMode;
+    last_boundary_at?: string | null;
+  };
 };
 
 // Back-end meta (best-effort typing; adapt if your API differs)
@@ -1185,7 +1222,11 @@ function invalidatePickerEntriesForDeletedJob(jobId: string) {
 function getPickerSessionCounts(session: PickerSession) {
   return session.items.reduce(
     (acc, item) => {
-      if ((item.pool || "FILMSTRIP") === "PREFERRED") {
+      const bucket = pickerBucketOf(item);
+      if (bucket === "DELETED") {
+        return acc;
+      }
+      if (bucket === "PREFERRED") {
         acc.preferred += 1;
       } else {
         acc.filmstrip += 1;
@@ -1348,6 +1389,19 @@ const DEFAULT_SETTINGS: SettingsV1 = {
     ttlDays: 3,
     maxBytes: 2 * 1024 * 1024 * 1024,
   },
+  pickerScheduler: {
+    moveCooldownTurns: 2,
+    recentHistory: {
+      ONE: 5,
+      TWO: 8,
+      FOUR: 12,
+    },
+    newArrivalBonus: 40,
+    justCompletedBonus: 35,
+    unseenBonus: 100,
+    resolveUrgencyWeight: 30,
+    polishRatingWeight: 12,
+  },
 };
 
 const FALLBACK_MODEL_CATALOG: ModelsPayload = {
@@ -1410,6 +1464,14 @@ function coerceSettings(raw: any): SettingsV1 {
     ui: { ...DEFAULT_SETTINGS.ui, ...((raw || {}).ui || {}) },
     polling: { ...DEFAULT_SETTINGS.polling, ...((raw || {}).polling || {}) },
     cache: { ...DEFAULT_SETTINGS.cache, ...((raw || {}).cache || {}) },
+    pickerScheduler: {
+      ...DEFAULT_SETTINGS.pickerScheduler,
+      ...((raw || {}).pickerScheduler || {}),
+      recentHistory: {
+        ...DEFAULT_SETTINGS.pickerScheduler.recentHistory,
+        ...(((raw || {}).pickerScheduler || {}).recentHistory || {}),
+      },
+    },
   } as SettingsV1;
 
   const rawByModel = (raw || {}).defaultParamsByModel;
@@ -1622,6 +1684,117 @@ type PickerRecent = {
   last_opened_at: string;
 };
 
+function createEmptyPickerRecentHistory(): Record<PickerCompareMode, string[]> {
+  return {
+    ONE: [],
+    TWO: [],
+    FOUR: [],
+  };
+}
+
+function pickerCompareModeSlotCount(mode: PickerCompareMode) {
+  return mode === "FOUR" ? 4 : mode === "TWO" ? 2 : 1;
+}
+
+function pickerBucketOf(item?: PickerSessionItem | null): PickerBucket {
+  if (!item) return "FILMSTRIP";
+  if (item.bucket === "DELETED") return "DELETED";
+  if (item.bucket === "PREFERRED") return "PREFERRED";
+  if (item.bucket === "FILMSTRIP") return "FILMSTRIP";
+  return item.pool === "PREFERRED" ? "PREFERRED" : "FILMSTRIP";
+}
+
+function pickerGenStatusFromJobStatus(status?: JobStatus): PickerGenStatus {
+  if (status === "SUCCEEDED") return "succeeded";
+  if (status === "RUNNING") return "running";
+  if (status === "QUEUED") return "queued";
+  return "failed";
+}
+
+function createEmptyPickerScheduler() {
+  return {
+    turn: 0,
+    next_arrival_seq: 1,
+    recent_history: createEmptyPickerRecentHistory(),
+    last_mode: "EMPTY" as PickerScheduleMode,
+    last_boundary_at: null,
+  };
+}
+
+function normalizePickerItem(raw: any, nextArrivalSeq: () => number): PickerSessionItem | null {
+  if (!raw?.job_id) return null;
+  const now = isoNow();
+  const image_id = raw?.image_id ? String(raw.image_id) : undefined;
+  const item_key =
+    typeof raw?.item_key === "string" && raw.item_key
+      ? String(raw.item_key)
+      : image_id
+        ? undefined
+        : pickerPendingItemKey(String(raw.job_id));
+  if (!image_id && !item_key) return null;
+  const rawStatus = String(raw?.status || "");
+  const status = (["QUEUED", "RUNNING", "CANCELLED", "SUCCEEDED", "FAILED", "UNKNOWN"] as const).includes(rawStatus as any)
+    ? (rawStatus as JobStatus)
+    : image_id
+      ? "SUCCEEDED"
+      : "UNKNOWN";
+  const bucket = raw?.bucket === "DELETED" ? "DELETED" : raw?.bucket === "PREFERRED" || raw?.pool === "PREFERRED" ? "PREFERRED" : "FILMSTRIP";
+  const arrivalSeq =
+    typeof raw?.arrival_seq === "number" && Number.isFinite(raw.arrival_seq) && raw.arrival_seq > 0
+      ? Math.floor(raw.arrival_seq)
+      : nextArrivalSeq();
+  const reviewed =
+    typeof raw?.reviewed === "boolean"
+      ? raw.reviewed
+      : typeof raw?.rating === "number" && Number.isFinite(raw.rating)
+        ? true
+        : false;
+  const showCountByMode = raw?.show_count_by_mode && typeof raw.show_count_by_mode === "object"
+    ? {
+        ONE: Math.max(0, Number(raw.show_count_by_mode.ONE || 0) || 0),
+        TWO: Math.max(0, Number(raw.show_count_by_mode.TWO || 0) || 0),
+        FOUR: Math.max(0, Number(raw.show_count_by_mode.FOUR || 0) || 0),
+      }
+    : undefined;
+  return {
+    item_key,
+    job_id: String(raw.job_id),
+    job_access_token: raw.job_access_token ? String(raw.job_access_token) : undefined,
+    image_id,
+    bucket,
+    pool: bucket === "PREFERRED" ? "PREFERRED" : "FILMSTRIP",
+    label: raw.label ? String(raw.label) : undefined,
+    rating: typeof raw.rating === "number" ? clamp(Math.round(raw.rating), 1, 5) : undefined,
+    reviewed,
+    picked: raw.picked !== undefined ? Boolean(raw.picked) : true,
+    notes: raw.notes ? String(raw.notes) : undefined,
+    status,
+    added_at: String(raw.added_at || now),
+    show_count_total: Math.max(0, Number(raw.show_count_total || 0) || 0),
+    show_count_by_mode: showCountByMode,
+    last_shown_at: raw.last_shown_at ? String(raw.last_shown_at) : null,
+    first_shown_at: raw.first_shown_at ? String(raw.first_shown_at) : null,
+    last_rated_at: raw.last_rated_at ? String(raw.last_rated_at) : null,
+    last_hard_action_at: raw.last_hard_action_at ? String(raw.last_hard_action_at) : null,
+    cooldown_until_turn:
+      typeof raw.cooldown_until_turn === "number" && Number.isFinite(raw.cooldown_until_turn)
+        ? Math.floor(raw.cooldown_until_turn)
+        : null,
+    arrival_seq: arrivalSeq,
+    arrival_turn:
+      typeof raw.arrival_turn === "number" && Number.isFinite(raw.arrival_turn)
+        ? Math.floor(raw.arrival_turn)
+        : 0,
+    last_status_changed_at: raw.last_status_changed_at ? String(raw.last_status_changed_at) : null,
+    just_completed_at: raw.just_completed_at ? String(raw.just_completed_at) : null,
+    just_completed_turn:
+      typeof raw.just_completed_turn === "number" && Number.isFinite(raw.just_completed_turn)
+        ? Math.floor(raw.just_completed_turn)
+        : null,
+    cluster_id: raw.cluster_id === null ? null : raw.cluster_id ? String(raw.cluster_id) : null,
+  } satisfies PickerSessionItem;
+}
+
 function createPickerSession(name?: string): PickerSession {
   const now = isoNow();
   return {
@@ -1639,11 +1812,42 @@ function createPickerSession(name?: string): PickerSession {
     },
     slots: [null, null, null, null],
     focus_key: null,
+    scheduler: createEmptyPickerScheduler(),
   };
 }
 
 function normalizePickerSession(raw: any): PickerSession {
   const now = isoNow();
+  let nextArrivalSeq = 1;
+  const claimArrivalSeq = () => nextArrivalSeq++;
+  const items = Array.isArray(raw?.items)
+    ? raw.items
+        .map((it: any) => normalizePickerItem(it, claimArrivalSeq))
+        .filter(Boolean) as PickerSessionItem[]
+    : [];
+  const maxArrivalSeq = items.reduce((max, item) => Math.max(max, item.arrival_seq || 0), 0);
+  const rawRecentHistory = raw?.scheduler?.recent_history || {};
+  const scheduler = {
+    ...createEmptyPickerScheduler(),
+    ...(raw?.scheduler || {}),
+    turn:
+      typeof raw?.scheduler?.turn === "number" && Number.isFinite(raw.scheduler.turn)
+        ? Math.max(0, Math.floor(raw.scheduler.turn))
+        : 0,
+    next_arrival_seq:
+      typeof raw?.scheduler?.next_arrival_seq === "number" && Number.isFinite(raw.scheduler.next_arrival_seq)
+        ? Math.max(maxArrivalSeq + 1, Math.floor(raw.scheduler.next_arrival_seq))
+        : Math.max(maxArrivalSeq + 1, nextArrivalSeq),
+    recent_history: {
+      ONE: Array.isArray(rawRecentHistory.ONE) ? rawRecentHistory.ONE.filter((x: unknown) => typeof x === "string") : [],
+      TWO: Array.isArray(rawRecentHistory.TWO) ? rawRecentHistory.TWO.filter((x: unknown) => typeof x === "string") : [],
+      FOUR: Array.isArray(rawRecentHistory.FOUR) ? rawRecentHistory.FOUR.filter((x: unknown) => typeof x === "string") : [],
+    },
+    last_mode: (["REVIEW_NEW", "RESOLVE_FILMSTRIP", "POLISH_PICKED", "EMPTY"] as const).includes(raw?.scheduler?.last_mode)
+      ? raw.scheduler.last_mode
+      : "EMPTY",
+    last_boundary_at: raw?.scheduler?.last_boundary_at ? String(raw.scheduler.last_boundary_at) : null,
+  };
   const session: PickerSession = {
     session_id: String(raw?.session_id || `pk_${Math.random().toString(36).slice(2, 10)}`),
     name: String(raw?.name || "未命名会话"),
@@ -1653,45 +1857,12 @@ function normalizePickerSession(raw: any): PickerSession {
       raw?.cover?.job_id && raw?.cover?.image_id
         ? { job_id: String(raw.cover.job_id), image_id: String(raw.cover.image_id) }
         : undefined,
-    items: Array.isArray(raw?.items)
-      ? raw.items
-          .map((it: any) => {
-            if (!it?.job_id) return null;
-            const image_id = it?.image_id ? String(it.image_id) : undefined;
-            const item_key =
-              typeof it?.item_key === "string" && it.item_key
-                ? String(it.item_key)
-                : image_id
-                  ? undefined
-                  : pickerPendingItemKey(String(it.job_id));
-            if (!image_id && !item_key) return null;
-            const rawStatus = String(it?.status || "");
-            const status = (["QUEUED", "RUNNING", "CANCELLED", "SUCCEEDED", "FAILED", "UNKNOWN"] as const).includes(rawStatus as any)
-              ? (rawStatus as JobStatus)
-              : image_id
-                ? "SUCCEEDED"
-                : "UNKNOWN";
-            return {
-              item_key,
-              job_id: String(it.job_id),
-              job_access_token: it.job_access_token ? String(it.job_access_token) : undefined,
-              image_id,
-              pool: it.pool === "PREFERRED" ? "PREFERRED" : "FILMSTRIP",
-              label: it.label ? String(it.label) : undefined,
-              rating: typeof it.rating === "number" ? clamp(Math.round(it.rating), 1, 5) : undefined,
-              picked: it.picked !== undefined ? Boolean(it.picked) : true,
-              notes: it.notes ? String(it.notes) : undefined,
-              status,
-              added_at: String(it.added_at || now),
-            } as PickerSessionItem;
-          })
-          .filter(Boolean) as PickerSessionItem[]
-      : [],
+    items,
     best_image:
       raw?.best_image?.job_id && raw?.best_image?.image_id
         ? { job_id: String(raw.best_image.job_id), image_id: String(raw.best_image.image_id) }
         : undefined,
-    compare_mode: raw?.compare_mode === "FOUR" || raw?.compare_mode === "FILMSTRIP" ? raw.compare_mode : "TWO",
+    compare_mode: raw?.compare_mode === "FOUR" || raw?.compare_mode === "ONE" ? raw.compare_mode : raw?.compare_mode === "FILMSTRIP" ? "ONE" : "TWO",
     layout_preset: raw?.layout_preset === "FREE_ZOOM" ? "FREE_ZOOM" : "SYNC_ZOOM",
     ui: {
       background: raw?.ui?.background === "light" ? "light" : "dark",
@@ -1702,6 +1873,7 @@ function normalizePickerSession(raw: any): PickerSession {
       ? raw.slots.slice(0, 4).map((x: any) => (typeof x === "string" && x.includes("::") ? x : null))
       : [null, null, null, null],
     focus_key: typeof raw?.focus_key === "string" ? raw.focus_key : null,
+    scheduler,
   };
   while (session.slots.length < 4) session.slots.push(null);
   return session;
@@ -1739,6 +1911,14 @@ function compactPickerSessionsForStorage(sessions: PickerSession[]) {
       slots,
       focus_key,
       best_image,
+      scheduler: {
+        ...session.scheduler,
+        recent_history: {
+          ONE: session.scheduler.recent_history.ONE.slice(0, 24),
+          TWO: session.scheduler.recent_history.TWO.slice(0, 24),
+          FOUR: session.scheduler.recent_history.FOUR.slice(0, 24),
+        },
+      },
     };
   });
 }
@@ -1840,37 +2020,45 @@ const usePickerStore = create<PickerStore>((set, get) => {
       if (!items.length) return;
       get().patchSession(session_id, (session) => {
         const existing = new Set(session.items.map((it) => pickerItemKey(it)));
+        let nextArrivalSeq = Math.max(1, session.scheduler?.next_arrival_seq || 1);
         const normalizedNew = items
-          .map((it) => ({
-            ...it,
-            pool: it.pool === "PREFERRED" ? "PREFERRED" : "FILMSTRIP",
-            picked: it.picked !== undefined ? it.picked : true,
-            status: it.status || (pickerItemHasImage(it) ? "SUCCEEDED" : "UNKNOWN"),
-            item_key: it.item_key || (!pickerItemHasImage(it) ? pickerPendingItemKey(it.job_id) : undefined),
-            added_at: it.added_at || isoNow(),
-          }))
+          .map((it) =>
+            normalizePickerItem(
+              {
+                ...it,
+                bucket: it.bucket || (it.pool === "PREFERRED" ? "PREFERRED" : "FILMSTRIP"),
+                reviewed:
+                  typeof it.reviewed === "boolean"
+                    ? it.reviewed
+                    : typeof it.rating === "number" && Number.isFinite(it.rating)
+                      ? true
+                      : false,
+                picked: it.picked !== undefined ? it.picked : true,
+                status: it.status || (pickerItemHasImage(it) ? "SUCCEEDED" : "UNKNOWN"),
+                item_key: it.item_key || (!pickerItemHasImage(it) ? pickerPendingItemKey(it.job_id) : undefined),
+                added_at: it.added_at || isoNow(),
+                arrival_seq: it.arrival_seq || nextArrivalSeq,
+                arrival_turn: it.arrival_turn ?? (session.scheduler?.turn || 0),
+              },
+              () => nextArrivalSeq++
+            )
+          )
+          .filter(Boolean)
+          .map((it) => it as PickerSessionItem)
           .filter((it) => !existing.has(pickerItemKey(it)));
         if (!normalizedNew.length) return session;
-
-        const slots = [...session.slots];
-        normalizedNew.forEach((item) => {
-          const key = pickerItemKey(item);
-          const emptyIndex = slots.findIndex((x) => !x);
-          if (emptyIndex >= 0) {
-            slots[emptyIndex] = key;
-            item.label = item.label || String.fromCharCode(65 + emptyIndex);
-          }
-        });
-
-        const focus_key = session.focus_key || slots.find(Boolean) || pickerItemKey(normalizedNew[0]);
+        const focus_key = session.focus_key || pickerItemKey(normalizedNew[0]);
         const firstImageItem = normalizedNew.find((item) => pickerItemHasImage(item));
         const cover = session.cover || (firstImageItem ? { job_id: firstImageItem.job_id, image_id: firstImageItem.image_id } : undefined);
         return {
           ...session,
           items: [...session.items, ...normalizedNew],
-          slots,
           cover,
           focus_key,
+          scheduler: {
+            ...(session.scheduler || createEmptyPickerScheduler()),
+            next_arrival_seq: Math.max(nextArrivalSeq, (session.scheduler?.next_arrival_seq || 1) + normalizedNew.length),
+          },
         };
       });
     },
@@ -1918,6 +2106,480 @@ const usePickerStore = create<PickerStore>((set, get) => {
     },
   };
 });
+
+type PickerSchedulerSettings = SettingsV1["pickerScheduler"];
+
+type PickerCandidate = {
+  key: string;
+  item: PickerSessionItem;
+  bucket: PickerBucket;
+  genStatus: PickerGenStatus;
+  layer: number;
+  score: number;
+};
+
+function pickerShowCountInMode(item: PickerSessionItem, mode: PickerCompareMode) {
+  return Math.max(0, Number(item.show_count_by_mode?.[mode] || 0) || 0);
+}
+
+function pickerItemsEqualBucket(item: PickerSessionItem, bucket: PickerBucket) {
+  return pickerBucketOf(item) === bucket;
+}
+
+function pickerVisibleCandidateItems(items: PickerSessionItem[]) {
+  return items.filter((item) => pickerBucketOf(item) !== "DELETED");
+}
+
+function pickerScheduleMode(items: PickerSessionItem[]): PickerScheduleMode {
+  const filmstrip = items.filter((item) => pickerItemsEqualBucket(item, "FILMSTRIP"));
+  if (filmstrip.some((item) => !item.reviewed)) return "REVIEW_NEW";
+  if (filmstrip.length) return "RESOLVE_FILMSTRIP";
+  if (items.some((item) => pickerItemsEqualBucket(item, "PREFERRED"))) return "POLISH_PICKED";
+  return "EMPTY";
+}
+
+function pickerLayerForItem(item: PickerSessionItem, mode: PickerScheduleMode) {
+  const bucket = pickerBucketOf(item);
+  const reviewed = Boolean(item.reviewed);
+  const statusRank = {
+    succeeded: 0,
+    running: 1,
+    queued: 2,
+    failed: 3,
+  }[pickerGenStatusFromJobStatus(item.status)];
+
+  if (mode === "REVIEW_NEW") {
+    if (bucket === "FILMSTRIP" && !reviewed) return statusRank;
+    if (bucket === "FILMSTRIP") return 4 + statusRank;
+    if (bucket === "PREFERRED") return 8 + statusRank;
+    return 99;
+  }
+  if (mode === "RESOLVE_FILMSTRIP") {
+    if (bucket === "FILMSTRIP") return statusRank;
+    if (bucket === "PREFERRED") return 4 + statusRank;
+    return 99;
+  }
+  if (mode === "POLISH_PICKED") {
+    if (bucket === "PREFERRED") return statusRank;
+    return 99;
+  }
+  return 99;
+}
+
+function pickerRecentPenalty(key: string, recentHistory: string[]) {
+  const idx = recentHistory.indexOf(key);
+  if (idx < 0) return 0;
+  if (idx < 4) return 100;
+  if (idx < 10) return 50;
+  return 20;
+}
+
+function pickerStaleBonus(lastShownAt?: string | null) {
+  if (!lastShownAt) return 12;
+  const elapsedMs = Date.now() - new Date(lastShownAt).getTime();
+  if (!Number.isFinite(elapsedMs) || elapsedMs <= 0) return 0;
+  return Math.min(elapsedMs / 1000 / 60 / 2, 30);
+}
+
+function pickerScoreItem(args: {
+  item: PickerSessionItem;
+  mode: PickerScheduleMode;
+  compareMode: PickerCompareMode;
+  currentTurn: number;
+  schedulerSettings: PickerSchedulerSettings;
+  recentHistory: string[];
+  selectedClusterIds: Set<string>;
+  currentStageSet: Set<string>;
+}) {
+  const { item, mode, compareMode, currentTurn, schedulerSettings, recentHistory, selectedClusterIds, currentStageSet } = args;
+  const key = pickerItemKey(item);
+  let score = 0;
+  if ((currentTurn - (item.arrival_turn || 0)) <= 2) score += schedulerSettings.newArrivalBonus;
+  if (item.just_completed_turn !== null && item.just_completed_turn !== undefined && currentTurn - item.just_completed_turn <= 2) {
+    score += schedulerSettings.justCompletedBonus;
+  }
+  if (!item.reviewed) score += schedulerSettings.unseenBonus;
+  score += Math.max(0, 50 - pickerShowCountInMode(item, compareMode) * 10);
+
+  if (mode === "REVIEW_NEW") {
+    score += item.reviewed ? 0 : 20;
+  }
+  if (mode === "RESOLVE_FILMSTRIP" && item.rating != null) {
+    score += Math.abs(item.rating - 3) * schedulerSettings.resolveUrgencyWeight;
+  }
+  if (mode === "POLISH_PICKED" && item.rating != null) {
+    score += item.rating * schedulerSettings.polishRatingWeight;
+  }
+
+  score += pickerStaleBonus(item.last_shown_at);
+  score -= pickerRecentPenalty(key, recentHistory);
+
+  if (item.cooldown_until_turn != null && currentTurn < item.cooldown_until_turn) score -= 9999;
+  if (currentStageSet.has(key)) score -= 9999;
+  if (item.cluster_id && selectedClusterIds.has(item.cluster_id)) score -= mode === "POLISH_PICKED" ? 40 : mode === "RESOLVE_FILMSTRIP" ? 65 : 90;
+
+  return score;
+}
+
+function pickerValidSlots(session: PickerSession) {
+  const itemMap = new Map(session.items.map((item) => [pickerItemKey(item), item]));
+  const seen = new Set<string>();
+  const slots = [...session.slots].slice(0, 4).map((key) => {
+    if (!key || seen.has(key)) return null;
+    const item = itemMap.get(key);
+    if (!item || pickerBucketOf(item) === "DELETED") return null;
+    seen.add(key);
+    return key;
+  });
+  while (slots.length < 4) slots.push(null);
+  return slots;
+}
+
+function pickerSelectKeys(args: {
+  items: PickerSessionItem[];
+  compareMode: PickerCompareMode;
+  mode: PickerScheduleMode;
+  currentTurn: number;
+  schedulerSettings: PickerSchedulerSettings;
+  recentHistory: string[];
+  currentStageKeys: string[];
+  preservedKeys: string[];
+}) {
+  const {
+    items,
+    compareMode,
+    mode,
+    currentTurn,
+    schedulerSettings,
+    recentHistory,
+    currentStageKeys,
+    preservedKeys,
+  } = args;
+  const slotCount = pickerCompareModeSlotCount(compareMode);
+  const preservedSet = new Set(preservedKeys);
+  const currentStageSet = new Set(currentStageKeys);
+  const buildCandidates = (allowCooldown: boolean) => {
+    const selectedClusterIds = new Set<string>(
+      preservedKeys
+        .map((key) => items.find((item) => pickerItemKey(item) === key)?.cluster_id || null)
+        .filter(Boolean) as string[]
+    );
+    return items
+      .filter((item) => !preservedSet.has(pickerItemKey(item)))
+      .filter((item) => pickerBucketOf(item) !== "DELETED")
+      .filter((item) => (allowCooldown ? true : item.cooldown_until_turn == null || currentTurn >= item.cooldown_until_turn))
+      .map((item) => {
+        const layer = pickerLayerForItem(item, mode);
+        return {
+          key: pickerItemKey(item),
+          item,
+          bucket: pickerBucketOf(item),
+          genStatus: pickerGenStatusFromJobStatus(item.status),
+          layer,
+          score: pickerScoreItem({
+            item,
+            mode,
+            compareMode,
+            currentTurn,
+            schedulerSettings,
+            recentHistory,
+            selectedClusterIds,
+            currentStageSet,
+          }),
+        } satisfies PickerCandidate;
+      })
+      .filter((candidate) => candidate.layer < 99)
+      .sort((a, b) => {
+        if (a.layer !== b.layer) return a.layer - b.layer;
+        if (a.score !== b.score) return b.score - a.score;
+        return (b.item.arrival_seq || 0) - (a.item.arrival_seq || 0);
+      });
+  };
+
+  const selected = [...preservedKeys];
+  const chosen = new Set(selected);
+  const takeBest = (predicate: (candidate: PickerCandidate) => boolean, pool: PickerCandidate[]) => {
+    const found = pool.find((candidate) => !chosen.has(candidate.key) && predicate(candidate));
+    if (!found) return false;
+    selected.push(found.key);
+    chosen.add(found.key);
+    return true;
+  };
+
+  const fillFrom = (pool: PickerCandidate[]) => {
+    while (selected.length < slotCount) {
+      const runningCount = selected.filter((key) => pickerGenStatusFromJobStatus(items.find((item) => pickerItemKey(item) === key)?.status) === "running").length;
+      const queuedCount = selected.filter((key) => pickerGenStatusFromJobStatus(items.find((item) => pickerItemKey(item) === key)?.status) === "queued").length;
+      const candidate = pool.find((entry) => {
+        if (chosen.has(entry.key)) return false;
+        if (compareMode === "FOUR") {
+          if (entry.genStatus === "failed") {
+            return !pool.some((other) => !chosen.has(other.key) && other.genStatus !== "failed");
+          }
+          if (entry.genStatus === "queued" && queuedCount >= 1) {
+            return !pool.some((other) => !chosen.has(other.key) && other.genStatus !== "queued");
+          }
+          if (entry.genStatus === "running" && runningCount >= 2) {
+            return !pool.some((other) => !chosen.has(other.key) && other.genStatus !== "running");
+          }
+        }
+        return true;
+      });
+      if (!candidate) break;
+      selected.push(candidate.key);
+      chosen.add(candidate.key);
+    }
+  };
+
+  const primaryPool = buildCandidates(false);
+  const fallbackPool = buildCandidates(true);
+
+  if (selected.length < slotCount && compareMode !== "ONE") {
+    if (mode === "REVIEW_NEW") {
+      takeBest((candidate) => candidate.bucket === "FILMSTRIP" && !candidate.item.reviewed, primaryPool);
+    }
+    takeBest((candidate) => candidate.genStatus === "succeeded", primaryPool);
+  }
+  if (selected.length < slotCount && compareMode === "FOUR") {
+    if (mode === "REVIEW_NEW") {
+      while (
+        selected.length < slotCount &&
+        selected.filter((key) => {
+          const item = items.find((entry) => pickerItemKey(entry) === key);
+          return item && pickerItemsEqualBucket(item, "FILMSTRIP") && !item.reviewed;
+        }).length < 4 &&
+        takeBest((candidate) => candidate.bucket === "FILMSTRIP" && !candidate.item.reviewed, primaryPool)
+      ) {
+        // keep filling new filmstrip first
+      }
+    }
+    while (
+      selected.filter((key) => {
+        const item = items.find((entry) => pickerItemKey(entry) === key);
+        return item && pickerGenStatusFromJobStatus(item.status) === "succeeded";
+      }).length < 2 &&
+      takeBest((candidate) => candidate.genStatus === "succeeded", primaryPool)
+    ) {
+      // ensure at least two succeeded cards when available
+    }
+  }
+
+  fillFrom(primaryPool);
+  if (selected.length < slotCount) fillFrom(fallbackPool);
+  return selected.slice(0, slotCount);
+}
+
+function pickerUpdateBestImage(items: PickerSessionItem[]) {
+  const preferred = items.find((item) => pickerItemsEqualBucket(item, "PREFERRED") && pickerItemHasImage(item));
+  return preferred ? { job_id: preferred.job_id, image_id: preferred.image_id } : undefined;
+}
+
+function pickerRecordExposure(args: {
+  session: PickerSession;
+  compareMode: PickerCompareMode;
+  visibleKeys: string[];
+  markOnlyNew?: boolean;
+}) {
+  const { session, compareMode, visibleKeys, markOnlyNew } = args;
+  const visibleSet = new Set(visibleKeys);
+  const previousVisible = new Set(pickerValidSlots(session).slice(0, pickerCompareModeSlotCount(compareMode)).filter(Boolean) as string[]);
+  const now = isoNow();
+  const items = session.items.map((item) => {
+    const key = pickerItemKey(item);
+    if (!visibleSet.has(key)) return item;
+    if (markOnlyNew && previousVisible.has(key)) return item;
+    return {
+      ...item,
+      show_count_total: (item.show_count_total || 0) + 1,
+      show_count_by_mode: {
+        ONE: item.show_count_by_mode?.ONE || 0,
+        TWO: item.show_count_by_mode?.TWO || 0,
+        FOUR: item.show_count_by_mode?.FOUR || 0,
+        [compareMode]: pickerShowCountInMode(item, compareMode) + 1,
+      },
+      first_shown_at: item.first_shown_at || now,
+      last_shown_at: now,
+    };
+  });
+  return items;
+}
+
+function pickerScheduleSession(args: {
+  session: PickerSession;
+  compareMode: PickerCompareMode;
+  schedulerSettings: PickerSchedulerSettings;
+  reason: "init" | "next" | "layout" | "fill";
+  preserveKeys?: string[];
+  fillSlotIndex?: number;
+}) {
+  const { session, compareMode, schedulerSettings, reason, preserveKeys = [], fillSlotIndex } = args;
+  const visibleItems = pickerVisibleCandidateItems(session.items);
+  const mode = pickerScheduleMode(visibleItems);
+  const slotCount = pickerCompareModeSlotCount(compareMode);
+  const currentTurn = (session.scheduler?.turn || 0) + 1;
+  const recentHistory = session.scheduler?.recent_history?.[compareMode] || [];
+  const currentSlots = pickerValidSlots(session);
+  const currentVisible = currentSlots.slice(0, slotCount).filter(Boolean) as string[];
+
+  let nextVisible: string[] = [];
+  if (reason === "fill" && typeof fillSlotIndex === "number") {
+    nextVisible = currentVisible.filter((key, index) => index !== fillSlotIndex);
+  } else if (reason === "layout") {
+    nextVisible = preserveKeys.filter(Boolean).slice(0, slotCount);
+  }
+
+  const selected = pickerSelectKeys({
+    items: visibleItems,
+    compareMode,
+    mode,
+    currentTurn,
+    schedulerSettings,
+    recentHistory,
+    currentStageKeys: reason === "next" ? currentVisible : [],
+    preservedKeys: nextVisible,
+  });
+  const visibleKeys = reason === "fill" && typeof fillSlotIndex === "number"
+    ? (() => {
+        const merged = [...currentVisible];
+        while (merged.length < slotCount) merged.push("");
+        merged[fillSlotIndex] = selected.find((key) => !merged.includes(key)) || merged[fillSlotIndex] || "";
+        return merged.filter(Boolean);
+      })()
+    : selected;
+
+  const slots = [null, null, null, null] as Array<string | null>;
+  visibleKeys.slice(0, slotCount).forEach((key, idx) => {
+    slots[idx] = key;
+  });
+  const items = pickerRecordExposure({
+    session: { ...session, slots: currentSlots },
+    compareMode,
+    visibleKeys,
+    markOnlyNew: reason === "fill",
+  });
+  const historyLimit = schedulerSettings.recentHistory[compareMode];
+  const mergedRecent = [...visibleKeys, ...recentHistory.filter((key) => !visibleKeys.includes(key))].slice(0, historyLimit);
+  const focusKey =
+    session.focus_key && visibleKeys.includes(session.focus_key)
+      ? session.focus_key
+      : visibleKeys[0] || null;
+
+  return {
+    ...session,
+    compare_mode: compareMode,
+    items,
+    slots,
+    focus_key: focusKey,
+    best_image: pickerUpdateBestImage(items),
+    scheduler: {
+      ...(session.scheduler || createEmptyPickerScheduler()),
+      turn: currentTurn,
+      last_mode: mode,
+      last_boundary_at: isoNow(),
+      recent_history: {
+        ...(session.scheduler?.recent_history || createEmptyPickerRecentHistory()),
+        [compareMode]: mergedRecent,
+      },
+    },
+  };
+}
+
+function pickerApplyRating(session: PickerSession, key: string, rating: number) {
+  const now = isoNow();
+  return {
+    ...session,
+    items: session.items.map((item) =>
+      pickerItemKey(item) === key
+        ? {
+            ...item,
+            rating,
+            reviewed: true,
+            last_rated_at: now,
+          }
+        : item
+    ),
+  };
+}
+
+function pickerApplyHardAction(args: {
+  session: PickerSession;
+  key: string;
+  action: "toPreferred" | "toFilmstrip" | "delete";
+  compareMode: PickerCompareMode;
+  schedulerSettings: PickerSchedulerSettings;
+}) {
+  const { session, key, action, compareMode, schedulerSettings } = args;
+  const slotIndex = pickerValidSlots(session).findIndex((slotKey) => slotKey === key);
+  const now = isoNow();
+  const items = session.items.map((item) => {
+    if (pickerItemKey(item) !== key) return item;
+    if (action === "delete") {
+      return {
+        ...item,
+        bucket: "DELETED" as PickerBucket,
+        pool: "FILMSTRIP",
+        last_hard_action_at: now,
+      };
+    }
+    const bucket = action === "toPreferred" ? "PREFERRED" : "FILMSTRIP";
+    return {
+      ...item,
+      bucket,
+      pool: bucket === "PREFERRED" ? "PREFERRED" : "FILMSTRIP",
+      last_hard_action_at: now,
+      cooldown_until_turn: (session.scheduler?.turn || 0) + schedulerSettings.moveCooldownTurns,
+    };
+  });
+  const next = {
+    ...session,
+    items,
+    best_image: pickerUpdateBestImage(items),
+    focus_key: session.focus_key === key ? null : session.focus_key,
+    slots: pickerValidSlots(session).map((slotKey) => (slotKey === key ? null : slotKey)),
+  };
+  return pickerScheduleSession({
+    session: next,
+    compareMode,
+    schedulerSettings,
+    reason: "fill",
+    fillSlotIndex: slotIndex >= 0 ? slotIndex : 0,
+  });
+}
+
+function pickerLayoutPreserveKeys(session: PickerSession, nextMode: PickerCompareMode) {
+  const slots = pickerValidSlots(session);
+  const currentSlotCount = pickerCompareModeSlotCount(session.compare_mode);
+  const nextSlotCount = pickerCompareModeSlotCount(nextMode);
+  const currentVisible = slots.slice(0, currentSlotCount).filter(Boolean) as string[];
+  if (!currentVisible.length) return [];
+  if (nextSlotCount === 1) {
+    return [session.focus_key && currentVisible.includes(session.focus_key) ? session.focus_key : currentVisible[0]];
+  }
+  return currentVisible.slice(0, nextSlotCount);
+}
+
+function pickerNormalizeStatusMetadata(session: PickerSession, previousItemsByKey: Map<string, PickerSessionItem>) {
+  const now = isoNow();
+  let changed = false;
+  const items = session.items.map((item) => {
+    const key = pickerItemKey(item);
+    const previous = previousItemsByKey.get(key);
+    if (!previous) return item;
+    if (previous.status === item.status) return item;
+    changed = true;
+    const previousGen = pickerGenStatusFromJobStatus(previous.status);
+    const nextGen = pickerGenStatusFromJobStatus(item.status);
+    return {
+      ...item,
+      last_status_changed_at: now,
+      just_completed_at:
+        previousGen !== "succeeded" && nextGen === "succeeded" ? now : item.just_completed_at,
+      just_completed_turn:
+        previousGen !== "succeeded" && nextGen === "succeeded" ? session.scheduler.turn : item.just_completed_turn,
+    };
+  });
+  return changed ? { ...session, items } : session;
+}
 
 // -----------------------------
 // Toast system
@@ -2488,13 +3150,16 @@ function Card({
   children,
   className,
   hover = true,
+  testId,
 }: {
   children: React.ReactNode;
   className?: string;
   hover?: boolean;
+  testId?: string;
 }) {
   return (
     <div
+      data-testid={testId}
       className={cn(
         "rounded-2xl border border-zinc-200 bg-white/70 p-4 shadow-sm backdrop-blur dark:border-white/10 dark:bg-zinc-900/60",
         hover && "transition-all hover:-translate-y-0.5 hover:shadow-md",
@@ -6640,6 +7305,20 @@ function Field({ label, children }: { label: React.ReactNode; children: React.Re
   );
 }
 
+function LabelWithHint({ label, hint }: { label: string; hint: string }) {
+  return (
+    <span className="inline-flex items-center gap-1">
+      <span>{label}</span>
+      <span
+        title={hint}
+        className="inline-flex h-4 w-4 items-center justify-center rounded-full border border-zinc-300 text-[10px] font-bold text-zinc-500 dark:border-white/15 dark:text-zinc-300"
+      >
+        ?
+      </span>
+    </span>
+  );
+}
+
 function PickerSessionJobSync() {
   const client = useApiClient();
   const settings = useSettingsStore((s) => s.settings);
@@ -6732,9 +7411,12 @@ function PickerSessionJobSync() {
         const imageIds = extractImageIdsFromResult(meta?.result);
         if (imageIds.length) {
           entry.placeholders.forEach(({ session_id, key, item }) => {
+            const replacementKey = pickerItemKeyFrom(entry.job_id, imageIds[0]);
             patchSession(session_id, (session) => ({
               ...session,
               items: session.items.filter((sessionItem) => pickerItemKey(sessionItem) !== key),
+              slots: session.slots.map((slotKey) => (slotKey === key ? replacementKey : slotKey)),
+              focus_key: session.focus_key === key ? replacementKey : session.focus_key,
             }));
             addItems(
               session_id,
@@ -6742,12 +7424,23 @@ function PickerSessionJobSync() {
                 job_id: entry.job_id,
                 image_id,
                 job_access_token: entry.job_access_token || jobsById.get(entry.job_id)?.job_access_token,
+                bucket: item.bucket || (item.pool === "PREFERRED" ? "PREFERRED" : "FILMSTRIP"),
                 pool: item.pool,
                 picked: item.picked,
                 rating: item.rating,
+                reviewed: item.reviewed,
                 notes: item.notes,
                 added_at: item.added_at,
                 status: "SUCCEEDED" as JobStatus,
+                show_count_total: item.show_count_total,
+                show_count_by_mode: item.show_count_by_mode,
+                first_shown_at: item.first_shown_at,
+                last_shown_at: item.last_shown_at,
+                arrival_seq: item.arrival_seq,
+                arrival_turn: item.arrival_turn,
+                last_status_changed_at: isoNow(),
+                just_completed_at: isoNow(),
+                just_completed_turn: usePickerStore.getState().sessions.find((session) => session.session_id === session_id)?.scheduler?.turn || 0,
               }))
             );
           });
@@ -6945,9 +7638,12 @@ function PendingSessionDirectHydrator() {
             const imageIds = extractImageIdsFromResult(meta?.result);
             if (imageIds.length) {
               entry.placeholders.forEach(({ session_id, key, item }) => {
+                const replacementKey = pickerItemKeyFrom(entry.job_id, imageIds[0]);
                 patchSession(session_id, (session) => ({
                   ...session,
                   items: session.items.filter((sessionItem) => pickerItemKey(sessionItem) !== key),
+                  slots: session.slots.map((slotKey) => (slotKey === key ? replacementKey : slotKey)),
+                  focus_key: session.focus_key === key ? replacementKey : session.focus_key,
                 }));
                 addItems(
                   session_id,
@@ -6955,12 +7651,23 @@ function PendingSessionDirectHydrator() {
                     job_id: entry.job_id,
                     image_id,
                     job_access_token: entry.job_access_token,
+                    bucket: item.bucket || (item.pool === "PREFERRED" ? "PREFERRED" : "FILMSTRIP"),
                     pool: item.pool,
                     picked: item.picked,
                     rating: item.rating,
+                    reviewed: item.reviewed,
                     notes: item.notes,
                     added_at: item.added_at,
                     status: "SUCCEEDED" as JobStatus,
+                    show_count_total: item.show_count_total,
+                    show_count_by_mode: item.show_count_by_mode,
+                    first_shown_at: item.first_shown_at,
+                    last_shown_at: item.last_shown_at,
+                    arrival_seq: item.arrival_seq,
+                    arrival_turn: item.arrival_turn,
+                    last_status_changed_at: isoNow(),
+                    just_completed_at: isoNow(),
+                    just_completed_turn: usePickerStore.getState().sessions.find((session) => session.session_id === session_id)?.scheduler?.turn || 0,
                   }))
                 );
               });
@@ -9048,6 +9755,175 @@ type PickerImageState = {
   code?: string;
 };
 
+function usePickerPreviewState(items: PickerSessionItem[]) {
+  const client = useApiClient();
+  const settings = useSettingsStore((s) => s.settings);
+  const { user } = useAuthSession();
+  const scope = user?.user_id || "__guest__";
+  const [imageState, setImageState] = useState<Record<string, PickerImageState>>({});
+  const revokeRef = useRef<string[]>([]);
+  const itemsKey = useMemo(
+    () =>
+      items
+        .map((item) => `${pickerItemKey(item)}:${item.status || "UNKNOWN"}:${item.job_access_token || ""}`)
+        .join("|"),
+    [items]
+  );
+
+  useEffect(() => {
+    return () => {
+      revokeRef.current.forEach((url) => URL.revokeObjectURL(url));
+      revokeRef.current = [];
+    };
+  }, []);
+
+  useEffect(() => {
+    let stopped = false;
+    const controller = new AbortController();
+    revokeRef.current.forEach((url) => URL.revokeObjectURL(url));
+    revokeRef.current = [];
+
+    const nextInitial: Record<string, PickerImageState> = {};
+    const imageItems = items.filter((item) => pickerItemHasImage(item) && pickerBucketOf(item) !== "DELETED");
+    imageItems.forEach((item) => {
+      const key = pickerItemKey(item);
+      if (settings.jobAuthMode === "TOKEN" && !item.job_access_token) {
+        nextInitial[key] = { loading: false, code: "TOKEN_REQUIRED", error: "缺少 token" };
+      } else {
+        nextInitial[key] = { loading: true };
+      }
+    });
+    setImageState(nextInitial);
+
+    if (!imageItems.length) return () => controller.abort();
+
+    (async () => {
+      const misses: Array<{ item: PickerSessionItem; key: string }> = [];
+      const cachedState: Record<string, PickerImageState> = {};
+      for (const item of imageItems) {
+        const key = pickerItemKey(item);
+        if (settings.jobAuthMode === "TOKEN" && !item.job_access_token) continue;
+        const cached = settings.cache.enabled
+          ? await imageCacheGet(scope, settings.baseUrl, item.job_id, item.image_id, "preview")
+          : null;
+        if (stopped) return;
+        if (cached) {
+          const url = URL.createObjectURL(cached);
+          revokeRef.current.push(url);
+          cachedState[key] = { loading: false, url };
+        } else {
+          misses.push({ item, key });
+        }
+      }
+
+      if (!stopped && Object.keys(cachedState).length) {
+        setImageState((current) => ({ ...current, ...cachedState }));
+      }
+      if (!misses.length) return;
+
+      const chunks: Array<Array<{ item: PickerSessionItem; key: string }>> = [];
+      for (let idx = 0; idx < misses.length; idx += 72) {
+        chunks.push(misses.slice(idx, idx + 72));
+      }
+
+      for (const chunk of chunks) {
+        try {
+          const payload = await client.batchPreviewImages(
+            chunk.map(({ item }) => ({
+              job_id: item.job_id,
+              image_id: item.image_id!,
+              job_access_token: item.job_access_token,
+            })),
+            controller.signal
+          );
+          if (stopped) return;
+          const byComposite = new Map(payload.items.map((entry) => [`${entry.job_id}::${entry.image_id}`, entry]));
+          const chunkState: Record<string, PickerImageState> = {};
+
+          await Promise.all(
+            chunk.map(async ({ item, key }) => {
+              const entry = byComposite.get(`${item.job_id}::${item.image_id}`);
+              if (!entry) return;
+              const blob = base64ToBlob(entry.data_base64, entry.mime);
+              if (settings.cache.enabled) {
+                await imageCachePut(scope, settings.baseUrl, item.job_id, item.image_id!, "preview", blob, settings.cache);
+              }
+              const url = URL.createObjectURL(blob);
+              revokeRef.current.push(url);
+              chunkState[key] = { loading: false, url };
+            })
+          );
+
+          const unresolved = chunk.filter(({ key }) => !chunkState[key]);
+          if (unresolved.length) {
+            await mapLimit(unresolved, 4, async ({ item, key }) => {
+              try {
+                const blob = await client.getPreviewBlob(item.job_id, item.image_id!, item.job_access_token, controller.signal);
+                if (settings.cache.enabled) {
+                  await imageCachePut(scope, settings.baseUrl, item.job_id, item.image_id!, "preview", blob, settings.cache);
+                }
+                const url = URL.createObjectURL(blob);
+                revokeRef.current.push(url);
+                chunkState[key] = { loading: false, url };
+              } catch (error: any) {
+                chunkState[key] = {
+                  loading: false,
+                  code: String(error?.error?.code || "ERROR"),
+                  error: error?.error?.message || "预览图加载失败",
+                };
+              }
+              return null;
+            });
+          }
+
+          if (!stopped) {
+            setImageState((current) => ({ ...current, ...chunkState }));
+          }
+        } catch {
+          if (stopped) return;
+          const fallbackState: Record<string, PickerImageState> = {};
+          await mapLimit(chunk, 4, async ({ item, key }) => {
+            try {
+              const blob = await client.getPreviewBlob(item.job_id, item.image_id!, item.job_access_token, controller.signal);
+              if (settings.cache.enabled) {
+                await imageCachePut(scope, settings.baseUrl, item.job_id, item.image_id!, "preview", blob, settings.cache);
+              }
+              const url = URL.createObjectURL(blob);
+              revokeRef.current.push(url);
+              fallbackState[key] = { loading: false, url };
+            } catch (error: any) {
+              fallbackState[key] = {
+                loading: false,
+                code: String(error?.error?.code || "ERROR"),
+                error: error?.error?.message || "预览图加载失败",
+              };
+            }
+            return null;
+          });
+          if (!stopped) {
+            setImageState((current) => ({ ...current, ...fallbackState }));
+          }
+        }
+      }
+    })();
+
+    return () => {
+      stopped = true;
+      controller.abort();
+    };
+  }, [
+    client,
+    itemsKey,
+    items,
+    scope,
+    settings.baseUrl,
+    settings.cache,
+    settings.jobAuthMode,
+  ]);
+
+  return imageState;
+}
+
 function RatingStars({
   value,
   onChange,
@@ -9185,6 +10061,7 @@ function PickerCompareSlot({
         className="absolute inset-0 z-0"
         onClick={onFocus}
         title="聚焦该图片"
+        data-testid={`picker-focus-${slotLabel}`}
       />
       <div className="relative h-[260px] w-full sm:h-[320px] md:h-[360px]">
         {!item ? (
@@ -9243,15 +10120,16 @@ function PickerCompareSlot({
 
         <div className="absolute left-2 top-2 z-20 flex items-center gap-2">
           <span className="rounded-full bg-black/55 px-2 py-1 text-[11px] font-bold text-white">{slotLabel}</span>
-          <button type="button" onClick={onBest} disabled={!hasImage}>
+          <button data-testid={`picker-best-${slotLabel}`} type="button" onClick={onBest} disabled={!hasImage}>
+            <span className="sr-only">{`toggle-best-${slotLabel}`}</span>
             <BestCrownBadge active={isBest} />
           </button>
         </div>
 
         <div className="absolute right-2 top-2 z-20 flex items-center gap-1">
           {item ? (
-            <Button variant="secondary" className="!px-2 !py-1 text-xs" onClick={onRemove}>
-              移除
+            <Button testId={`picker-remove-${slotLabel}`} variant="secondary" className="!px-2 !py-1 text-xs" onClick={onRemove}>
+              删除
             </Button>
           ) : null}
         </div>
@@ -9260,7 +10138,7 @@ function PickerCompareSlot({
       {item ? (
           <div className="relative z-20 border-t border-black/5 bg-white/80 p-2 dark:border-white/10 dark:bg-zinc-900/70">
           <div className="flex items-center justify-between gap-2">
-            <div className="truncate text-xs font-semibold text-zinc-700 dark:text-zinc-200">
+            <div data-testid={`picker-name-${slotLabel}`} className="truncate text-xs font-semibold text-zinc-700 dark:text-zinc-200">
               {displayName}
             </div>
             {hasImage ? (
@@ -9319,7 +10197,6 @@ function PickerPage() {
   const addItems = usePickerStore((s) => s.addItems);
   const updateItem = usePickerStore((s) => s.updateItem);
   const removeItem = usePickerStore((s) => s.removeItem);
-  const setSlot = usePickerStore((s) => s.setSlot);
   const setFocus = usePickerStore((s) => s.setFocus);
 
   const [importOpen, setImportOpen] = useState(false);
@@ -9329,14 +10206,9 @@ function PickerPage() {
   const [importState, setImportState] = useState<Record<string, { loading: boolean; imageIds: string[]; error?: string }>>({});
   const [importSelection, setImportSelection] = useState<Record<string, boolean>>({});
   const [manualTokenByJob, setManualTokenByJob] = useState<Record<string, string>>({});
-  const [imageState, setImageState] = useState<Record<string, PickerImageState>>({});
-  const [prefetchPausedUntil, setPrefetchPausedUntil] = useState(0);
-  const revokeRef = useRef<string[]>([]);
-  const mountedRef = useRef(true);
-  const inFlightRef = useRef<Map<string, AbortController>>(new Map());
-  const imageStateRef = useRef<Record<string, PickerImageState>>({});
   const autoImportedRef = useRef<Record<string, boolean>>({});
-  const rotationSeenRef = useRef<Record<string, string[]>>({});
+  const previousSessionIdRef = useRef<string | null>(null);
+  const previousSessionItemsRef = useRef<Map<string, PickerSessionItem>>(new Map());
 
   const currentSession = useMemo(
     () => sessions.find((s) => s.session_id === currentSessionId) || null,
@@ -9365,10 +10237,6 @@ function PickerPage() {
   }, [sessions.length, createSession, searchParams, setSearchParams]);
 
   useEffect(() => {
-    imageStateRef.current = imageState;
-  }, [imageState]);
-
-  useEffect(() => {
     if (immersiveMode) {
       document.body.classList.add("overflow-hidden");
       setImportOpen(false);
@@ -9379,29 +10247,6 @@ function PickerPage() {
       document.body.classList.remove("overflow-hidden");
     };
   }, [immersiveMode]);
-
-  useEffect(() => {
-    mountedRef.current = true;
-    return () => {
-      mountedRef.current = false;
-      inFlightRef.current.forEach((ctrl) => {
-        try {
-          ctrl.abort();
-        } catch {
-          // ignore
-        }
-      });
-      inFlightRef.current.clear();
-      revokeRef.current.forEach((u) => {
-        try {
-          URL.revokeObjectURL(u);
-        } catch {
-          // ignore
-        }
-      });
-      revokeRef.current = [];
-    };
-  }, []);
 
   useEffect(() => {
     const sid = sessionQuery;
@@ -9510,12 +10355,13 @@ function PickerPage() {
   }, [jobQuery, currentSession?.session_id]);
 
   const sessionItems = currentSession?.items || [];
+  const imageState = usePickerPreviewState(sessionItems);
   const filmstripItems = useMemo(
-    () => sessionItems.filter((it) => (it.pool || "FILMSTRIP") !== "PREFERRED"),
+    () => sessionItems.filter((it) => pickerBucketOf(it) === "FILMSTRIP"),
     [sessionItems]
   );
   const preferredItems = useMemo(
-    () => sessionItems.filter((it) => (it.pool || "FILMSTRIP") === "PREFERRED"),
+    () => sessionItems.filter((it) => pickerBucketOf(it) === "PREFERRED"),
     [sessionItems]
   );
   const orderedItemsByPool = useMemo(
@@ -9528,28 +10374,7 @@ function PickerPage() {
     return map;
   }, [sessionItems]);
 
-  const normalizedSlots = useMemo(() => {
-    const slots = [...(currentSession?.slots || [null, null, null, null])].slice(0, 4);
-    while (slots.length < 4) slots.push(null);
-    const seen = new Set<string>();
-    for (let i = 0; i < slots.length; i++) {
-      const k = slots[i];
-      if (!k || !itemMap.has(k) || seen.has(k)) {
-        slots[i] = null;
-      } else {
-        seen.add(k);
-      }
-    }
-    for (const it of orderedItemsByPool) {
-      const k = pickerItemKey(it);
-      if (seen.has(k)) continue;
-      const idx = slots.findIndex((x) => !x);
-      if (idx < 0) break;
-      slots[idx] = k;
-      seen.add(k);
-    }
-    return slots;
-  }, [currentSession?.slots, orderedItemsByPool, itemMap]);
+  const normalizedSlots = useMemo(() => (currentSession ? pickerValidSlots(currentSession) : [null, null, null, null]), [currentSession]);
 
   const focusKey = useMemo(() => {
     if (!currentSession) return null;
@@ -9564,61 +10389,9 @@ function PickerPage() {
   }, [currentSession?.session_id, currentSession?.focus_key, focusKey, setFocus]);
 
   const compareMode = currentSession?.compare_mode || "TWO";
-  const stageSlots = compareMode === "FOUR" ? normalizedSlots.slice(0, 4) : normalizedSlots.slice(0, 2);
-  const isPreferredKey = (key?: string | null) => Boolean(key && (itemMap.get(key)?.pool || "FILMSTRIP") === "PREFERRED");
-
-  const ensureImage = async (item: PickerSessionItem) => {
-    if (!pickerItemHasImage(item)) return;
-    const key = pickerItemKey(item);
-    const snap = imageStateRef.current[key];
-    if (snap?.url || snap?.loading || inFlightRef.current.has(key)) return;
-
-    if (settings.jobAuthMode === "TOKEN" && !item.job_access_token) {
-      setImageState((prev) => ({ ...prev, [key]: { loading: false, code: "TOKEN_REQUIRED", error: "缺少 token" } }));
-      return;
-    }
-
-    const controller = new AbortController();
-    inFlightRef.current.set(key, controller);
-    setImageState((prev) => ({ ...prev, [key]: { ...prev[key], loading: true, error: undefined, code: undefined } }));
-
-    try {
-      const blob = await runWithImageAccessTurnstile(() =>
-        client.getImageBlob(item.job_id, item.image_id, item.job_access_token, controller.signal)
-      );
-      if (!mountedRef.current) return;
-      const url = URL.createObjectURL(blob);
-      revokeRef.current.push(url);
-      setImageState((prev) => ({ ...prev, [key]: { loading: false, url } }));
-    } catch (e: any) {
-      if (controller.signal.aborted || !mountedRef.current) return;
-      const code = String(e?.error?.code || "ERROR");
-      const msg = e?.error?.message || "图片加载失败";
-      setImageState((prev) => ({ ...prev, [key]: { loading: false, error: msg, code } }));
-      if (code === "429") {
-        setPrefetchPausedUntil(Date.now() + 5000);
-        push({ kind: "info", title: "请求过快（429）", message: "已暂停预取 5 秒" });
-      }
-    } finally {
-      inFlightRef.current.delete(key);
-    }
-  };
-
-  useEffect(() => {
-    if (!currentSession) return;
-    if (Date.now() < prefetchPausedUntil) return;
-    const targetKeys = new Set<string>();
-    stageSlots.forEach((k) => k && targetKeys.add(k));
-    if (focusKey) targetKeys.add(focusKey);
-    sessionItems.slice(0, 10).forEach((it) => targetKeys.add(pickerItemKey(it)));
-    const targets = Array.from(targetKeys)
-      .map((k) => itemMap.get(k))
-      .filter(Boolean) as PickerSessionItem[];
-    mapLimit(targets, 2, async (it) => {
-      await ensureImage(it);
-      return null;
-    });
-  }, [currentSession?.session_id, stageSlots.join("|"), focusKey, sessionItems.map((x) => pickerItemKey(x)).join("|"), prefetchPausedUntil, settings.jobAuthMode]);
+  const stageSlotCount = pickerCompareModeSlotCount(compareMode);
+  const stageSlots = normalizedSlots.slice(0, stageSlotCount);
+  const isPreferredKey = (key?: string | null) => Boolean(key && pickerBucketOf(itemMap.get(key) || null) === "PREFERRED");
 
   const fixToken = (item: PickerSessionItem) => {
     const tok = prompt(`为 job ${shortId(item.job_id)} 输入 X-Job-Token：`);
@@ -9629,63 +10402,66 @@ function PickerPage() {
     push({ kind: "success", title: "已保存 token" });
   };
 
+  const rateItem = (key: string, rating: number) => {
+    if (!currentSession) return;
+    patchSession(currentSession.session_id, (session) => pickerApplyRating(session, key, rating));
+  };
+
   const toggleBest = (key: string) => {
     if (!currentSession) return;
-    patchSession(currentSession.session_id, (session) => {
-      const items = session.items.map((it) => {
-        const itemKey = pickerItemKey(it);
-        if (itemKey !== key) return it;
-        if (!pickerItemHasImage(it)) return it;
-        const currentPool = it.pool === "PREFERRED" ? "PREFERRED" : "FILMSTRIP";
-        return { ...it, pool: currentPool === "PREFERRED" ? "FILMSTRIP" : "PREFERRED" };
-      });
-      const preferred = items.find((it) => (it.pool || "FILMSTRIP") === "PREFERRED" && pickerItemHasImage(it));
-      return {
-        ...session,
-        items,
-        best_image: preferred ? { job_id: preferred.job_id, image_id: preferred.image_id } : undefined,
-      };
-    });
+    const currentItem = itemMap.get(key);
+    if (!currentItem || !pickerItemHasImage(currentItem)) return;
+    patchSession(currentSession.session_id, (session) =>
+      pickerApplyHardAction({
+        session,
+        key,
+        action: pickerBucketOf(currentItem) === "PREFERRED" ? "toFilmstrip" : "toPreferred",
+        compareMode,
+        schedulerSettings: settings.pickerScheduler,
+      })
+    );
+  };
+
+  const deleteFromPicker = (key: string) => {
+    if (!currentSession) return;
+    patchSession(currentSession.session_id, (session) =>
+      pickerApplyHardAction({
+        session,
+        key,
+        action: "delete",
+        compareMode,
+        schedulerSettings: settings.pickerScheduler,
+      })
+    );
   };
 
   const shiftToNextBatch = () => {
     if (!currentSession) return;
-    const slotCount = compareMode === "FOUR" ? 4 : 2;
-    const orderedKeys = orderedItemsByPool.map((it) => pickerItemKey(it));
-    if (!orderedKeys.length) {
+    if (!pickerVisibleCandidateItems(sessionItems).length) {
       push({ kind: "info", title: "暂无可切换图片" });
       return;
     }
-
-    const sessionId = currentSession.session_id;
-    const seenList = rotationSeenRef.current[sessionId] || [];
-    const seen = new Set(seenList);
-    stageSlots.forEach((k) => k && seen.add(k));
-    let nextKeys = orderedKeys.filter((k) => !seen.has(k));
-    if (nextKeys.length < slotCount) {
-      seen.clear();
-      stageSlots.forEach((k) => k && seen.add(k));
-      nextKeys = orderedKeys.filter((k) => !seen.has(k));
-      if (!nextKeys.length) nextKeys = orderedKeys;
-    }
-
-    const chosen = nextKeys.slice(0, slotCount);
-    chosen.forEach((k) => seen.add(k));
-    rotationSeenRef.current[sessionId] = Array.from(seen);
-
-    patchSession(sessionId, (session) => {
-      const slots = [...session.slots];
-      for (let i = 0; i < slotCount; i++) {
-        slots[i] = chosen[i] || null;
-      }
-      const focus_key = chosen[0] || slots.find(Boolean) || null;
-      return { ...session, slots, focus_key };
-    });
+    patchSession(currentSession.session_id, (session) =>
+      pickerScheduleSession({
+        session,
+        compareMode,
+        schedulerSettings: settings.pickerScheduler,
+        reason: "next",
+      })
+    );
   };
 
   const setSessionMode = (mode: PickerCompareMode) => {
     if (!currentSession) return;
-    patchSession(currentSession.session_id, (s) => ({ ...s, compare_mode: mode }));
+    patchSession(currentSession.session_id, (session) =>
+      pickerScheduleSession({
+        session: { ...session, compare_mode: mode },
+        compareMode: mode,
+        schedulerSettings: settings.pickerScheduler,
+        reason: "layout",
+        preserveKeys: pickerLayoutPreserveKeys(session, mode),
+      })
+    );
   };
 
   const patchSessionUi = (patch: Partial<PickerSession["ui"]>) => {
@@ -9702,6 +10478,35 @@ function PickerPage() {
     () => orderedItemsByPool.map((it) => pickerItemKey(it)),
     [orderedItemsByPool]
   );
+
+  useEffect(() => {
+    if (!currentSession) return;
+    const previous = previousSessionItemsRef.current;
+    const currentMap = new Map(sessionItems.map((item) => [pickerItemKey(item), item]));
+    if (previous.size && previousSessionIdRef.current === currentSession.session_id) {
+      const patched = pickerNormalizeStatusMetadata(currentSession, previous);
+      if (patched !== currentSession) {
+        patchSession(currentSession.session_id, () => patched);
+      }
+    }
+    previousSessionIdRef.current = currentSession.session_id;
+    previousSessionItemsRef.current = currentMap;
+  }, [currentSession, sessionItems, patchSession]);
+
+  useEffect(() => {
+    if (!currentSession) return;
+    if (pickerVisibleCandidateItems(sessionItems).length === 0) return;
+    const visible = normalizedSlots.slice(0, stageSlotCount).filter(Boolean);
+    if (visible.length) return;
+    patchSession(currentSession.session_id, (session) =>
+      pickerScheduleSession({
+        session,
+        compareMode,
+        schedulerSettings: settings.pickerScheduler,
+        reason: "init",
+      })
+    );
+  }, [currentSession?.session_id, compareMode, normalizedSlots.join("|"), sessionItems.length, patchSession, settings.pickerScheduler, stageSlotCount]);
 
   const downloadOne = async (item: PickerSessionItem) => {
     if (!pickerItemHasImage(item)) return false;
@@ -9724,7 +10529,7 @@ function PickerPage() {
   };
 
   const downloadBest = async () => {
-    const preferred = orderedItemsByPool.filter((it) => (it.pool || "FILMSTRIP") === "PREFERRED" && pickerItemHasImage(it));
+    const preferred = orderedItemsByPool.filter((it) => pickerBucketOf(it) === "PREFERRED" && pickerItemHasImage(it));
     if (!preferred.length) {
       push({ kind: "info", title: "优选池为空" });
       return;
@@ -9780,26 +10585,25 @@ function PickerPage() {
       const focusItem = itemMap.get(focusKey);
       if (!focusItem) return;
       if (["1", "2", "3", "4", "5"].includes(e.key)) {
-        updateItem(currentSession.session_id, focusKey, { rating: Number(e.key) });
+        rateItem(focusKey, Number(e.key));
         return;
       }
-      if (e.key === "ArrowLeft" || e.key === "ArrowRight") {
-        if (compareMode !== "FILMSTRIP" || focusListKeys.length < 2) return;
+      if (compareMode === "ONE" && (e.key === "ArrowLeft" || e.key === "ArrowRight")) {
+        if (focusListKeys.length < 2) return;
         const i = focusListKeys.indexOf(focusKey);
         if (i < 0) return;
         const next = e.key === "ArrowRight" ? (i + 1) % focusListKeys.length : (i - 1 + focusListKeys.length) % focusListKeys.length;
-        setFocus(currentSession.session_id, focusListKeys[next]);
+        patchSession(currentSession.session_id, (session) => ({
+          ...session,
+          focus_key: focusListKeys[next],
+          slots: [focusListKeys[next], null, null, null],
+        }));
         return;
       }
       const key = e.key.toLowerCase();
       if (key === "d" && !e.shiftKey) {
         e.preventDefault();
         downloadFocus();
-        return;
-      }
-      if (["a", "b", "c"].includes(key) || (key === "d" && e.shiftKey)) {
-        const idx = key === "d" ? 3 : ["a", "b", "c"].indexOf(key);
-        setSlot(currentSession.session_id, idx, focusKey);
         return;
       }
       if (e.key === "Enter") {
@@ -9809,12 +10613,12 @@ function PickerPage() {
       }
       if (e.key === "Backspace") {
         e.preventDefault();
-        removeItem(currentSession.session_id, focusKey);
+        deleteFromPicker(focusKey);
       }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [currentSession?.session_id, focusKey, compareMode, focusListKeys.join("|"), itemMap, updateItem, setSlot, removeItem, immersiveMode]);
+  }, [currentSession?.session_id, focusKey, compareMode, focusListKeys.join("|"), itemMap, immersiveMode, patchSession]);
 
   if (!currentSession) {
     return (
@@ -9825,8 +10629,10 @@ function PickerPage() {
   }
 
   const darkStage = currentSession.ui.background === "dark";
-  const selectedCount = sessionItems.filter((it) => it.picked).length;
-  const immersiveSlots = compareMode === "FOUR" ? normalizedSlots.slice(0, 4) : compareMode === "TWO" ? normalizedSlots.slice(0, 2) : [focusKey];
+  const selectedCount = sessionItems.filter((it) => it.picked && pickerBucketOf(it) !== "DELETED").length;
+  const activeMode = pickerScheduleMode(pickerVisibleCandidateItems(sessionItems));
+  const pendingReviewCount = filmstripItems.filter((item) => !item.reviewed).length;
+  const immersiveSlots = normalizedSlots.slice(0, pickerCompareModeSlotCount(compareMode));
 
   const renderImmersiveSlot = (slotKey: string | null, label: string) => {
     const item = slotKey ? itemMap.get(slotKey) || null : null;
@@ -9907,10 +10713,10 @@ function PickerPage() {
               className="pointer-events-auto !px-2 !py-1 text-xs"
               onClick={(e) => {
                 e.stopPropagation();
-                if (slotKey) removeItem(currentSession.session_id, slotKey);
+                if (slotKey) deleteFromPicker(slotKey);
               }}
             >
-              移除
+              删除
             </Button>
           ) : null}
         </div>
@@ -9921,7 +10727,7 @@ function PickerPage() {
               {hasImage ? (
                 <RatingStars
                   value={item.rating || 0}
-                  onChange={(n) => slotKey && updateItem(currentSession.session_id, slotKey, { rating: n })}
+                  onChange={(n) => slotKey && rateItem(slotKey, n)}
                   className="pointer-events-auto"
                 />
               ) : (
@@ -9994,9 +10800,9 @@ function PickerPage() {
           <div className="mx-2 h-6 w-px bg-zinc-200 dark:bg-white/10" />
 
           <Button variant="secondary" onClick={() => setImportOpen(true)}>从历史导入</Button>
+          <Button testId="picker-mode-one" variant={compareMode === "ONE" ? "primary" : "ghost"} onClick={() => setSessionMode("ONE")}>1-up</Button>
           <Button variant={compareMode === "TWO" ? "primary" : "ghost"} onClick={() => setSessionMode("TWO")}>2-up</Button>
           <Button variant={compareMode === "FOUR" ? "primary" : "ghost"} onClick={() => setSessionMode("FOUR")}>4-up</Button>
-          <Button variant={compareMode === "FILMSTRIP" ? "primary" : "ghost"} onClick={() => setSessionMode("FILMSTRIP")}>Filmstrip</Button>
           <Button
             variant={currentSession.layout_preset === "SYNC_ZOOM" ? "secondary" : "ghost"}
             onClick={() => patchSessionLayout(currentSession.layout_preset === "SYNC_ZOOM" ? "FREE_ZOOM" : "SYNC_ZOOM")}
@@ -10024,60 +10830,33 @@ function PickerPage() {
           <Button variant="secondary" onClick={() => setImmersiveMode(true)}>
             全屏审阅
           </Button>
-          <Button variant="secondary" onClick={shiftToNextBatch}>
+          <Button testId="picker-next-batch" variant="secondary" onClick={shiftToNextBatch}>
             切换下一组
           </Button>
           <Button variant="primary" onClick={downloadBest}>下载优选</Button>
           <Button variant="secondary" onClick={downloadPicked}>下载选中</Button>
         </div>
+        <div className="mt-3 flex flex-wrap items-center gap-2 text-xs text-zinc-500 dark:text-zinc-400">
+          <span className="rounded-full border border-zinc-200 bg-white px-3 py-1 dark:border-white/10 dark:bg-zinc-950/40">
+            当前模式 {activeMode}
+          </span>
+          <span className="rounded-full border border-zinc-200 bg-white px-3 py-1 dark:border-white/10 dark:bg-zinc-950/40">
+            未审 Filmstrip {pendingReviewCount}
+          </span>
+          <span className="rounded-full border border-zinc-200 bg-white px-3 py-1 dark:border-white/10 dark:bg-zinc-950/40">
+            Filmstrip {filmstripItems.length} / 优选池 {preferredItems.length}
+          </span>
+        </div>
       </Card>
 
-      <Card className={cn("mb-3 overflow-hidden p-2", darkStage ? "bg-zinc-950" : "bg-zinc-50")}>
-        {compareMode === "FILMSTRIP" ? (
-          <div className="grid grid-cols-1 gap-2">
-            <PickerCompareSlot
-              slotLabel="Focus"
-              item={focusKey ? itemMap.get(focusKey) || null : null}
-              image={focusKey ? imageState[focusKey] : undefined}
-              isBest={Boolean(focusKey && isPreferredKey(focusKey))}
-              focused
-              showInfo={currentSession.ui.showInfo}
-              showGrid={currentSession.ui.showGrid}
-              darkStage={darkStage}
-              jobRec={focusKey ? jobsById.get(itemMap.get(focusKey)?.job_id || "") : undefined}
-              displayName={
-                focusKey && itemMap.get(focusKey)
-                  ? pickerDisplayName(itemMap.get(focusKey)!, jobsById.get(itemMap.get(focusKey)!.job_id))
-                  : "-"
-              }
-              onFocus={() => {}}
-              onEnsureImage={() => {
-                const item = focusKey ? itemMap.get(focusKey) : null;
-                if (item) ensureImage(item);
-              }}
-              onBest={() => {
-                if (focusKey) toggleBest(focusKey);
-              }}
-              onRate={(n) => {
-                if (focusKey) updateItem(currentSession.session_id, focusKey, { rating: n });
-              }}
-              onRemove={() => {
-                if (focusKey) removeItem(currentSession.session_id, focusKey);
-              }}
-              onFixToken={() => {
-                const item = focusKey ? itemMap.get(focusKey) : null;
-                if (item) fixToken(item);
-              }}
-            />
-          </div>
-        ) : (
-          <div className={cn("grid gap-2", compareMode === "FOUR" ? "grid-cols-1 md:grid-cols-2" : "grid-cols-1 md:grid-cols-2")}>
-            {stageSlots.map((slotKey, idx) => {
-              const item = slotKey ? itemMap.get(slotKey) || null : null;
-              const label = String.fromCharCode(65 + idx);
-              return (
+      <Card className={cn("mb-3 overflow-hidden p-2", darkStage ? "bg-zinc-950" : "bg-zinc-50")} testId="picker-stage">
+        <div className={cn("grid gap-2", compareMode === "FOUR" ? "grid-cols-1 md:grid-cols-2" : "grid-cols-1")}>
+          {stageSlots.map((slotKey, idx) => {
+            const item = slotKey ? itemMap.get(slotKey) || null : null;
+            const label = String.fromCharCode(65 + idx);
+            return (
+              <div key={`${label}_${slotKey || "empty"}`} data-testid={`picker-slot-${label}`}>
                 <PickerCompareSlot
-                  key={`${label}_${slotKey || "empty"}`}
                   slotLabel={label}
                   item={item}
                   image={slotKey ? imageState[slotKey] : undefined}
@@ -10089,24 +10868,24 @@ function PickerPage() {
                   jobRec={item ? jobsById.get(item.job_id) : undefined}
                   displayName={item ? pickerDisplayName(item, jobsById.get(item.job_id)) : "-"}
                   onFocus={() => slotKey && setFocus(currentSession.session_id, slotKey)}
-                  onEnsureImage={() => item && ensureImage(item)}
+                  onEnsureImage={() => {}}
                   onBest={() => slotKey && toggleBest(slotKey)}
-                  onRate={(n) => slotKey && updateItem(currentSession.session_id, slotKey, { rating: n })}
-                  onRemove={() => slotKey && removeItem(currentSession.session_id, slotKey)}
+                  onRate={(n) => slotKey && rateItem(slotKey, n)}
+                  onRemove={() => slotKey && deleteFromPicker(slotKey)}
                   onFixToken={() => item && fixToken(item)}
                 />
-              );
-            })}
-          </div>
-        )}
+              </div>
+            );
+          })}
+        </div>
       </Card>
 
       <Card>
         <div className="mb-2 flex items-center justify-between">
           <div className="text-sm font-bold text-zinc-900 dark:text-zinc-50">Filmstrip</div>
-          <div className="text-xs text-zinc-500 dark:text-zinc-400">已选 {selectedCount} / 总计 {sessionItems.length}</div>
+          <div className="text-xs text-zinc-500 dark:text-zinc-400">已选 {selectedCount} / 总计 {filmstripItems.length + preferredItems.length}</div>
         </div>
-        {!sessionItems.length ? (
+        {!filmstripItems.length && !preferredItems.length ? (
           <EmptyHint text="暂无图片，点击“从历史导入”开始挑选" />
         ) : (
           <div className="space-y-4">
@@ -10137,8 +10916,17 @@ function PickerPage() {
                     <button
                       type="button"
                       className="relative block h-36 w-full overflow-hidden bg-zinc-100 dark:bg-zinc-900"
-                      onClick={() => setFocus(currentSession.session_id, key)}
-                      onMouseEnter={() => hasImage && ensureImage(item)}
+                      onClick={() => {
+                        if (compareMode === "ONE") {
+                          patchSession(currentSession.session_id, (session) => ({
+                            ...session,
+                            focus_key: key,
+                            slots: [key, null, null, null],
+                          }));
+                        } else {
+                          setFocus(currentSession.session_id, key);
+                        }
+                      }}
                     >
                       {!hasImage ? (
                         <PickerPendingVisual status={status} />
@@ -10174,7 +10962,7 @@ function PickerPage() {
                       {hasImage ? (
                         <RatingStars
                           value={item.rating || 0}
-                          onChange={(n) => updateItem(currentSession.session_id, key, { rating: n })}
+                          onChange={(n) => rateItem(key, n)}
                         />
                       ) : (
                         <div
@@ -10189,17 +10977,12 @@ function PickerPage() {
                         </div>
                       )}
                       <div className="flex flex-wrap gap-1">
-                        {["A", "B", "C", "D"].map((s, i) => (
-                          <Button key={s} variant="ghost" className="!px-1.5 !py-0.5 text-[10px]" onClick={() => setSlot(currentSession.session_id, i, key)}>
-                            {s}
-                          </Button>
-                        ))}
                         <Button variant="ghost" className="!px-1.5 !py-0.5 text-[10px]" onClick={() => toggleBest(key)} disabled={!hasImage}>
-                          优选
+                          {isPreferredKey(key) ? "移回片池" : "移入优选"}
                         </Button>
                         <Button variant="ghost" className="!px-1.5 !py-0.5 text-[10px]" onClick={() => downloadOne(item)} disabled={!hasImage}>下载</Button>
-                        <Button variant="danger" className="!px-1.5 !py-0.5 text-[10px]" onClick={() => removeItem(currentSession.session_id, key)}>
-                          移除
+                        <Button variant="danger" className="!px-1.5 !py-0.5 text-[10px]" onClick={() => deleteFromPicker(key)}>
+                          删除
                         </Button>
                       </div>
                       <div className="truncate text-[10px] text-zinc-500 dark:text-zinc-400">
@@ -10246,8 +11029,17 @@ function PickerPage() {
                         <button
                           type="button"
                           className="relative block h-36 w-full overflow-hidden bg-zinc-100 dark:bg-zinc-900"
-                          onClick={() => setFocus(currentSession.session_id, key)}
-                          onMouseEnter={() => ensureImage(item)}
+                          onClick={() => {
+                            if (compareMode === "ONE") {
+                              patchSession(currentSession.session_id, (session) => ({
+                                ...session,
+                                focus_key: key,
+                                slots: [key, null, null, null],
+                              }));
+                            } else {
+                              setFocus(currentSession.session_id, key);
+                            }
+                          }}
                         >
                           {state?.url ? (
                             <img
@@ -10279,20 +11071,15 @@ function PickerPage() {
                           </div>
                           <RatingStars
                             value={item.rating || 0}
-                            onChange={(n) => updateItem(currentSession.session_id, key, { rating: n })}
+                            onChange={(n) => rateItem(key, n)}
                           />
                           <div className="flex flex-wrap gap-1">
-                            {["A", "B", "C", "D"].map((s, i) => (
-                              <Button key={s} variant="ghost" className="!px-1.5 !py-0.5 text-[10px]" onClick={() => setSlot(currentSession.session_id, i, key)}>
-                                {s}
-                              </Button>
-                            ))}
                             <Button variant="ghost" className="!px-1.5 !py-0.5 text-[10px]" onClick={() => toggleBest(key)}>
                               移回片池
                             </Button>
                             <Button variant="ghost" className="!px-1.5 !py-0.5 text-[10px]" onClick={() => downloadOne(item)}>下载</Button>
-                            <Button variant="danger" className="!px-1.5 !py-0.5 text-[10px]" onClick={() => removeItem(currentSession.session_id, key)}>
-                              移除
+                            <Button variant="danger" className="!px-1.5 !py-0.5 text-[10px]" onClick={() => deleteFromPicker(key)}>
+                              删除
                             </Button>
                           </div>
                           <div className="truncate text-[10px] text-zinc-500 dark:text-zinc-400">
@@ -10325,64 +11112,18 @@ function PickerPage() {
                   <div className="text-[11px] text-zinc-300">悬停显示评分与优选控件，按 `Esc` 退出</div>
                 </div>
                 <div className="flex items-center gap-2">
+                  <Button variant={compareMode === "ONE" ? "secondary" : "ghost"} onClick={() => setSessionMode("ONE")}>1-up</Button>
                   <Button variant={compareMode === "TWO" ? "secondary" : "ghost"} onClick={() => setSessionMode("TWO")}>2-up</Button>
                   <Button variant={compareMode === "FOUR" ? "secondary" : "ghost"} onClick={() => setSessionMode("FOUR")}>4-up</Button>
-                  <Button variant={compareMode === "FILMSTRIP" ? "secondary" : "ghost"} onClick={() => setSessionMode("FILMSTRIP")}>Filmstrip</Button>
                   <Button variant="secondary" onClick={shiftToNextBatch}>切换下一组</Button>
                   <Button variant="secondary" onClick={() => setImmersiveMode(false)}>退出全屏</Button>
                 </div>
               </div>
 
               <div className="flex-1 overflow-auto">
-                {compareMode === "FILMSTRIP" ? (
-                  <div className="grid grid-cols-1 gap-3">
-                    {renderImmersiveSlot(focusKey, "Focus")}
-                    <div className="flex gap-2 overflow-x-auto pb-1">
-                      {sessionItems.map((it, idx) => {
-                        const k = pickerItemKey(it);
-                        const s = imageState[k];
-                        const active = k === focusKey;
-                        const hasImage = pickerItemHasImage(it);
-                        const status = pickerItemJobStatus(it, jobsById.get(it.job_id));
-                        return (
-                          <button
-                            key={`${k}_immersive_strip`}
-                            type="button"
-                            className={cn(
-                              "relative h-20 w-32 flex-none overflow-hidden rounded-xl border",
-                              active ? "border-white shadow-[0_0_0_1px_rgba(255,255,255,0.25)]" : "border-white/20"
-                            )}
-                            onClick={() => setFocus(currentSession.session_id, k)}
-                            onMouseEnter={() => hasImage && ensureImage(it)}
-                          >
-                            {!hasImage ? (
-                              <div className="flex h-full w-full flex-col items-center justify-center gap-1 bg-white/5 px-2 text-center">
-                                {status === "FAILED" ? (
-                                  <span className="inline-flex h-4 w-4 items-center justify-center rounded-full border border-rose-300/60 text-[10px] font-bold text-rose-200">
-                                    !
-                                  </span>
-                                ) : (
-                                  <LoadingRing className="h-3.5 w-3.5" />
-                                )}
-                                <span className="text-[10px] text-white/75">{status === "FAILED" ? "失败" : "生成中"}</span>
-                              </div>
-                            ) : s?.url ? (
-                              <img src={s.url} alt={pickerDisplayName(it, jobsById.get(it.job_id))} className="h-full w-full object-cover" />
-                            ) : (
-                              <Skeleton className="h-full w-full" />
-                            )}
-                            {isPreferredKey(k) ? <span className="absolute left-1 top-1 rounded-full bg-amber-500/90 px-1.5 py-0.5 text-[10px] font-bold text-white">优</span> : null}
-                            <span className="absolute bottom-1 left-1 rounded bg-black/55 px-1.5 py-0.5 text-[10px] text-white">{idx + 1}</span>
-                          </button>
-                        );
-                      })}
-                    </div>
-                  </div>
-                ) : (
-                  <div className={cn("grid gap-3", compareMode === "FOUR" ? "grid-cols-1 lg:grid-cols-2" : "grid-cols-1 lg:grid-cols-2")}>
-                    {immersiveSlots.map((slotKey, idx) => renderImmersiveSlot(slotKey || null, String.fromCharCode(65 + idx)))}
-                  </div>
-                )}
+                <div className={cn("grid gap-3", compareMode === "FOUR" ? "grid-cols-1 lg:grid-cols-2" : "grid-cols-1")}>
+                  {immersiveSlots.map((slotKey, idx) => renderImmersiveSlot(slotKey || null, String.fromCharCode(65 + idx)))}
+                </div>
               </div>
             </div>
           </motion.div>
@@ -10601,6 +11342,15 @@ function SettingsPage() {
   const [cacheEnabled, setCacheEnabled] = useState(settings.cache.enabled);
   const [cacheTtlDays, setCacheTtlDays] = useState(settings.cache.ttlDays);
   const [cacheMaxGb, setCacheMaxGb] = useState(Number((settings.cache.maxBytes / (1024 * 1024 * 1024)).toFixed(2)));
+  const [moveCooldownTurns, setMoveCooldownTurns] = useState(settings.pickerScheduler.moveCooldownTurns);
+  const [recentHistoryOne, setRecentHistoryOne] = useState(settings.pickerScheduler.recentHistory.ONE);
+  const [recentHistoryTwo, setRecentHistoryTwo] = useState(settings.pickerScheduler.recentHistory.TWO);
+  const [recentHistoryFour, setRecentHistoryFour] = useState(settings.pickerScheduler.recentHistory.FOUR);
+  const [newArrivalBonus, setNewArrivalBonus] = useState(settings.pickerScheduler.newArrivalBonus);
+  const [justCompletedBonus, setJustCompletedBonus] = useState(settings.pickerScheduler.justCompletedBonus);
+  const [unseenBonus, setUnseenBonus] = useState(settings.pickerScheduler.unseenBonus);
+  const [resolveUrgencyWeight, setResolveUrgencyWeight] = useState(settings.pickerScheduler.resolveUrgencyWeight);
+  const [polishRatingWeight, setPolishRatingWeight] = useState(settings.pickerScheduler.polishRatingWeight);
   const [cacheStatsState, setCacheStatsState] = useState<ImageCacheStats>({ count: 0, size: 0 });
 
   const [health, setHealth] = useState<any | null>(null);
@@ -10619,6 +11369,15 @@ function SettingsPage() {
     setCacheEnabled(settings.cache.enabled);
     setCacheTtlDays(settings.cache.ttlDays);
     setCacheMaxGb(Number((settings.cache.maxBytes / (1024 * 1024 * 1024)).toFixed(2)));
+    setMoveCooldownTurns(settings.pickerScheduler.moveCooldownTurns);
+    setRecentHistoryOne(settings.pickerScheduler.recentHistory.ONE);
+    setRecentHistoryTwo(settings.pickerScheduler.recentHistory.TWO);
+    setRecentHistoryFour(settings.pickerScheduler.recentHistory.FOUR);
+    setNewArrivalBonus(settings.pickerScheduler.newArrivalBonus);
+    setJustCompletedBonus(settings.pickerScheduler.justCompletedBonus);
+    setUnseenBonus(settings.pickerScheduler.unseenBonus);
+    setResolveUrgencyWeight(settings.pickerScheduler.resolveUrgencyWeight);
+    setPolishRatingWeight(settings.pickerScheduler.polishRatingWeight);
   }, [catalog.default_model, settings]);
 
   useEffect(() => {
@@ -10645,6 +11404,19 @@ function SettingsPage() {
         enabled: cacheEnabled,
         ttlDays: cacheTtlDays,
         maxBytes: Math.round(cacheMaxGb * 1024 * 1024 * 1024),
+      },
+      pickerScheduler: {
+        moveCooldownTurns,
+        recentHistory: {
+          ONE: recentHistoryOne,
+          TWO: recentHistoryTwo,
+          FOUR: recentHistoryFour,
+        },
+        newArrivalBonus,
+        justCompletedBonus,
+        unseenBonus,
+        resolveUrgencyWeight,
+        polishRatingWeight,
       },
     };
     setSettings(next);
@@ -10842,6 +11614,42 @@ function SettingsPage() {
               <input type="range" min={1} max={12} step={1} value={concurrency} onChange={(e) => setConcurrency(Number(e.target.value))} className="w-full" />
             </Field>
             <div className="text-xs text-zinc-500 dark:text-zinc-400">并发过高可能触发 429，需要降低刷新频率。</div>
+          </div>
+        </Card>
+
+        <Card className="lg:col-span-2">
+          <div className="text-sm font-bold text-zinc-900 dark:text-zinc-50">Picker 调度参数</div>
+          <div className="mt-2 text-xs text-zinc-600 dark:text-zinc-300">
+            这些参数只影响 Picker 的下一次调度边界，不会强制打断当前正在看的屏幕。
+          </div>
+          <div className="mt-3 grid grid-cols-1 gap-4 md:grid-cols-2">
+            <Field label={<LabelWithHint label={`移动冷却 (${moveCooldownTurns} turn)`} hint="图片在 Filmstrip 和优选池之间移动后，冷却期间不会立刻回到展示区。" />}>
+              <input type="range" min={1} max={6} step={1} value={moveCooldownTurns} onChange={(e) => setMoveCooldownTurns(Number(e.target.value))} className="w-full" />
+            </Field>
+            <Field label={<LabelWithHint label={`新图加分 (+${newArrivalBonus})`} hint="新流入 Filmstrip 的图片在前 2 个调度 turn 内获得额外优先级。" />}>
+              <input type="range" min={0} max={120} step={5} value={newArrivalBonus} onChange={(e) => setNewArrivalBonus(Number(e.target.value))} className="w-full" />
+            </Field>
+            <Field label={<LabelWithHint label={`刚完成加分 (+${justCompletedBonus})`} hint="queued/running 刚转为 succeeded 的图片，在下一次调度中更容易进展示区。" />}>
+              <input type="range" min={0} max={120} step={5} value={justCompletedBonus} onChange={(e) => setJustCompletedBonus(Number(e.target.value))} className="w-full" />
+            </Field>
+            <Field label={<LabelWithHint label={`未审图加分 (+${unseenBonus})`} hint="REVIEW_NEW 模式下，未审图的全局优先级偏置。" />}>
+              <input type="range" min={0} max={180} step={5} value={unseenBonus} onChange={(e) => setUnseenBonus(Number(e.target.value))} className="w-full" />
+            </Field>
+            <Field label={<LabelWithHint label={`复筛紧迫度 (${resolveUrgencyWeight})`} hint="RESOLVE_FILMSTRIP 模式使用 abs(rating - 3) * weight，星级越极端越优先复筛。" />}>
+              <input type="range" min={0} max={60} step={5} value={resolveUrgencyWeight} onChange={(e) => setResolveUrgencyWeight(Number(e.target.value))} className="w-full" />
+            </Field>
+            <Field label={<LabelWithHint label={`终筛高分偏置 (${polishRatingWeight})`} hint="POLISH_PICKED 模式使用 rating * weight，高分优选图会更靠前。" />}>
+              <input type="range" min={0} max={24} step={1} value={polishRatingWeight} onChange={(e) => setPolishRatingWeight(Number(e.target.value))} className="w-full" />
+            </Field>
+            <Field label={<LabelWithHint label={`1-up 最近历史 (${recentHistoryOne})`} hint="1 图模式下，最近展示过的图片会被降权，避免来回重复。" />}>
+              <input type="range" min={2} max={12} step={1} value={recentHistoryOne} onChange={(e) => setRecentHistoryOne(Number(e.target.value))} className="w-full" />
+            </Field>
+            <Field label={<LabelWithHint label={`2-up 最近历史 (${recentHistoryTwo})`} hint="2 图模式下，最近 1~3 屏展示过的图片会被降权。" />}>
+              <input type="range" min={4} max={16} step={1} value={recentHistoryTwo} onChange={(e) => setRecentHistoryTwo(Number(e.target.value))} className="w-full" />
+            </Field>
+            <Field label={<LabelWithHint label={`4-up 最近历史 (${recentHistoryFour})`} hint="4 图模式下，历史长度越长，下一组越不容易重复刚看过的图。" />}>
+              <input type="range" min={6} max={24} step={1} value={recentHistoryFour} onChange={(e) => setRecentHistoryFour(Number(e.target.value))} className="w-full" />
+            </Field>
           </div>
         </Card>
 

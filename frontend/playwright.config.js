@@ -7,7 +7,7 @@ export default defineConfig({
   workers: 1,
   reporter: [["list"]],
   use: {
-    baseURL: "http://127.0.0.1:5178",
+    baseURL: process.env.PW_BASE_URL || "http://127.0.0.1:5178",
     headless: true,
   },
 });
