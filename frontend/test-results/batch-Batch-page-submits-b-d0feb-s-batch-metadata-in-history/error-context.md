@@ -1,0 +1,180 @@
+# Page snapshot
+
+```yaml
+- generic [ref=e3]:
+  - generic [ref=e5]:
+    - generic [ref=e6]:
+      - generic [ref=e7]: NB
+      - generic [ref=e8]:
+        - generic [ref=e9]: Nano Banana Pro
+        - generic [ref=e10]: http://127.0.0.1:8000•Online•admin
+    - generic [ref=e11]:
+      - link "Dashboard" [ref=e12] [cursor=pointer]:
+        - /url: /
+      - link "Create" [ref=e13] [cursor=pointer]:
+        - /url: /create
+      - link "Batch" [ref=e14] [cursor=pointer]:
+        - /url: /batch
+      - link "History" [ref=e15] [cursor=pointer]:
+        - /url: /history
+      - link "Picker" [ref=e16] [cursor=pointer]:
+        - /url: /picker
+      - link "Admin" [ref=e17] [cursor=pointer]:
+        - /url: /admin
+      - link "Settings" [ref=e18] [cursor=pointer]:
+        - /url: /settings
+      - button "+ 快速创建" [ref=e19] [cursor=pointer]
+      - button "退出" [ref=e20] [cursor=pointer]
+  - generic [ref=e22]:
+    - generic [ref=e24]:
+      - generic [ref=e25]: History
+      - generic [ref=e26]: 本地历史画廊。支持批次识别、全文搜索、筛选和 Notion 风格详情模态。
+    - generic [ref=e27]:
+      - generic [ref=e28]:
+        - generic [ref=e29]: Browse
+        - generic [ref=e30]: Search & Filter
+        - generic [ref=e31]:
+          - generic [ref=e32]:
+            - generic [ref=e33]: Search
+            - textbox "job id / prompt / batch / section / error / model" [ref=e34]
+          - generic [ref=e35]:
+            - generic [ref=e36]: Status
+            - combobox [ref=e37]:
+              - option "All Statuses" [selected]
+              - option "Queued"
+              - option "Running"
+              - option "Success"
+              - option "Failed"
+              - option "Cancelled"
+          - generic [ref=e38]:
+            - generic [ref=e39]: Model
+            - combobox [ref=e40]:
+              - option "All Models" [selected]
+              - option "Nano Banana 2"
+              - option "Nano Banana"
+              - option "Nano Banana Pro"
+          - generic [ref=e41]:
+            - generic [ref=e42]: Date Range
+            - combobox [ref=e43]:
+              - option "All Time" [selected]
+              - option "Today"
+              - option "Last 7 Days"
+              - option "Last 30 Days"
+              - option "Custom"
+          - generic [ref=e44]:
+            - generic [ref=e45]: Batch
+            - combobox [ref=e46]:
+              - option "All Batches" [selected]
+              - option "PW Batch"
+          - generic [ref=e47]:
+            - generic [ref=e48]: Session
+            - combobox [ref=e49]:
+              - option "All Sessions" [selected]
+              - option "No Session"
+              - option "PW Batch-P2-Closing"
+              - option "PW Batch-P1-Intro"
+          - generic [ref=e50]:
+            - generic [ref=e51]: Sort
+            - combobox [ref=e52]:
+              - option "Created Desc" [selected]
+              - option "Created Asc"
+              - option "Longest First"
+          - generic [ref=e53]:
+            - generic [ref=e54]: Density
+            - combobox [ref=e55]:
+              - option "Cozy" [selected]
+              - option "Compact"
+          - generic [ref=e56]:
+            - generic [ref=e57]:
+              - generic [ref=e58]: Only Failed
+              - generic [ref=e59]: Failed + cancelled
+            - button [ref=e60] [cursor=pointer]
+          - generic [ref=e62]:
+            - generic [ref=e63]:
+              - generic [ref=e64]: Auto Refresh
+              - generic [ref=e65]: Keep running/queued cards fresh
+            - button [ref=e66] [cursor=pointer]
+      - generic [ref=e68]:
+        - generic [ref=e70]:
+          - generic [ref=e71]: Total 4
+          - generic [ref=e72]: Active 0
+          - generic [ref=e73]: Page 1 / 1
+          - generic [ref=e74]: Showing 1-4
+        - generic [ref=e75]:
+          - 'button "global look PW Batch Page number: 2 PW Batch SUCCEEDED 3/10/2026, 6:21:17 PM 1b31da…da8d2c global look PW Batch Page number: 2 Section · Closing" [ref=e76] [cursor=pointer]':
+            - generic [ref=e77]:
+              - 'img "global look PW Batch Page number: 2" [ref=e81]'
+              - generic:
+                - generic: PW Batch
+                - generic: SUCCEEDED
+            - generic [ref=e82]:
+              - generic [ref=e83]:
+                - generic [ref=e84]: 3/10/2026, 6:21:17 PM
+                - generic [ref=e85]: 1b31da…da8d2c
+              - generic [ref=e86]: "global look PW Batch Page number: 2"
+              - generic [ref=e87]: Section · Closing
+          - 'button "global look PW Batch Page number: 2 PW Batch SUCCEEDED 3/10/2026, 6:21:16 PM a76703…22126e global look PW Batch Page number: 2 Section · Closing" [ref=e88] [cursor=pointer]':
+            - generic [ref=e89]:
+              - 'img "global look PW Batch Page number: 2" [ref=e93]'
+              - generic:
+                - generic: PW Batch
+                - generic: SUCCEEDED
+            - generic [ref=e94]:
+              - generic [ref=e95]:
+                - generic [ref=e96]: 3/10/2026, 6:21:16 PM
+                - generic [ref=e97]: a76703…22126e
+              - generic [ref=e98]: "global look PW Batch Page number: 2"
+              - generic [ref=e99]: Section · Closing
+          - 'button "global look PW Batch Page number: 2 PW Batch SUCCEEDED 3/10/2026, 6:21:14 PM a5e1c1…efbc3b global look PW Batch Page number: 2 Section · Closing" [ref=e100] [cursor=pointer]':
+            - generic [ref=e101]:
+              - 'img "global look PW Batch Page number: 2" [ref=e105]'
+              - generic:
+                - generic: PW Batch
+                - generic: SUCCEEDED
+            - generic [ref=e106]:
+              - generic [ref=e107]:
+                - generic [ref=e108]: 3/10/2026, 6:21:14 PM
+                - generic [ref=e109]: a5e1c1…efbc3b
+              - generic [ref=e110]: "global look PW Batch Page number: 2"
+              - generic [ref=e111]: Section · Closing
+          - 'button "! Failed PW Batch FAILED 3/10/2026, 6:21:14 PM f9cd14…50551d hero frame Intro global look PW Batch Page number: 1 任务失败" [ref=e112] [cursor=pointer]':
+            - generic [ref=e113]:
+              - generic [ref=e116]:
+                - generic [ref=e117]: "!"
+                - generic [ref=e118]: Failed
+              - generic:
+                - generic: PW Batch
+                - generic: FAILED
+            - generic [ref=e119]:
+              - generic [ref=e120]:
+                - generic [ref=e121]: 3/10/2026, 6:21:14 PM
+                - generic [ref=e122]: f9cd14…50551d
+              - generic [ref=e123]: "hero frame Intro global look PW Batch Page number: 1"
+              - generic [ref=e124]: 任务失败
+      - generic [ref=e125]:
+        - generic [ref=e126]: Pager
+        - generic [ref=e127]: Page Controls
+        - generic [ref=e128]:
+          - generic [ref=e129]:
+            - generic [ref=e130]: Per Page
+            - combobox [ref=e131]:
+              - option "24" [selected]
+              - option "48"
+              - option "72"
+          - generic [ref=e132]:
+            - generic [ref=e133]: Totals
+            - generic [ref=e134]:
+              - generic [ref=e135]: "Total cards: 4"
+              - generic [ref=e136]: "Current page: 1"
+              - generic [ref=e137]: "Total pages: 1"
+          - generic [ref=e138]:
+            - button "Prev" [disabled] [ref=e139]
+            - button "Next" [disabled] [ref=e140]
+  - generic [ref=e142]:
+    - generic [ref=e143]: 提示
+    - list [ref=e144]:
+      - listitem [ref=e145]: "后端 API 前缀：{BASE_URL}/v1（本应用从 Settings.baseUrl 拼接）。"
+      - listitem [ref=e146]: 历史列表只来自浏览器本地存储，不会也无法展示系统级全部 job。
+      - listitem [ref=e147]: SSE 端点若需要 token header，原生 EventSource 无法带 header，会自动 fallback 到轮询。
+      - listitem [ref=e148]: multipart 字段名（如 reference_images / prompt / params）如与后端不一致，请在 CreateJobPage 的 FormData 处对齐。
+```

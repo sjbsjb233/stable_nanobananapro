@@ -234,6 +234,8 @@ type PickerSession = {
   name: string;
   created_at: string;
   updated_at: string;
+  archived?: boolean;
+  pinned?: boolean;
   cover?: PickerItemRef;
   items: PickerSessionItem[];
   best_image?: PickerItemRef;
@@ -526,6 +528,7 @@ const KEY_JOBS_LEGACY = "nbp_jobs_v1";
 const KEY_DASH_CACHE = "nbp_dashboard_cache_v1";
 const KEY_PICKER_SESSIONS = "nbp_picker_sessions_v1";
 const KEY_PICKER_RECENT = "nbp_picker_recent_v1";
+const KEY_PICKER_SIDEBAR_PREF = "nbp_picker_sidebar_pref_v1";
 const KEY_HISTORY_AUTO_REFRESH_PREF = "nbp_history_auto_refresh_pref_v1";
 const KEY_CREATE_CLONE_DRAFT = "nbp_create_clone_draft_v1";
 const IMAGE_CACHE_DB = "nbp_image_cache_v1";
@@ -1891,11 +1894,13 @@ function createPickerSession(name?: string): PickerSession {
     name: (name || "").trim() || `挑选会话 ${new Date().toLocaleDateString()}`,
     created_at: now,
     updated_at: now,
+    archived: false,
+    pinned: false,
     items: [],
-    compare_mode: "TWO",
+    compare_mode: "FOUR",
     layout_preset: "SYNC_ZOOM",
     ui: {
-      background: "dark",
+      background: "light",
       showGrid: false,
       showInfo: false,
     },
@@ -1942,6 +1947,8 @@ function normalizePickerSession(raw: any): PickerSession {
     name: String(raw?.name || "未命名会话"),
     created_at: String(raw?.created_at || now),
     updated_at: String(raw?.updated_at || raw?.created_at || now),
+    archived: Boolean(raw?.archived),
+    pinned: Boolean(raw?.pinned),
     cover:
       raw?.cover?.job_id && raw?.cover?.image_id
         ? { job_id: String(raw.cover.job_id), image_id: String(raw.cover.image_id) }
@@ -1972,6 +1979,14 @@ function normalizePickerSessions(raw: any): PickerSession[] {
   const list = Array.isArray(raw) ? raw : [];
   const sessions = list.map((x) => normalizePickerSession(x));
   return sessions.sort((a, b) => {
+    const aArchived = a.archived ? 1 : 0;
+    const bArchived = b.archived ? 1 : 0;
+    if (aArchived !== bArchived) return aArchived - bArchived;
+    const aPinned = a.pinned ? 1 : 0;
+    const bPinned = b.pinned ? 1 : 0;
+    if (aPinned !== bPinned) return bPinned - aPinned;
+    const updatedDelta = (new Date(b.updated_at).getTime() || 0) - (new Date(a.updated_at).getTime() || 0);
+    if (updatedDelta !== 0) return updatedDelta;
     const createdDelta = (new Date(b.created_at).getTime() || 0) - (new Date(a.created_at).getTime() || 0);
     if (createdDelta !== 0) return createdDelta;
     return (new Date(b.updated_at).getTime() || 0) - (new Date(a.updated_at).getTime() || 0);
@@ -10145,7 +10160,7 @@ function PickerCompareSlot({
         title="聚焦该图片"
         data-testid={`picker-focus-${slotLabel}`}
       />
-      <div className="relative h-[260px] w-full sm:h-[320px] md:h-[360px]">
+      <div className="relative h-[320px] w-full sm:h-[400px] md:h-[460px] xl:h-[500px]">
         {!item ? (
           <div className="flex h-full items-center justify-center text-sm text-zinc-500 dark:text-zinc-400">空槽位 {slotLabel}</div>
         ) : !hasImage ? (
@@ -10288,6 +10303,17 @@ function PickerPage() {
   const [importState, setImportState] = useState<Record<string, { loading: boolean; imageIds: string[]; error?: string }>>({});
   const [importSelection, setImportSelection] = useState<Record<string, boolean>>({});
   const [manualTokenByJob, setManualTokenByJob] = useState<Record<string, string>>({});
+  const [sidebarPinned, setSidebarPinned] = useState(() => {
+    const saved = safeJsonParse<{ pinned?: boolean } | null>(storageGet(KEY_PICKER_SIDEBAR_PREF), null);
+    return saved?.pinned ?? false;
+  });
+  const [sidebarHoverOpen, setSidebarHoverOpen] = useState(false);
+  const [showArchivedSessions, setShowArchivedSessions] = useState(false);
+  const [sessionMenuId, setSessionMenuId] = useState<string | null>(null);
+  const [newSessionDraft, setNewSessionDraft] = useState("");
+  const [visibleSessionCount, setVisibleSessionCount] = useState(16);
+  const [importPage, setImportPage] = useState(1);
+  const [importGroupCollapsed, setImportGroupCollapsed] = useState<Record<string, boolean>>({});
   const autoImportedRef = useRef<Record<string, boolean>>({});
   const previousSessionIdRef = useRef<string | null>(null);
   const previousSessionItemsRef = useRef<Map<string, PickerSessionItem>>(new Map());
@@ -10331,6 +10357,10 @@ function PickerPage() {
   }, [immersiveMode]);
 
   useEffect(() => {
+    storageSet(KEY_PICKER_SIDEBAR_PREF, JSON.stringify({ pinned: sidebarPinned }));
+  }, [sidebarPinned]);
+
+  useEffect(() => {
     const sid = sessionQuery;
     if (!sid) return;
     if (sid === currentSessionId) return;
@@ -10355,11 +10385,93 @@ function PickerPage() {
   const filteredJobs = useMemo(() => {
     const q = importFilter.trim().toLowerCase();
     const base = [...jobs].filter((j) => !j.deleted);
-    if (!q) return base.slice(0, 60);
+    if (!q) return base;
     return base
       .filter((j) => `${j.job_id} ${j.prompt_preview || ""} ${(j.tags || []).join(" ")}`.toLowerCase().includes(q))
-      .slice(0, 60);
+      .slice(0, 400);
   }, [jobs, importFilter]);
+  const activeSessions = useMemo(() => sessions.filter((session) => !session.archived), [sessions]);
+  const archivedSessions = useMemo(() => sessions.filter((session) => session.archived), [sessions]);
+  const sidebarSessions = showArchivedSessions ? archivedSessions : activeSessions;
+  const visibleSidebarSessions = useMemo(
+    () => sidebarSessions.slice(0, visibleSessionCount),
+    [sidebarSessions, visibleSessionCount]
+  );
+  const sidebarOpen = sidebarPinned || sidebarHoverOpen;
+
+  const importGroups = useMemo(() => {
+    const grouped = new Map<
+      string,
+      {
+        key: string;
+        label: string;
+        hint: string;
+        jobs: JobRecord[];
+        collapsible: boolean;
+      }
+    >();
+
+    filteredJobs.forEach((job) => {
+      const isBatch = Boolean(job.batch_id && (job.batch_size || 0) > 1);
+      const key = isBatch ? `batch:${job.batch_id}` : `job:${job.job_id}`;
+      const existing = grouped.get(key);
+      if (existing) {
+        existing.jobs.push(job);
+        return;
+      }
+      grouped.set(key, {
+        key,
+        label: isBatch ? (job.batch_name ? `批次 · ${job.batch_name}` : `批次 · ${shortId(job.batch_id || job.job_id, 6)}`) : (job.prompt_preview || shortId(job.job_id, 6)),
+        hint: isBatch
+          ? `${job.batch_size || 0} 个 job${job.section_title ? ` · ${job.section_title}` : ""}`
+          : `${shortId(job.job_id)} · ${job.status_cache || "UNKNOWN"}`,
+        jobs: [job],
+        collapsible: isBatch,
+      });
+    });
+
+    return Array.from(grouped.values())
+      .map((group) => ({
+        ...group,
+        jobs: group.jobs.sort((a, b) => (new Date(b.created_at).getTime() || 0) - (new Date(a.created_at).getTime() || 0)),
+      }))
+      .sort((a, b) => {
+        const latestA = Math.max(...a.jobs.map((job) => new Date(job.created_at).getTime() || 0));
+        const latestB = Math.max(...b.jobs.map((job) => new Date(job.created_at).getTime() || 0));
+        return latestB - latestA;
+      });
+  }, [filteredJobs]);
+  const importGroupPageSize = 10;
+  const importTotalPages = Math.max(1, Math.ceil(importGroups.length / importGroupPageSize));
+  const safeImportPage = clamp(importPage, 1, importTotalPages);
+  const pagedImportGroups = useMemo(
+    () => importGroups.slice((safeImportPage - 1) * importGroupPageSize, safeImportPage * importGroupPageSize),
+    [importGroups, safeImportPage]
+  );
+
+  useEffect(() => {
+    setVisibleSessionCount(16);
+  }, [showArchivedSessions, sidebarSessions.length]);
+
+  useEffect(() => {
+    if (importPage !== safeImportPage) setImportPage(safeImportPage);
+  }, [importPage, safeImportPage]);
+
+  useEffect(() => {
+    setImportPage(1);
+  }, [importFilter, importGroups.length]);
+
+  useEffect(() => {
+    setImportGroupCollapsed((current) => {
+      const next = { ...current };
+      importGroups.forEach((group) => {
+        if (next[group.key] === undefined) {
+          next[group.key] = group.collapsible;
+        }
+      });
+      return next;
+    });
+  }, [importGroups]);
 
   const loadJobImages = async (job_id: string, tokenOverride?: string) => {
     const rec = jobsById.get(job_id);
@@ -10425,6 +10537,57 @@ function PickerPage() {
     if (!silent) push({ kind: "success", title: "已导入", message: `${loaded.imageIds.length} 张图片` });
   };
 
+  const createSessionFromSidebar = () => {
+    const id = createSession(newSessionDraft.trim() || undefined);
+    setNewSessionDraft("");
+    syncSessionParam(id);
+    push({ kind: "success", title: "已创建会话" });
+    setShowArchivedSessions(false);
+  };
+
+  const archiveSession = (sessionId: string, archived: boolean) => {
+    patchSession(sessionId, (session) => ({ ...session, archived }));
+    if (archived && currentSessionId === sessionId) {
+      const nextActive = sessions.find((session) => session.session_id !== sessionId && !session.archived);
+      if (nextActive) {
+        setCurrentSessionAndUrl(nextActive.session_id);
+      }
+    }
+    setSessionMenuId(null);
+  };
+
+  const pinSession = (sessionId: string, pinned: boolean) => {
+    patchSession(sessionId, (session) => ({ ...session, pinned }));
+    setSessionMenuId(null);
+  };
+
+  const renameSessionFromSidebar = (session: PickerSession) => {
+    const nextName = prompt("重命名会话：", session.name);
+    if (!nextName) return;
+    renameSession(session.session_id, nextName);
+    setSessionMenuId(null);
+  };
+
+  const deleteSessionFromSidebar = (session: PickerSession) => {
+    if (!confirm(`删除会话「${session.name}」？`)) return;
+    const nextSessionId = sessions.find((item) => item.session_id !== session.session_id && !item.archived)?.session_id
+      || sessions.find((item) => item.session_id !== session.session_id)?.session_id
+      || null;
+    deleteSession(session.session_id);
+    syncSessionParam(nextSessionId);
+    setSessionMenuId(null);
+  };
+
+  const importAllFromGroup = async (group: { jobs: JobRecord[]; label: string }) => {
+    if (!currentSession) return;
+    let importedJobs = 0;
+    for (const job of group.jobs) {
+      await importAllFromJob(job.job_id, true);
+      importedJobs += 1;
+    }
+    push({ kind: "success", title: "已批量导入", message: `${group.label} · ${importedJobs} 个 job` });
+  };
+
   useEffect(() => {
     const jobId = jobQuery;
     if (!jobId || !currentSession) return;
@@ -10470,7 +10633,7 @@ function PickerPage() {
     setFocus(currentSession.session_id, focusKey);
   }, [currentSession?.session_id, currentSession?.focus_key, focusKey, setFocus]);
 
-  const compareMode = currentSession?.compare_mode || "TWO";
+  const compareMode = currentSession?.compare_mode || "FOUR";
   const stageSlotCount = pickerCompareModeSlotCount(compareMode);
   const stageSlots = normalizedSlots.slice(0, stageSlotCount);
   const isPreferredKey = (key?: string | null) => Boolean(key && pickerBucketOf(itemMap.get(key) || null) === "PREFERRED");
@@ -10825,275 +10988,376 @@ function PickerPage() {
   };
 
   return (
-    <div className="mx-auto w-full max-w-[1400px] px-4 py-6">
-      <PageTitle
-        title="Image Picker"
-        subtitle="跨任务图片对比、选优与下载（本地会话持久化）"
-        right={
+    <div className={cn("relative min-h-screen", sidebarPinned ? "pl-[330px]" : "pl-6")}>
+      {!sidebarPinned ? (
+        <div
+          className="fixed inset-y-0 left-0 z-30 w-5"
+          onMouseEnter={() => setSidebarHoverOpen(true)}
+        />
+      ) : null}
+
+      <aside
+        className="fixed bottom-4 left-4 top-24 z-40 w-[300px] rounded-[28px] border border-zinc-200/80 bg-white/92 p-3 shadow-[0_18px_60px_rgba(15,23,42,0.14)] backdrop-blur transition duration-300 dark:border-white/10 dark:bg-zinc-950/88"
+        style={{ transform: sidebarOpen ? "translateX(0)" : "translateX(calc(-100% + 18px))" }}
+        onMouseEnter={() => setSidebarHoverOpen(true)}
+        onMouseLeave={() => {
+          if (!sidebarPinned) {
+            setSidebarHoverOpen(false);
+            setSessionMenuId(null);
+          }
+        }}
+        data-testid="picker-session-sidebar"
+      >
+        <div className="absolute inset-y-8 -right-3 flex items-center">
+          <button
+            type="button"
+            className="rounded-full border border-zinc-200 bg-white px-2 py-5 text-[10px] font-bold uppercase tracking-[0.22em] text-zinc-500 shadow-sm dark:border-white/10 dark:bg-zinc-950 dark:text-zinc-300"
+            onClick={() => setSidebarPinned((current) => !current)}
+          >
+            {sidebarPinned ? "收" : "会话"}
+          </button>
+        </div>
+
+        <div className="mb-3 flex items-start justify-between gap-3">
+          <div>
+            <div className="text-sm font-bold text-zinc-900 dark:text-zinc-50">Sessions</div>
+            <div className="text-[11px] text-zinc-500 dark:text-zinc-400">
+              {showArchivedSessions ? `归档 ${archivedSessions.length}` : `活跃 ${activeSessions.length}`}
+            </div>
+          </div>
           <div className="flex items-center gap-2">
-            <Button variant="ghost" onClick={() => navigate("/history")}>返回 History</Button>
+            <Button variant={sidebarPinned ? "secondary" : "ghost"} className="!px-2 !py-1 text-xs" onClick={() => setSidebarPinned((current) => !current)}>
+              {sidebarPinned ? "固定" : "自动隐藏"}
+            </Button>
+            <Button testId="picker-sidebar-archived-toggle" variant="ghost" className="!px-2 !py-1 text-xs" onClick={() => setShowArchivedSessions((current) => !current)}>
+              {showArchivedSessions ? "返回活跃" : "查看归档"}
+            </Button>
           </div>
-        }
-      />
+        </div>
 
-      <Card className="mb-3">
-        <div className="flex flex-wrap items-center gap-2">
-          <div className="min-w-[220px] flex-1">
-            <Select
-              value={currentSession.session_id}
-              onChange={setCurrentSessionAndUrl}
-              options={sessions.map((s) => ({ value: s.session_id, label: `${s.name} · ${s.items.length} 张` }))}
-            />
+        <div className="mb-3 rounded-2xl border border-zinc-200 bg-zinc-50/80 p-2 dark:border-white/10 dark:bg-zinc-900/50">
+          <div className="flex gap-2">
+            <Input value={newSessionDraft} onChange={setNewSessionDraft} placeholder="新建会话名称" />
+            <Button testId="picker-sidebar-create-session" variant="secondary" className="!px-3" onClick={createSessionFromSidebar}>
+              新建
+            </Button>
           </div>
-          <Button
-            variant="secondary"
-            onClick={() => {
-              const name = prompt("新会话名称：", `挑选会话 ${new Date().toLocaleDateString()}`);
-              const id = createSession(name || undefined);
-              syncSessionParam(id);
-              push({ kind: "success", title: "已创建会话" });
-            }}
-          >
-            新建会话
-          </Button>
-          <Button
-            variant="ghost"
-            onClick={() => {
-              const name = prompt("重命名会话：", currentSession.name);
-              if (!name) return;
-              renameSession(currentSession.session_id, name);
-            }}
-          >
-            重命名
-          </Button>
-          <Button
-            variant="danger"
-            onClick={() => {
-              if (!confirm("删除当前会话？")) return;
-              const nextSessionId = sessions.find((s) => s.session_id !== currentSession.session_id)?.session_id || null;
-              deleteSession(currentSession.session_id);
-              syncSessionParam(nextSessionId);
-            }}
-            disabled={sessions.length <= 1}
-          >
-            删除会话
-          </Button>
-
-          <div className="mx-2 h-6 w-px bg-zinc-200 dark:bg-white/10" />
-
-          <Button variant="secondary" onClick={() => setImportOpen(true)}>从历史导入</Button>
-          <Button testId="picker-mode-one" variant={compareMode === "ONE" ? "primary" : "ghost"} onClick={() => setSessionMode("ONE")}>1-up</Button>
-          <Button variant={compareMode === "TWO" ? "primary" : "ghost"} onClick={() => setSessionMode("TWO")}>2-up</Button>
-          <Button variant={compareMode === "FOUR" ? "primary" : "ghost"} onClick={() => setSessionMode("FOUR")}>4-up</Button>
-          <Button
-            variant={currentSession.layout_preset === "SYNC_ZOOM" ? "secondary" : "ghost"}
-            onClick={() => patchSessionLayout(currentSession.layout_preset === "SYNC_ZOOM" ? "FREE_ZOOM" : "SYNC_ZOOM")}
-          >
-            {currentSession.layout_preset === "SYNC_ZOOM" ? "同步缩放" : "自由缩放"}
-          </Button>
-          <Button
-            variant={currentSession.ui.showInfo ? "secondary" : "ghost"}
-            onClick={() => patchSessionUi({ showInfo: !currentSession.ui.showInfo })}
-          >
-            Info
-          </Button>
-          <Button
-            variant={currentSession.ui.showGrid ? "secondary" : "ghost"}
-            onClick={() => patchSessionUi({ showGrid: !currentSession.ui.showGrid })}
-          >
-            Grid
-          </Button>
-          <Button
-            variant={darkStage ? "secondary" : "ghost"}
-            onClick={() => patchSessionUi({ background: darkStage ? "light" : "dark" })}
-          >
-            {darkStage ? "Dark BG" : "Light BG"}
-          </Button>
-          <Button variant="secondary" onClick={() => setImmersiveMode(true)}>
-            全屏审阅
-          </Button>
-          <Button testId="picker-next-batch" variant="secondary" onClick={shiftToNextBatch}>
-            切换下一组
-          </Button>
-          <Button variant="primary" onClick={downloadBest}>下载优选</Button>
-          <Button variant="secondary" onClick={downloadPicked}>下载选中</Button>
+          <div className="mt-2 flex items-center gap-2 text-[11px] text-zinc-500 dark:text-zinc-400">
+            <span>默认 4-up</span>
+            <span>·</span>
+            <span>Light BG</span>
+            <span>·</span>
+            <span>支持归档 / 置顶</span>
+          </div>
         </div>
-        <div className="mt-3 flex flex-wrap items-center gap-2 text-xs text-zinc-500 dark:text-zinc-400">
-          <span className="rounded-full border border-zinc-200 bg-white px-3 py-1 dark:border-white/10 dark:bg-zinc-950/40">
-            当前模式 {activeMode}
-          </span>
-          <span className="rounded-full border border-zinc-200 bg-white px-3 py-1 dark:border-white/10 dark:bg-zinc-950/40">
-            未审 Filmstrip {pendingReviewCount}
-          </span>
-          <span className="rounded-full border border-zinc-200 bg-white px-3 py-1 dark:border-white/10 dark:bg-zinc-950/40">
-            Filmstrip {filmstripItems.length} / 优选池 {preferredItems.length}
-          </span>
-        </div>
-      </Card>
 
-      <Card className={cn("mb-3 overflow-hidden p-2", darkStage ? "bg-zinc-950" : "bg-zinc-50")} testId="picker-stage">
-        <div className={cn("grid gap-2", compareMode === "FOUR" ? "grid-cols-1 md:grid-cols-2" : "grid-cols-1")}>
-          {stageSlots.map((slotKey, idx) => {
-            const item = slotKey ? itemMap.get(slotKey) || null : null;
-            const label = String.fromCharCode(65 + idx);
-            return (
-              <div key={`${label}_${slotKey || "empty"}`} data-testid={`picker-slot-${label}`}>
-                <PickerCompareSlot
-                  slotLabel={label}
-                  item={item}
-                  image={slotKey ? imageState[slotKey] : undefined}
-                  isBest={Boolean(slotKey && isPreferredKey(slotKey))}
-                  focused={Boolean(slotKey && slotKey === focusKey)}
-                  showInfo={currentSession.ui.showInfo}
-                  showGrid={currentSession.ui.showGrid}
-                  darkStage={darkStage}
-                  jobRec={item ? jobsById.get(item.job_id) : undefined}
-                  displayName={item ? pickerDisplayName(item, jobsById.get(item.job_id)) : "-"}
-                  onFocus={() => slotKey && setFocus(currentSession.session_id, slotKey)}
-                  onEnsureImage={() => {}}
-                  onBest={() => slotKey && toggleBest(slotKey)}
-                  onRate={(n) => slotKey && rateItem(slotKey, n)}
-                  onRemove={() => slotKey && deleteFromPicker(slotKey)}
-                  onFixToken={() => item && fixToken(item)}
-                />
-              </div>
-            );
-          })}
-        </div>
-      </Card>
-
-      <Card>
-        <div className="mb-2 flex items-center justify-between">
-          <div className="text-sm font-bold text-zinc-900 dark:text-zinc-50">Filmstrip</div>
-          <div className="text-xs text-zinc-500 dark:text-zinc-400">已选 {selectedCount} / 总计 {filmstripItems.length + preferredItems.length}</div>
-        </div>
-        {!filmstripItems.length && !preferredItems.length ? (
-          <EmptyHint text="暂无图片，点击“从历史导入”开始挑选" />
-        ) : (
-          <div className="space-y-4">
-            <div
-              className="flex gap-2 overflow-x-auto pb-2"
-              onWheel={(e) => {
-                if (Math.abs(e.deltaY) > Math.abs(e.deltaX)) {
-                  (e.currentTarget as HTMLDivElement).scrollLeft += e.deltaY;
-                }
-              }}
-            >
-              {filmstripItems.map((item) => {
-                const key = pickerItemKey(item);
-                const active = key === focusKey;
-                const inSlot = normalizedSlots.indexOf(key);
-                const state = imageState[key];
-                const hasImage = pickerItemHasImage(item);
-                const status = pickerItemJobStatus(item, jobsById.get(item.job_id));
-                return (
-                  <motion.div
-                    layout
-                    key={`film_${key}`}
-                    className={cn(
-                      "w-56 flex-none overflow-hidden rounded-2xl border",
-                      active ? "border-zinc-900 shadow-md dark:border-white" : "border-zinc-200 dark:border-white/10"
-                    )}
-                  >
-                    <button
-                      type="button"
-                      className="relative block h-36 w-full overflow-hidden bg-zinc-100 dark:bg-zinc-900"
-                      onClick={() => {
-                        if (compareMode === "ONE") {
-                          patchSession(currentSession.session_id, (session) => ({
-                            ...session,
-                            focus_key: key,
-                            slots: [key, null, null, null],
-                          }));
-                        } else {
-                          setFocus(currentSession.session_id, key);
-                        }
-                      }}
-                    >
-                      {!hasImage ? (
-                        <PickerPendingVisual status={status} />
-                      ) : state?.url ? (
-                        <img
-                          src={state.url}
-                          alt={item.image_id}
-                          className="h-full w-full object-cover opacity-0 blur-sm transition duration-300"
-                          onLoad={(e) => {
-                            const el = e.currentTarget;
-                            el.classList.remove("opacity-0", "blur-sm");
-                            el.classList.add("opacity-100");
-                          }}
-                        />
-                      ) : (
-                        <Skeleton className="h-full w-full" />
-                      )}
-                      {state?.code === "404" ? <div className="absolute inset-0 flex items-center justify-center bg-black/60 text-xs font-bold text-white">404</div> : null}
-                    </button>
-
-                    <div className="space-y-1 p-2">
-                      <div className="flex items-center justify-between">
-                        <label className="inline-flex items-center gap-1 text-[11px] text-zinc-600 dark:text-zinc-300">
-                          <input
-                            type="checkbox"
-                            checked={Boolean(item.picked)}
-                            onChange={(e) => updateItem(currentSession.session_id, key, { picked: e.target.checked })}
-                          />
-                          选中
-                        </label>
-                        <div className="text-[11px] text-zinc-500 dark:text-zinc-400">{inSlot >= 0 ? String.fromCharCode(65 + inSlot) : "-"}</div>
-                      </div>
-                      {hasImage ? (
-                        <RatingStars
-                          value={item.rating || 0}
-                          onChange={(n) => rateItem(key, n)}
-                        />
-                      ) : (
-                        <div
-                          className={cn(
-                            "rounded-xl px-2 py-1 text-[11px] font-semibold",
-                            status === "FAILED"
-                              ? "bg-rose-500/10 text-rose-700 dark:text-rose-200"
-                              : "bg-sky-500/10 text-sky-700 dark:text-sky-200"
-                          )}
-                        >
-                          {status === "FAILED" ? "该任务生成失败" : "图像生成中，完成后会自动补图"}
-                        </div>
-                      )}
-                      <div className="flex flex-wrap gap-1">
-                        <Button variant="ghost" className="!px-1.5 !py-0.5 text-[10px]" onClick={() => toggleBest(key)} disabled={!hasImage}>
-                          {isPreferredKey(key) ? "移回片池" : "移入优选"}
-                        </Button>
-                        <Button variant="ghost" className="!px-1.5 !py-0.5 text-[10px]" onClick={() => downloadOne(item)} disabled={!hasImage}>下载</Button>
-                        <Button variant="danger" className="!px-1.5 !py-0.5 text-[10px]" onClick={() => deleteFromPicker(key)}>
-                          删除
-                        </Button>
-                      </div>
-                      <div className="truncate text-[10px] text-zinc-500 dark:text-zinc-400">
-                        {pickerDisplayName(item, jobsById.get(item.job_id))}
+        <div
+          className="h-[calc(100%-132px)] overflow-y-auto pr-1"
+          onScroll={(e) => {
+            const el = e.currentTarget;
+            if (el.scrollTop + el.clientHeight >= el.scrollHeight - 72) {
+              setVisibleSessionCount((current) => Math.min(sidebarSessions.length, current + 12));
+            }
+          }}
+        >
+          <div className="space-y-2">
+            {visibleSidebarSessions.map((session) => {
+              const counts = getPickerSessionCounts(session);
+              const active = session.session_id === currentSession.session_id;
+              const menuOpen = sessionMenuId === session.session_id;
+              return (
+                <div
+                  key={session.session_id}
+                  data-testid={`picker-session-item-${session.session_id}`}
+                  className={cn(
+                    "relative rounded-2xl border p-2.5 transition",
+                    active
+                      ? "border-zinc-900 bg-zinc-900 text-white shadow-md dark:border-white dark:bg-white dark:text-zinc-900"
+                      : "border-zinc-200 bg-white/80 hover:border-zinc-300 dark:border-white/10 dark:bg-zinc-900/60 dark:hover:border-white/20"
+                  )}
+                >
+                  <button
+                    type="button"
+                    className="absolute inset-0 rounded-2xl"
+                    onClick={() => {
+                      setCurrentSessionAndUrl(session.session_id);
+                      setSessionMenuId(null);
+                      setShowArchivedSessions(Boolean(session.archived));
+                    }}
+                    aria-label={`切换会话 ${session.name}`}
+                  />
+                  <div className="relative z-10 flex items-start justify-between gap-2">
+                    <div className="min-w-0">
+                      <div className="truncate text-sm font-semibold">{session.name}</div>
+                      <div className={cn("mt-1 text-[11px]", active ? "text-white/75 dark:text-zinc-700" : "text-zinc-500 dark:text-zinc-400")}>
+                        Filmstrip {counts.filmstrip} · 优选 {counts.preferred}
                       </div>
                     </div>
-                  </motion.div>
+                    <div className="relative">
+                      <button
+                        type="button"
+                        className={cn(
+                          "relative z-20 rounded-full px-2 py-1 text-xs font-bold",
+                          active ? "bg-white/15 text-white dark:bg-zinc-900/10 dark:text-zinc-900" : "bg-zinc-100 text-zinc-600 dark:bg-zinc-800 dark:text-zinc-300"
+                        )}
+                        data-testid={`picker-session-menu-${session.session_id}`}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setSessionMenuId((current) => (current === session.session_id ? null : session.session_id));
+                        }}
+                      >
+                        ...
+                      </button>
+                      {menuOpen ? (
+                        <div className="absolute right-0 top-9 z-30 w-40 rounded-2xl border border-zinc-200 bg-white p-1.5 shadow-xl dark:border-white/10 dark:bg-zinc-950">
+                          <button type="button" className="w-full rounded-xl px-3 py-2 text-left text-xs hover:bg-zinc-100 dark:hover:bg-zinc-900" onClick={() => renameSessionFromSidebar(session)}>
+                            重命名
+                          </button>
+                          <button type="button" className="w-full rounded-xl px-3 py-2 text-left text-xs hover:bg-zinc-100 dark:hover:bg-zinc-900" onClick={() => pinSession(session.session_id, !session.pinned)}>
+                            {session.pinned ? "取消置顶" : "置顶"}
+                          </button>
+                          <button type="button" className="w-full rounded-xl px-3 py-2 text-left text-xs hover:bg-zinc-100 dark:hover:bg-zinc-900" onClick={() => archiveSession(session.session_id, !session.archived)}>
+                            {session.archived ? "恢复会话" : "归档会话"}
+                          </button>
+                          <button type="button" className="w-full rounded-xl px-3 py-2 text-left text-xs text-rose-600 hover:bg-rose-50 dark:hover:bg-rose-950/30" onClick={() => deleteSessionFromSidebar(session)}>
+                            删除
+                          </button>
+                        </div>
+                      ) : null}
+                    </div>
+                  </div>
+                  <div className="relative z-10 mt-2 flex flex-wrap items-center gap-1 text-[10px]">
+                    {session.pinned ? <span className={cn("rounded-full px-2 py-0.5", active ? "bg-white/15 text-white dark:bg-zinc-900/10 dark:text-zinc-900" : "bg-amber-100 text-amber-700 dark:bg-amber-500/15 dark:text-amber-200")}>置顶</span> : null}
+                    {session.archived ? <span className={cn("rounded-full px-2 py-0.5", active ? "bg-white/15 text-white dark:bg-zinc-900/10 dark:text-zinc-900" : "bg-zinc-100 text-zinc-600 dark:bg-zinc-800 dark:text-zinc-300")}>归档</span> : null}
+                    <span className={cn("rounded-full px-2 py-0.5", active ? "bg-white/15 text-white dark:bg-zinc-900/10 dark:text-zinc-900" : "bg-zinc-100 text-zinc-600 dark:bg-zinc-800 dark:text-zinc-300")}>
+                      {session.compare_mode}
+                    </span>
+                  </div>
+                </div>
+              );
+            })}
+            {!visibleSidebarSessions.length ? (
+              <div className="rounded-2xl border border-dashed border-zinc-200 p-4 text-xs text-zinc-500 dark:border-white/10 dark:text-zinc-400">
+                {showArchivedSessions ? "还没有归档会话。" : "还没有活跃会话。"}
+              </div>
+            ) : null}
+          </div>
+          {visibleSessionCount < sidebarSessions.length ? (
+            <div className="mt-3 flex justify-center">
+              <Button variant="ghost" className="!px-3 !py-1.5 text-xs" onClick={() => setVisibleSessionCount((current) => Math.min(sidebarSessions.length, current + 12))}>
+                加载更多会话
+              </Button>
+            </div>
+          ) : null}
+        </div>
+      </aside>
+
+      <div className="mx-auto w-full max-w-[1780px] px-4 py-6">
+        <PageTitle
+          title="Image Picker"
+          subtitle="中间大舞台负责审图，左侧侧边栏负责 session 切换与管理。"
+          right={
+            <div className="flex items-center gap-2">
+              <span className="rounded-full border border-zinc-200 bg-white px-3 py-1 text-xs font-semibold text-zinc-600 dark:border-white/10 dark:bg-zinc-950/50 dark:text-zinc-300">
+                当前会话 · {currentSession.name}
+              </span>
+              <Button variant="ghost" onClick={() => navigate("/history")}>返回 History</Button>
+            </div>
+          }
+        />
+
+        <div className="space-y-4">
+          <Card className="overflow-hidden border-none bg-[radial-gradient(circle_at_top_left,rgba(251,191,36,0.18),transparent_28%),radial-gradient(circle_at_top_right,rgba(56,189,248,0.16),transparent_26%),linear-gradient(180deg,rgba(255,255,255,0.98),rgba(244,244,245,0.96))] shadow-[0_14px_50px_rgba(15,23,42,0.08)] dark:bg-[radial-gradient(circle_at_top_left,rgba(251,191,36,0.14),transparent_24%),radial-gradient(circle_at_top_right,rgba(56,189,248,0.1),transparent_24%),linear-gradient(180deg,rgba(24,24,27,0.96),rgba(9,9,11,0.96))]">
+            <div className="flex items-center gap-2 overflow-x-auto whitespace-nowrap pb-1" data-testid="picker-toolbar">
+              <Button variant="secondary" onClick={() => setImportOpen(true)}>从历史导入</Button>
+              <Button testId="picker-mode-one" variant={compareMode === "ONE" ? "primary" : "ghost"} onClick={() => setSessionMode("ONE")}>1-up</Button>
+              <Button variant={compareMode === "TWO" ? "primary" : "ghost"} onClick={() => setSessionMode("TWO")}>2-up</Button>
+              <Button variant={compareMode === "FOUR" ? "primary" : "ghost"} onClick={() => setSessionMode("FOUR")}>4-up</Button>
+              <Button
+                variant={currentSession.layout_preset === "SYNC_ZOOM" ? "secondary" : "ghost"}
+                onClick={() => patchSessionLayout(currentSession.layout_preset === "SYNC_ZOOM" ? "FREE_ZOOM" : "SYNC_ZOOM")}
+              >
+                {currentSession.layout_preset === "SYNC_ZOOM" ? "同步缩放" : "自由缩放"}
+              </Button>
+              <Button variant={currentSession.ui.showInfo ? "secondary" : "ghost"} onClick={() => patchSessionUi({ showInfo: !currentSession.ui.showInfo })}>
+                Info
+              </Button>
+              <Button variant={currentSession.ui.showGrid ? "secondary" : "ghost"} onClick={() => patchSessionUi({ showGrid: !currentSession.ui.showGrid })}>
+                Grid
+              </Button>
+              <Button
+                variant={!darkStage ? "secondary" : "ghost"}
+                onClick={() => patchSessionUi({ background: darkStage ? "light" : "dark" })}
+              >
+                {darkStage ? "Light BG" : "Dark BG"}
+              </Button>
+              <Button variant="secondary" onClick={() => setImmersiveMode(true)}>全屏审阅</Button>
+              <Button testId="picker-next-batch" variant="secondary" onClick={shiftToNextBatch}>切换下一组</Button>
+              <Button variant="primary" onClick={downloadBest}>下载优选</Button>
+              <Button variant="secondary" onClick={downloadPicked}>下载选中</Button>
+            </div>
+            <div className="mt-3 flex flex-wrap items-center gap-2 text-xs text-zinc-500 dark:text-zinc-400">
+              <span className="rounded-full border border-zinc-200 bg-white px-3 py-1 dark:border-white/10 dark:bg-zinc-950/40" data-testid="picker-stat-mode">当前模式 {activeMode}</span>
+              <span className="rounded-full border border-zinc-200 bg-white px-3 py-1 dark:border-white/10 dark:bg-zinc-950/40" data-testid="picker-stat-pending">未审 Filmstrip {pendingReviewCount}</span>
+              <span className="rounded-full border border-zinc-200 bg-white px-3 py-1 dark:border-white/10 dark:bg-zinc-950/40" data-testid="picker-stat-filmstrip">Filmstrip {filmstripItems.length}</span>
+              <span className="rounded-full border border-zinc-200 bg-white px-3 py-1 dark:border-white/10 dark:bg-zinc-950/40" data-testid="picker-stat-preferred">优选池 {preferredItems.length}</span>
+              <span className="rounded-full border border-zinc-200 bg-white px-3 py-1 dark:border-white/10 dark:bg-zinc-950/40" data-testid="picker-stat-selected">已选 {selectedCount}</span>
+            </div>
+          </Card>
+
+          <Card className={cn("overflow-hidden border-none p-3 shadow-[0_22px_70px_rgba(15,23,42,0.16)]", darkStage ? "bg-zinc-950" : "bg-[linear-gradient(180deg,#fffdf7,#f8fafc)]")} testId="picker-stage">
+            <div className="mb-3 flex items-center justify-between gap-3">
+              <div>
+                <div className="text-sm font-bold text-zinc-900 dark:text-zinc-50">{currentSession.name}</div>
+                <div className="text-xs text-zinc-500 dark:text-zinc-400">审图主舞台默认突出展示，硬操作后立即补位。</div>
+              </div>
+              <div className="text-[11px] text-zinc-500 dark:text-zinc-400">{compareMode} · {darkStage ? "Dark Stage" : "Light Stage"}</div>
+            </div>
+            <div className={cn("grid gap-3", compareMode === "FOUR" ? "grid-cols-1 xl:grid-cols-2" : "grid-cols-1")}>
+              {stageSlots.map((slotKey, idx) => {
+                const item = slotKey ? itemMap.get(slotKey) || null : null;
+                const label = String.fromCharCode(65 + idx);
+                return (
+                  <div key={`${label}_${slotKey || "empty"}`} data-testid={`picker-slot-${label}`}>
+                    <PickerCompareSlot
+                      slotLabel={label}
+                      item={item}
+                      image={slotKey ? imageState[slotKey] : undefined}
+                      isBest={Boolean(slotKey && isPreferredKey(slotKey))}
+                      focused={Boolean(slotKey && slotKey === focusKey)}
+                      showInfo={currentSession.ui.showInfo}
+                      showGrid={currentSession.ui.showGrid}
+                      darkStage={darkStage}
+                      jobRec={item ? jobsById.get(item.job_id) : undefined}
+                      displayName={item ? pickerDisplayName(item, jobsById.get(item.job_id)) : "-"}
+                      onFocus={() => slotKey && setFocus(currentSession.session_id, slotKey)}
+                      onEnsureImage={() => {}}
+                      onBest={() => slotKey && toggleBest(slotKey)}
+                      onRate={(n) => slotKey && rateItem(slotKey, n)}
+                      onRemove={() => slotKey && deleteFromPicker(slotKey)}
+                      onFixToken={() => item && fixToken(item)}
+                    />
+                  </div>
                 );
               })}
             </div>
+          </Card>
 
-            <div>
-              <div className="mb-2 flex items-center justify-between">
-                <div className="text-sm font-bold text-zinc-900 dark:text-zinc-50">优选池</div>
-                <div className="text-xs text-zinc-500 dark:text-zinc-400">{preferredItems.length} 张</div>
-              </div>
-              {!preferredItems.length ? (
-                <div className="rounded-2xl border border-dashed border-zinc-200 p-3 text-xs text-zinc-500 dark:border-white/10 dark:text-zinc-400">
-                  还没有优选图片，可在 Filmstrip 中点击“优选”转入。
+          <div className="grid gap-4 xl:grid-cols-[minmax(0,1.6fr)_minmax(330px,0.95fr)]">
+            <Card className="overflow-hidden">
+              <div className="mb-3 flex items-center justify-between">
+                <div>
+                  <div className="text-sm font-bold text-zinc-900 dark:text-zinc-50">Filmstrip</div>
+                  <div className="text-xs text-zinc-500 dark:text-zinc-400">横向片池适合快速浏览、评分和硬决策。</div>
                 </div>
+                <div className="text-xs text-zinc-500 dark:text-zinc-400">已选 {selectedCount} / 总计 {filmstripItems.length + preferredItems.length}</div>
+              </div>
+              {!filmstripItems.length && !preferredItems.length ? (
+                <EmptyHint text="暂无图片，点击“从历史导入”开始挑选" />
               ) : (
                 <div
-                  className="flex gap-2 overflow-x-auto pb-2"
+                  className="flex gap-3 overflow-x-auto pb-2"
                   onWheel={(e) => {
                     if (Math.abs(e.deltaY) > Math.abs(e.deltaX)) {
                       (e.currentTarget as HTMLDivElement).scrollLeft += e.deltaY;
                     }
                   }}
                 >
+                  {filmstripItems.map((item) => {
+                    const key = pickerItemKey(item);
+                    const active = key === focusKey;
+                    const inSlot = normalizedSlots.indexOf(key);
+                    const state = imageState[key];
+                    const hasImage = pickerItemHasImage(item);
+                    const status = pickerItemJobStatus(item, jobsById.get(item.job_id));
+                    return (
+                      <motion.div
+                        layout
+                        key={`film_${key}`}
+                        className={cn(
+                          "w-64 flex-none overflow-hidden rounded-[24px] border",
+                          active ? "border-zinc-900 shadow-md dark:border-white" : "border-zinc-200 dark:border-white/10"
+                        )}
+                      >
+                        <button
+                          type="button"
+                          className="relative block h-40 w-full overflow-hidden bg-zinc-100 dark:bg-zinc-900"
+                          onClick={() => {
+                            if (compareMode === "ONE") {
+                              patchSession(currentSession.session_id, (session) => ({
+                                ...session,
+                                focus_key: key,
+                                slots: [key, null, null, null],
+                              }));
+                            } else {
+                              setFocus(currentSession.session_id, key);
+                            }
+                          }}
+                        >
+                          {!hasImage ? (
+                            <PickerPendingVisual status={status} />
+                          ) : state?.url ? (
+                            <img
+                              src={state.url}
+                              alt={item.image_id}
+                              className="h-full w-full object-cover opacity-0 blur-sm transition duration-300"
+                              onLoad={(e) => {
+                                const el = e.currentTarget;
+                                el.classList.remove("opacity-0", "blur-sm");
+                                el.classList.add("opacity-100");
+                              }}
+                            />
+                          ) : (
+                            <Skeleton className="h-full w-full" />
+                          )}
+                        </button>
+                        <div className="space-y-2 p-3">
+                          <div className="flex items-center justify-between text-[11px] text-zinc-500 dark:text-zinc-400">
+                            <label className="inline-flex items-center gap-1">
+                              <input
+                                type="checkbox"
+                                checked={Boolean(item.picked)}
+                                onChange={(e) => updateItem(currentSession.session_id, key, { picked: e.target.checked })}
+                              />
+                              选中
+                            </label>
+                            <span>槽位 {inSlot >= 0 ? String.fromCharCode(65 + inSlot) : "-"}</span>
+                          </div>
+                          {hasImage ? (
+                            <RatingStars value={item.rating || 0} onChange={(n) => rateItem(key, n)} />
+                          ) : (
+                            <div className="rounded-xl bg-sky-500/10 px-2 py-1 text-[11px] font-semibold text-sky-700 dark:text-sky-200">{status}</div>
+                          )}
+                          <div className="flex flex-wrap gap-1">
+                            <Button variant="ghost" className="!px-1.5 !py-0.5 text-[10px]" onClick={() => toggleBest(key)} disabled={!hasImage}>
+                              {isPreferredKey(key) ? "移回片池" : "移入优选"}
+                            </Button>
+                            <Button variant="ghost" className="!px-1.5 !py-0.5 text-[10px]" onClick={() => downloadOne(item)} disabled={!hasImage}>下载</Button>
+                            <Button variant="danger" className="!px-1.5 !py-0.5 text-[10px]" onClick={() => deleteFromPicker(key)}>删除</Button>
+                          </div>
+                          <div className="truncate text-[10px] text-zinc-500 dark:text-zinc-400">{pickerDisplayName(item, jobsById.get(item.job_id))}</div>
+                        </div>
+                      </motion.div>
+                    );
+                  })}
+                </div>
+              )}
+            </Card>
+
+            <Card className="overflow-hidden">
+              <div className="mb-3 flex items-center justify-between">
+                <div>
+                  <div className="text-sm font-bold text-zinc-900 dark:text-zinc-50">优选池</div>
+                  <div className="text-xs text-zinc-500 dark:text-zinc-400">保留有潜力的图，继续横向比较与下载。</div>
+                </div>
+                <div className="text-xs text-zinc-500 dark:text-zinc-400">{preferredItems.length} 张</div>
+              </div>
+              {!preferredItems.length ? (
+                <div className="rounded-2xl border border-dashed border-zinc-200 p-4 text-xs text-zinc-500 dark:border-white/10 dark:text-zinc-400">
+                  还没有优选图片，可在 Filmstrip 中点击“移入优选”。
+                </div>
+              ) : (
+                <div className="space-y-3">
                   {preferredItems.map((item) => {
                     const key = pickerItemKey(item);
                     const active = key === focusKey;
@@ -11104,13 +11368,13 @@ function PickerPage() {
                         layout
                         key={`pref_${key}`}
                         className={cn(
-                          "w-56 flex-none overflow-hidden rounded-2xl border",
+                          "overflow-hidden rounded-[24px] border",
                           active ? "border-amber-500 shadow-md dark:border-amber-300" : "border-zinc-200 dark:border-white/10"
                         )}
                       >
                         <button
                           type="button"
-                          className="relative block h-36 w-full overflow-hidden bg-zinc-100 dark:bg-zinc-900"
+                          className="relative block h-44 w-full overflow-hidden bg-zinc-100 dark:bg-zinc-900"
                           onClick={() => {
                             if (compareMode === "ONE") {
                               patchSession(currentSession.session_id, (session) => ({
@@ -11137,11 +11401,11 @@ function PickerPage() {
                           ) : (
                             <Skeleton className="h-full w-full" />
                           )}
-                          <div className="absolute left-1 top-1 rounded-full bg-amber-500/90 px-2 py-0.5 text-[10px] font-bold text-white">优</div>
+                          <div className="absolute left-2 top-2 rounded-full bg-amber-500 px-2 py-0.5 text-[10px] font-bold text-white">优选</div>
                         </button>
-                        <div className="space-y-1 p-2">
-                          <div className="flex items-center justify-between">
-                            <label className="inline-flex items-center gap-1 text-[11px] text-zinc-600 dark:text-zinc-300">
+                        <div className="space-y-2 p-3">
+                          <div className="flex items-center justify-between text-[11px] text-zinc-500 dark:text-zinc-400">
+                            <label className="inline-flex items-center gap-1">
                               <input
                                 type="checkbox"
                                 checked={Boolean(item.picked)}
@@ -11149,34 +11413,25 @@ function PickerPage() {
                               />
                               选中
                             </label>
-                            <div className="text-[11px] text-zinc-500 dark:text-zinc-400">{inSlot >= 0 ? String.fromCharCode(65 + inSlot) : "-"}</div>
+                            <span>槽位 {inSlot >= 0 ? String.fromCharCode(65 + inSlot) : "-"}</span>
                           </div>
-                          <RatingStars
-                            value={item.rating || 0}
-                            onChange={(n) => rateItem(key, n)}
-                          />
+                          <RatingStars value={item.rating || 0} onChange={(n) => rateItem(key, n)} />
                           <div className="flex flex-wrap gap-1">
-                            <Button variant="ghost" className="!px-1.5 !py-0.5 text-[10px]" onClick={() => toggleBest(key)}>
-                              移回片池
-                            </Button>
+                            <Button variant="ghost" className="!px-1.5 !py-0.5 text-[10px]" onClick={() => toggleBest(key)}>移回片池</Button>
                             <Button variant="ghost" className="!px-1.5 !py-0.5 text-[10px]" onClick={() => downloadOne(item)}>下载</Button>
-                            <Button variant="danger" className="!px-1.5 !py-0.5 text-[10px]" onClick={() => deleteFromPicker(key)}>
-                              删除
-                            </Button>
+                            <Button variant="danger" className="!px-1.5 !py-0.5 text-[10px]" onClick={() => deleteFromPicker(key)}>删除</Button>
                           </div>
-                          <div className="truncate text-[10px] text-zinc-500 dark:text-zinc-400">
-                            {pickerDisplayName(item, jobsById.get(item.job_id))}
-                          </div>
+                          <div className="truncate text-[10px] text-zinc-500 dark:text-zinc-400">{pickerDisplayName(item, jobsById.get(item.job_id))}</div>
                         </div>
                       </motion.div>
                     );
                   })}
                 </div>
               )}
-            </div>
+            </Card>
           </div>
-        )}
-      </Card>
+        </div>
+      </div>
 
       <AnimatePresence>
         {immersiveMode ? (
@@ -11226,12 +11481,12 @@ function PickerPage() {
               animate={{ x: 0 }}
               exit={{ x: 420 }}
               transition={{ duration: settings.ui.reduceMotion ? 0 : 0.18 }}
-              className="h-full w-[420px] max-w-[95vw] overflow-y-auto border-l border-zinc-200 bg-white p-4 shadow-2xl dark:border-white/10 dark:bg-zinc-950"
+              className="h-full w-[480px] max-w-[96vw] overflow-y-auto border-l border-zinc-200 bg-white p-4 shadow-2xl dark:border-white/10 dark:bg-zinc-950"
             >
               <div className="flex items-center justify-between">
                 <div>
                   <div className="text-lg font-bold text-zinc-900 dark:text-zinc-50">导入图片</div>
-                  <div className="text-xs text-zinc-600 dark:text-zinc-300">从历史任务勾选图片加入当前会话</div>
+                  <div className="text-xs text-zinc-600 dark:text-zinc-300">同批次任务默认折叠，可整批导入，也支持展开后逐图勾选。</div>
                 </div>
                 <Button variant="ghost" onClick={() => setImportOpen(false)}>关闭</Button>
               </div>
@@ -11256,98 +11511,150 @@ function PickerPage() {
                     导入该 Job
                   </Button>
                 </div>
+                <div className="flex items-center justify-between text-[11px] text-zinc-500 dark:text-zinc-400">
+                  <span>共 {importGroups.length} 组</span>
+                  <span data-testid="picker-import-page">第 {safeImportPage} / {importTotalPages} 页</span>
+                </div>
               </div>
 
               <div className="mt-4 space-y-2">
-                {filteredJobs.map((job) => {
-                  const st = importState[job.job_id];
-                  const ids = st?.imageIds || [];
+                {pagedImportGroups.map((group) => {
+                  const collapsed = importGroupCollapsed[group.key] ?? group.collapsible;
                   return (
-                    <div key={job.job_id} className="rounded-2xl border border-zinc-200 p-2 dark:border-white/10">
+                    <div key={group.key} className="rounded-2xl border border-zinc-200 p-3 dark:border-white/10" data-testid="picker-import-group">
                       <div className="flex items-start justify-between gap-2">
                         <div className="min-w-0">
-                          <div className="truncate text-xs font-bold text-zinc-900 dark:text-zinc-50">
-                            {job.prompt_preview || shortId(job.job_id)}
-                          </div>
-                          <div className="mt-0.5 text-[11px] text-zinc-500 dark:text-zinc-400">
-                            {shortId(job.job_id)} · {job.status_cache || "UNKNOWN"}
-                          </div>
+                          <div className="truncate text-xs font-bold text-zinc-900 dark:text-zinc-50">{group.label}</div>
+                          <div className="mt-0.5 text-[11px] text-zinc-500 dark:text-zinc-400">{group.hint}</div>
                         </div>
-                        <Button
-                          variant="ghost"
-                          className="!px-2 !py-1 text-xs"
-                          onClick={() => loadJobImages(job.job_id)}
-                        >
-                          {st?.loading ? "加载中…" : "读取图片"}
-                        </Button>
+                        <div className="flex shrink-0 items-center gap-1">
+                          {group.jobs.length > 1 ? (
+                            <Button
+                              variant="ghost"
+                              className="!px-2 !py-1 text-xs"
+                              onClick={() => setImportGroupCollapsed((current) => ({ ...current, [group.key]: !collapsed }))}
+                            >
+                              {collapsed ? "展开" : "折叠"}
+                            </Button>
+                          ) : null}
+                          <Button variant="secondary" className="!px-2 !py-1 text-xs" onClick={() => importAllFromGroup(group)}>
+                            整组导入
+                          </Button>
+                        </div>
                       </div>
 
-                      {st?.error ? <div className="mt-2 text-[11px] text-rose-600 dark:text-rose-300">{st.error}</div> : null}
-                      {ids.length ? (
-                        <div className="mt-2 space-y-1">
-                          <div className="flex items-center justify-between">
-                            <div className="text-[11px] text-zinc-500 dark:text-zinc-400">{ids.length} 张</div>
-                            <div className="flex gap-1">
-                              <Button
-                                variant="ghost"
-                                className="!px-2 !py-0.5 text-[10px]"
-                                onClick={() =>
-                                  setImportSelection((prev) => {
-                                    const next = { ...prev };
-                                    ids.forEach((id) => {
-                                      next[pickerItemKeyFrom(job.job_id, id)] = true;
-                                    });
-                                    return next;
-                                  })
-                                }
-                              >
-                                全选
-                              </Button>
-                              <Button
-                                variant="ghost"
-                                className="!px-2 !py-0.5 text-[10px]"
-                                onClick={() =>
-                                  setImportSelection((prev) => {
-                                    const next = { ...prev };
-                                    ids.forEach((id) => {
-                                      next[pickerItemKeyFrom(job.job_id, id)] = false;
-                                    });
-                                    return next;
-                                  })
-                                }
-                              >
-                                清空
-                              </Button>
-                            </div>
-                          </div>
-                          <div className="max-h-32 space-y-1 overflow-auto rounded-xl bg-zinc-50 p-2 dark:bg-zinc-900/50">
-                            {ids.map((id) => {
-                              const key = pickerItemKeyFrom(job.job_id, id);
-                              const display = pickerDisplayName(
-                                {
-                                  job_id: job.job_id,
-                                  image_id: id,
-                                  added_at: job.created_at || isoNow(),
-                                },
-                                job
-                              );
-                              return (
-                                <label key={key} className="flex items-center gap-2 text-[11px] text-zinc-700 dark:text-zinc-200">
-                                  <input
-                                    type="checkbox"
-                                    checked={Boolean(importSelection[key])}
-                                    onChange={(e) => setImportSelection((m) => ({ ...m, [key]: e.target.checked }))}
-                                  />
-                                  <span className="truncate">{display}</span>
-                                </label>
-                              );
-                            })}
-                          </div>
+                      {!collapsed ? (
+                        <div className="mt-3 space-y-2">
+                          {group.jobs.map((job) => {
+                            const st = importState[job.job_id];
+                            const ids = st?.imageIds || [];
+                            return (
+                              <div key={job.job_id} className="rounded-2xl bg-zinc-50/80 p-2.5 dark:bg-zinc-900/40">
+                                <div className="flex items-start justify-between gap-2">
+                                  <div className="min-w-0">
+                                    <div className="truncate text-xs font-bold text-zinc-900 dark:text-zinc-50">
+                                      {job.prompt_preview || shortId(job.job_id)}
+                                    </div>
+                                    <div className="mt-0.5 text-[11px] text-zinc-500 dark:text-zinc-400">
+                                      {shortId(job.job_id)} · {job.status_cache || "UNKNOWN"}
+                                    </div>
+                                  </div>
+                                  <Button
+                                    variant="ghost"
+                                    className="!px-2 !py-1 text-xs"
+                                    onClick={() => loadJobImages(job.job_id)}
+                                  >
+                                    {st?.loading ? "加载中…" : "读取图片"}
+                                  </Button>
+                                </div>
+
+                                {st?.error ? <div className="mt-2 text-[11px] text-rose-600 dark:text-rose-300">{st.error}</div> : null}
+                                {ids.length ? (
+                                  <div className="mt-2 space-y-1">
+                                    <div className="flex items-center justify-between">
+                                      <div className="text-[11px] text-zinc-500 dark:text-zinc-400">{ids.length} 张</div>
+                                      <div className="flex gap-1">
+                                        <Button
+                                          variant="ghost"
+                                          className="!px-2 !py-0.5 text-[10px]"
+                                          onClick={() =>
+                                            setImportSelection((prev) => {
+                                              const next = { ...prev };
+                                              ids.forEach((id) => {
+                                                next[pickerItemKeyFrom(job.job_id, id)] = true;
+                                              });
+                                              return next;
+                                            })
+                                          }
+                                        >
+                                          全选
+                                        </Button>
+                                        <Button
+                                          variant="ghost"
+                                          className="!px-2 !py-0.5 text-[10px]"
+                                          onClick={() =>
+                                            setImportSelection((prev) => {
+                                              const next = { ...prev };
+                                              ids.forEach((id) => {
+                                                next[pickerItemKeyFrom(job.job_id, id)] = false;
+                                              });
+                                              return next;
+                                            })
+                                          }
+                                        >
+                                          清空
+                                        </Button>
+                                      </div>
+                                    </div>
+                                    <div className="max-h-32 space-y-1 overflow-auto rounded-xl bg-white p-2 dark:bg-zinc-950/40">
+                                      {ids.map((id) => {
+                                        const key = pickerItemKeyFrom(job.job_id, id);
+                                        const display = pickerDisplayName(
+                                          {
+                                            job_id: job.job_id,
+                                            image_id: id,
+                                            added_at: job.created_at || isoNow(),
+                                          },
+                                          job
+                                        );
+                                        return (
+                                          <label key={key} className="flex items-center gap-2 text-[11px] text-zinc-700 dark:text-zinc-200">
+                                            <input
+                                              type="checkbox"
+                                              checked={Boolean(importSelection[key])}
+                                              onChange={(e) => setImportSelection((m) => ({ ...m, [key]: e.target.checked }))}
+                                            />
+                                            <span className="truncate">{display}</span>
+                                          </label>
+                                        );
+                                      })}
+                                    </div>
+                                  </div>
+                                ) : null}
+                              </div>
+                            );
+                          })}
                         </div>
-                      ) : null}
+                      ) : (
+                        <div className="mt-2 rounded-2xl border border-dashed border-zinc-200 px-3 py-2 text-[11px] text-zinc-500 dark:border-white/10 dark:text-zinc-400">
+                          已自动折叠该批次。可直接整组导入，或点击“展开”逐个 job 查看图片。
+                        </div>
+                      )}
                     </div>
                   );
                 })}
+              </div>
+
+              <div className="mt-4 flex items-center justify-between">
+                <Button variant="ghost" className="!px-3 !py-1.5 text-xs" onClick={() => setImportPage((page) => clamp(page - 1, 1, importTotalPages))} disabled={safeImportPage <= 1}>
+                  上一页
+                </Button>
+                <div className="text-[11px] text-zinc-500 dark:text-zinc-400" data-testid="picker-import-page-summary">
+                  第 {safeImportPage} / {importTotalPages} 页 · 当前 {pagedImportGroups.length} 组
+                </div>
+                <Button variant="ghost" className="!px-3 !py-1.5 text-xs" onClick={() => setImportPage((page) => clamp(page + 1, 1, importTotalPages))} disabled={safeImportPage >= importTotalPages}>
+                  下一页
+                </Button>
               </div>
 
               <Divider />

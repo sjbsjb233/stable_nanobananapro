@@ -218,6 +218,140 @@ function buildPressureFixtures(count = 84) {
   };
 }
 
+function buildSidebarFixtures() {
+  const jobs = [
+    pickerJob("sidebar_a", { first_image_id: "image_0", image_count_cache: 1 }),
+    pickerJob("sidebar_archived", { first_image_id: "image_0", image_count_cache: 1 }),
+  ];
+
+  return {
+    jobs,
+    metas: Object.fromEntries(
+      jobs.map((job) => [
+        job.job_id,
+        {
+          job_id: job.job_id,
+          model: job.model_cache,
+          status: job.status_cache,
+          created_at: job.created_at,
+          updated_at: job.last_seen_at,
+          timing: {
+            queued_at: job.created_at,
+            started_at: job.created_at,
+            finished_at: job.last_seen_at,
+            queue_wait_ms: 200,
+            run_duration_ms: 1200,
+          },
+          result: {
+            images: [{ image_id: "image_0", mime: "image/png", width: 1, height: 1 }],
+          },
+        },
+      ])
+    ),
+    sessions: [
+      {
+        session_id: "pk_sidebar_primary",
+        name: "Primary Review",
+        created_at: "2026-03-10T00:00:00Z",
+        updated_at: "2026-03-10T00:00:00Z",
+        pinned: true,
+        archived: false,
+        items: [pickerImageItem("sidebar_a")],
+        compare_mode: "FOUR",
+        layout_preset: "SYNC_ZOOM",
+        ui: { background: "light", showGrid: false, showInfo: false },
+        slots: [null, null, null, null],
+        focus_key: null,
+      },
+      {
+        session_id: "pk_sidebar_archived",
+        name: "Archived Review",
+        created_at: "2026-03-09T00:00:00Z",
+        updated_at: "2026-03-09T00:00:00Z",
+        pinned: false,
+        archived: true,
+        items: [pickerImageItem("sidebar_archived")],
+        compare_mode: "FOUR",
+        layout_preset: "SYNC_ZOOM",
+        ui: { background: "light", showGrid: false, showInfo: false },
+        slots: [null, null, null, null],
+        focus_key: null,
+      },
+    ],
+    previewBatchCalls: 0,
+    originalImageCalls: 0,
+    previewImageCalls: 0,
+    activeCalls: 0,
+  };
+}
+
+function buildImportDrawerFixtures() {
+  const jobs = [];
+  const metas = {};
+  const session = {
+    session_id: "pk_picker_import",
+    name: "Import Target",
+    created_at: "2026-03-10T00:00:00Z",
+    updated_at: "2026-03-10T00:00:00Z",
+    pinned: false,
+    archived: false,
+    items: [],
+    compare_mode: "FOUR",
+    layout_preset: "SYNC_ZOOM",
+    ui: { background: "light", showGrid: false, showInfo: false },
+    slots: [null, null, null, null],
+    focus_key: null,
+  };
+
+  const addJob = (job) => {
+    jobs.push(job);
+    metas[job.job_id] = {
+      job_id: job.job_id,
+      model: job.model_cache,
+      status: job.status_cache,
+      created_at: job.created_at,
+      updated_at: job.last_seen_at,
+      timing: { queued_at: job.created_at, started_at: job.created_at, finished_at: job.last_seen_at, queue_wait_ms: 200, run_duration_ms: 1200 },
+      result: { images: [{ image_id: "image_0", mime: "image/png", width: 1, height: 1 }] },
+    };
+  };
+
+  for (let idx = 0; idx < 11; idx += 1) {
+    addJob(
+      pickerJob(`import_single_${idx}`, {
+        first_image_id: "image_0",
+        image_count_cache: 1,
+        created_at: `2026-03-10T00:${String(idx).padStart(2, "0")}:00Z`,
+      })
+    );
+  }
+
+  ["batch_a", "batch_b", "batch_c"].forEach((name, idx) => {
+    addJob(
+      pickerJob(name, {
+        first_image_id: "image_0",
+        image_count_cache: 1,
+        created_at: `2026-03-10T00:${String(30 + idx).padStart(2, "0")}:00Z`,
+        prompt_preview: `Batch member ${idx + 1}`,
+      })
+    );
+    jobs[jobs.length - 1].batch_id = "import_batch_alpha";
+    jobs[jobs.length - 1].batch_name = "Import Batch Alpha";
+    jobs[jobs.length - 1].batch_size = 3;
+    jobs[jobs.length - 1].batch_index = idx + 1;
+  });
+
+  return {
+    jobs,
+    metas,
+    sessions: [session],
+    previewBatchCalls: 0,
+    originalImageCalls: 0,
+    previewImageCalls: 0,
+    activeCalls: 0,
+  };
+}
+
 async function seedPickerState(page, fixtures, sessionId) {
   await page.addInitScript(
     ([adminUserId, jobs, sessions, seedSessionId]) => {
@@ -441,7 +575,8 @@ test.describe.serial("Picker page", () => {
     const afterPromote = await page.getByTestId("picker-slot-A").textContent();
     expect(afterPromote).not.toContain("film_c");
     expect(afterPromote).not.toContain("pref_a");
-    await expect(page.getByText("Filmstrip 3 / 优选池 2")).toBeVisible();
+    await expect(page.getByTestId("picker-stat-filmstrip")).toHaveText("Filmstrip 3");
+    await expect(page.getByTestId("picker-stat-preferred")).toHaveText("优选池 2");
   });
 
   test("hydrates a running placeholder in place and uses preview-first loading until explicit download", async ({ page }) => {
@@ -485,5 +620,58 @@ test.describe.serial("Picker page", () => {
     await expect(page.getByTestId("picker-slot-A")).not.toContainText("空槽位");
     await expect(page.getByTestId("picker-slot-A").locator("img")).toBeVisible();
     expect(fixtures.originalImageCalls).toBe(0);
+  });
+
+  test("opens the sidebar from the left edge, creates default light 4-up sessions, and archives sessions from the menu", async ({ page }) => {
+    const fixtures = buildSidebarFixtures();
+    await seedPickerState(page, fixtures, "pk_sidebar_primary");
+    await installPickerMocks(page, fixtures);
+    await loginToPicker(page, "pk_sidebar_primary");
+
+    await page.mouse.move(2, 240);
+    await expect(page.getByTestId("picker-session-item-pk_sidebar_primary")).toBeVisible();
+    await expect(page.getByTestId("picker-session-item-pk_sidebar_archived")).toHaveCount(0);
+
+    await page.getByPlaceholder("新建会话名称").fill("Focus Session");
+    await page.getByTestId("picker-sidebar-create-session").click();
+
+    const created = await page.evaluate(() => {
+      const sessions = JSON.parse(localStorage.getItem("nbp_picker_sessions_v1") || "[]");
+      return sessions.find((session) => session.name === "Focus Session");
+    });
+    expect(created.compare_mode).toBe("FOUR");
+    expect(created.ui.background).toBe("light");
+
+    await page.getByTestId(`picker-session-menu-${created.session_id}`).click();
+    await page.getByRole("button", { name: "归档会话" }).click();
+    await page.getByTestId("picker-sidebar-archived-toggle").click();
+    await expect(page.getByTestId(`picker-session-item-${created.session_id}`)).toBeVisible();
+  });
+
+  test("groups import drawer batches, keeps batch groups collapsed by default, paginates groups, and imports an entire batch", async ({ page }) => {
+    const fixtures = buildImportDrawerFixtures();
+    await seedPickerState(page, fixtures, "pk_picker_import");
+    await installPickerMocks(page, fixtures);
+    await loginToPicker(page, "pk_picker_import");
+
+    await page.getByRole("button", { name: "从历史导入" }).click();
+    await expect(page.getByTestId("picker-import-page")).toHaveText("第 1 / 2 页");
+    await expect(page.getByTestId("picker-import-group")).toHaveCount(10);
+
+    const batchGroup = page.getByTestId("picker-import-group").filter({ hasText: "批次 · Import Batch Alpha" }).first();
+    await expect(batchGroup).toContainText("已自动折叠该批次");
+    await batchGroup.getByRole("button", { name: "整组导入" }).click();
+
+    await expect
+      .poll(() =>
+        page.evaluate(() => {
+          const sessions = JSON.parse(localStorage.getItem("nbp_picker_sessions_v1") || "[]");
+          return sessions.find((session) => session.session_id === "pk_picker_import")?.items?.length || 0;
+        })
+      )
+      .toBe(3);
+
+    await page.getByRole("button", { name: "下一页" }).click();
+    await expect(page.getByTestId("picker-import-page")).toHaveText("第 2 / 2 页");
   });
 });
