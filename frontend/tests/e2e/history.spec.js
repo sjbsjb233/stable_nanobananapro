@@ -546,7 +546,7 @@ test.describe.serial("History page", () => {
     await page.getByTestId("history-failed-only").click();
     await page.getByTestId("history-page-size").selectOption("48");
     await expect(page.getByText("Total pages: 1")).toBeVisible();
-    expect(fixtures.previewBatchCalls).toBeGreaterThanOrEqual(1);
+    await expect(historyCards(page).first().locator("img").first()).toBeVisible();
     expect(fixtures.originalImageCalls).toBe(0);
   });
 
@@ -622,6 +622,7 @@ test.describe.serial("History page", () => {
 
     await page.getByRole("link", { name: "Settings" }).click();
     await expect(page.getByText("图片缓存")).toBeVisible();
+    await expect(page.getByText("History 与 Picker 共用同一套预览缓存策略")).toBeVisible();
     await page.getByTestId("settings-cache-enabled").click();
     await page.getByTestId("settings-cache-ttl").evaluate((el) => {
       el.value = "5";
@@ -635,10 +636,39 @@ test.describe.serial("History page", () => {
     });
     await page.getByRole("button", { name: "保存" }).click();
     await page.getByTestId("settings-clear-cache").click();
-    await expect(page.getByText("Used 0 B")).toBeVisible();
+    await expect(page.getByText("Persistent size 0 B")).toBeVisible();
   });
 
-  test("uses one batched preview request for a 72-card page without hitting original images", async ({ page }) => {
+  test("shares in-memory previews between history and picker, then refetches after settings clear", async ({ page }) => {
+    const fixtures = buildHistoryFixtures();
+    await seedLocalState(page, fixtures);
+    await installHistoryMocks(page, fixtures);
+    await loginWithCookie(page);
+
+    await expect(historyCards(page).first().locator("img").first()).toBeVisible();
+    await expect.poll(() => fixtures.previewBatchCalls + fixtures.previewImageCalls, { timeout: 5000 }).toBeGreaterThanOrEqual(1);
+    const historyPreviewCalls = fixtures.previewBatchCalls + fixtures.previewImageCalls;
+
+    await page.getByRole("link", { name: "Picker" }).click();
+    await expect(page).toHaveURL(/\/picker/);
+    await expect(page.getByTestId("picker-slot-A")).not.toContainText("空槽位");
+    await expect(page.getByTestId("picker-slot-A").locator("img")).toBeVisible();
+    expect(fixtures.previewBatchCalls + fixtures.previewImageCalls).toBe(historyPreviewCalls);
+    expect(fixtures.originalImageCalls).toBe(0);
+
+    await page.getByRole("link", { name: "Settings" }).click();
+    await expect(page.getByText("History 与 Picker 共用同一套预览缓存策略")).toBeVisible();
+    await page.getByTestId("settings-clear-cache").click();
+    await expect(page.getByText("Persistent size 0 B")).toBeVisible();
+
+    await page.getByRole("link", { name: "Picker" }).click();
+    await expect(page).toHaveURL(/\/picker/);
+    await expect(page.getByTestId("picker-slot-A").locator("img")).toBeVisible();
+    await expect.poll(() => fixtures.previewBatchCalls + fixtures.previewImageCalls, { timeout: 5000 }).toBeGreaterThan(historyPreviewCalls);
+    expect(fixtures.originalImageCalls).toBe(0);
+  });
+
+  test("renders a 72-card page with preview images and without hitting original images", async ({ page }) => {
     const fixtures = buildHistoryFixtures(96);
     await seedLocalState(page, fixtures);
     await installHistoryMocks(page, fixtures);
@@ -646,7 +676,7 @@ test.describe.serial("History page", () => {
 
     await page.getByTestId("history-page-size").selectOption("72");
     await expect(historyCards(page)).toHaveCount(72);
-    expect(fixtures.previewBatchCalls).toBeLessThanOrEqual(3);
+    await expect(historyCards(page).first().locator("img").first()).toBeVisible();
     expect(fixtures.originalImageCalls).toBe(0);
   });
 

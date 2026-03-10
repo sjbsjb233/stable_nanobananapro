@@ -1036,6 +1036,95 @@ async function imageCacheClear(scope?: string) {
   }
 }
 
+type SharedPreviewState = {
+  key: string;
+  scope: string;
+  baseUrl: string;
+  job_id: string;
+  image_id: string;
+  loading: boolean;
+  url?: string;
+  error?: string;
+  code?: string;
+  updated_at: number;
+};
+
+type SharedPreviewTarget = {
+  localKey: string;
+  job_id: string;
+  image_id: string;
+  job_access_token?: string;
+};
+
+const sharedPreviewStore = new Map<string, SharedPreviewState>();
+const sharedPreviewSubscribers = new Set<() => void>();
+const sharedPreviewInflight = new Map<string, Promise<void>>();
+
+function sharedPreviewResourceKey(scope: string, baseUrl: string, jobId: string, imageId: string) {
+  return imageCacheKey(imageCacheRecordScope(scope), baseUrl, jobId, imageId, "preview");
+}
+
+function notifySharedPreviewSubscribers() {
+  sharedPreviewSubscribers.forEach((listener) => listener());
+}
+
+function sharedPreviewSubscribe(listener: () => void) {
+  sharedPreviewSubscribers.add(listener);
+  return () => {
+    sharedPreviewSubscribers.delete(listener);
+  };
+}
+
+function sharedPreviewGet(scope: string, baseUrl: string, jobId: string, imageId: string) {
+  return sharedPreviewStore.get(sharedPreviewResourceKey(scope, baseUrl, jobId, imageId));
+}
+
+function sharedPreviewSet(next: SharedPreviewState) {
+  const previous = sharedPreviewStore.get(next.key);
+  if (previous?.url && previous.url !== next.url) {
+    URL.revokeObjectURL(previous.url);
+  }
+  sharedPreviewStore.set(next.key, next);
+}
+
+function sharedPreviewPatchMany(entries: SharedPreviewState[]) {
+  if (!entries.length) return;
+  entries.forEach((entry) => sharedPreviewSet(entry));
+  notifySharedPreviewSubscribers();
+}
+
+function clearSharedPreviewMemory(scope?: string) {
+  const normalizedScope = scope ? imageCacheRecordScope(scope) : null;
+  let changed = false;
+  Array.from(sharedPreviewStore.entries()).forEach(([key, entry]) => {
+    if (normalizedScope && entry.scope !== normalizedScope) return;
+    if (entry.url) URL.revokeObjectURL(entry.url);
+    sharedPreviewStore.delete(key);
+    sharedPreviewInflight.delete(key);
+    changed = true;
+  });
+  if (changed) notifySharedPreviewSubscribers();
+}
+
+function sharedPreviewRemember(scope: string, baseUrl: string, jobId: string, imageId: string, blob: Blob) {
+  const key = sharedPreviewResourceKey(scope, baseUrl, jobId, imageId);
+  const existing = sharedPreviewStore.get(key);
+  if (existing?.url) return existing.url;
+  const next: SharedPreviewState = {
+    key,
+    scope: imageCacheRecordScope(scope),
+    baseUrl,
+    job_id: jobId,
+    image_id: imageId,
+    loading: false,
+    url: URL.createObjectURL(blob),
+    updated_at: Date.now(),
+  };
+  sharedPreviewSet(next);
+  notifySharedPreviewSubscribers();
+  return next.url as string;
+}
+
 async function readCachedImageOrFetch(args: {
   scope: string;
   baseUrl: string;
@@ -3423,6 +3512,7 @@ function ImageCacheJanitor() {
 
   useEffect(() => {
     if (!settings.cache.enabled) {
+      clearSharedPreviewMemory(scope);
       imageCacheClear(scope);
       return;
     }
@@ -7836,7 +7926,6 @@ function useHistoryPreviewMap(records: JobRecord[]) {
   const { user } = useAuthSession();
   const scope = user?.user_id || "__guest__";
   const [previewMap, setPreviewMap] = useState<Record<string, HistoryPreviewEntry>>({});
-  const revokeRef = useRef<string[]>([]);
   const recordsKey = useMemo(
     () => records.map((rec) => `${rec.job_id}:${rec.first_image_id || ""}:${rec.status_cache || ""}`).join("|"),
     [records]
@@ -7853,26 +7942,22 @@ function useHistoryPreviewMap(records: JobRecord[]) {
   );
 
   useEffect(() => {
-    return () => {
-      revokeRef.current.forEach((url) => URL.revokeObjectURL(url));
-      revokeRef.current = [];
-    };
-  }, []);
-
-  useEffect(() => {
     let stopped = false;
     const controller = new AbortController();
-    revokeRef.current.forEach((url) => URL.revokeObjectURL(url));
-    revokeRef.current = [];
-
     const successful = targets.filter((rec) => rec.status_cache === "SUCCEEDED" && rec.first_image_id);
-    setPreviewMap((current) => {
+    setPreviewMap(() => {
       const next: Record<string, HistoryPreviewEntry> = {};
       targets.forEach((rec) => {
-        const key = rec.job_id;
-        if (rec.status_cache === "SUCCEEDED" && rec.first_image_id) {
-          next[key] = { loading: true, failed: false };
+        if (rec.status_cache !== "SUCCEEDED" || !rec.first_image_id) return;
+        const shared = sharedPreviewGet(scope, settings.baseUrl, rec.job_id, rec.first_image_id);
+        if (shared?.url) {
+          next[rec.job_id] = { src: shared.url, loading: false, failed: false };
+          return;
         }
+        next[rec.job_id] = {
+          loading: !(settings.jobAuthMode === "TOKEN" && !rec.job_access_token),
+          failed: settings.jobAuthMode === "TOKEN" && !rec.job_access_token,
+        };
       });
       return next;
     });
@@ -7883,21 +7968,29 @@ function useHistoryPreviewMap(records: JobRecord[]) {
       const cachedResults = await Promise.all(
         successful.map(async (rec) => {
           const imageId = rec.first_image_id as string;
-          const blob = settings.cache.enabled
-            ? await imageCacheGet(scope, settings.baseUrl, rec.job_id, imageId, "preview")
-            : null;
-          return { rec, imageId, blob };
+          const shared = sharedPreviewGet(scope, settings.baseUrl, rec.job_id, imageId);
+          const blob =
+            !shared?.url && settings.cache.enabled
+              ? await imageCacheGet(scope, settings.baseUrl, rec.job_id, imageId, "preview")
+              : null;
+          return { rec, imageId, sharedUrl: shared?.url, blob };
         })
       );
       if (stopped) return;
 
       const misses: Array<{ job_id: string; image_id: string; job_access_token?: string }> = [];
       const nextState: Record<string, HistoryPreviewEntry> = {};
-      cachedResults.forEach(({ rec, imageId, blob }) => {
-        if (blob) {
-          const url = URL.createObjectURL(blob);
-          revokeRef.current.push(url);
-          nextState[rec.job_id] = { src: url, loading: false, failed: false };
+      cachedResults.forEach(({ rec, imageId, sharedUrl, blob }) => {
+        if (sharedUrl) {
+          nextState[rec.job_id] = { src: sharedUrl, loading: false, failed: false };
+        } else if (blob) {
+          nextState[rec.job_id] = {
+            src: sharedPreviewRemember(scope, settings.baseUrl, rec.job_id, imageId, blob),
+            loading: false,
+            failed: false,
+          };
+        } else if (settings.jobAuthMode === "TOKEN" && !rec.job_access_token) {
+          nextState[rec.job_id] = { loading: false, failed: true };
         } else {
           misses.push({ job_id: rec.job_id, image_id: imageId, job_access_token: rec.job_access_token });
           nextState[rec.job_id] = { loading: true, failed: false };
@@ -7922,9 +8015,11 @@ function useHistoryPreviewMap(records: JobRecord[]) {
             if (settings.cache.enabled) {
               await imageCachePut(scope, settings.baseUrl, miss.job_id, miss.image_id, "preview", blob, settings.cache);
             }
-            const url = URL.createObjectURL(blob);
-            revokeRef.current.push(url);
-            merged[miss.job_id] = { src: url, loading: false, failed: false };
+            merged[miss.job_id] = {
+              src: sharedPreviewRemember(scope, settings.baseUrl, miss.job_id, miss.image_id, blob),
+              loading: false,
+              failed: false,
+            };
           })
         );
         if (!stopped) {
@@ -7947,16 +8042,7 @@ function useHistoryPreviewMap(records: JobRecord[]) {
       stopped = true;
       controller.abort();
     };
-  }, [
-    client,
-    recordsKey,
-    scope,
-    settings.baseUrl,
-    settings.cache.enabled,
-    settings.cache.maxBytes,
-    settings.cache.ttlDays,
-    targets,
-  ]);
+  }, [client, recordsKey, scope, settings.baseUrl, settings.cache.enabled, settings.cache.maxBytes, settings.cache.ttlDays, settings.jobAuthMode, targets]);
 
   return previewMap;
 }
@@ -9761,7 +9847,6 @@ function usePickerPreviewState(items: PickerSessionItem[]) {
   const { user } = useAuthSession();
   const scope = user?.user_id || "__guest__";
   const [imageState, setImageState] = useState<Record<string, PickerImageState>>({});
-  const revokeRef = useRef<string[]>([]);
   const itemsKey = useMemo(
     () =>
       items
@@ -9769,25 +9854,21 @@ function usePickerPreviewState(items: PickerSessionItem[]) {
         .join("|"),
     [items]
   );
-
-  useEffect(() => {
-    return () => {
-      revokeRef.current.forEach((url) => URL.revokeObjectURL(url));
-      revokeRef.current = [];
-    };
-  }, []);
+  const imageItems = useMemo(
+    () => items.filter((item) => pickerItemHasImage(item) && pickerBucketOf(item) !== "DELETED"),
+    [items]
+  );
 
   useEffect(() => {
     let stopped = false;
     const controller = new AbortController();
-    revokeRef.current.forEach((url) => URL.revokeObjectURL(url));
-    revokeRef.current = [];
-
     const nextInitial: Record<string, PickerImageState> = {};
-    const imageItems = items.filter((item) => pickerItemHasImage(item) && pickerBucketOf(item) !== "DELETED");
     imageItems.forEach((item) => {
       const key = pickerItemKey(item);
-      if (settings.jobAuthMode === "TOKEN" && !item.job_access_token) {
+      const shared = sharedPreviewGet(scope, settings.baseUrl, item.job_id, item.image_id);
+      if (shared?.url) {
+        nextInitial[key] = { loading: false, url: shared.url };
+      } else if (settings.jobAuthMode === "TOKEN" && !item.job_access_token) {
         nextInitial[key] = { loading: false, code: "TOKEN_REQUIRED", error: "缺少 token" };
       } else {
         nextInitial[key] = { loading: true };
@@ -9802,15 +9883,21 @@ function usePickerPreviewState(items: PickerSessionItem[]) {
       const cachedState: Record<string, PickerImageState> = {};
       for (const item of imageItems) {
         const key = pickerItemKey(item);
+        const shared = sharedPreviewGet(scope, settings.baseUrl, item.job_id, item.image_id);
+        if (shared?.url) {
+          cachedState[key] = { loading: false, url: shared.url };
+          continue;
+        }
         if (settings.jobAuthMode === "TOKEN" && !item.job_access_token) continue;
         const cached = settings.cache.enabled
           ? await imageCacheGet(scope, settings.baseUrl, item.job_id, item.image_id, "preview")
           : null;
         if (stopped) return;
         if (cached) {
-          const url = URL.createObjectURL(cached);
-          revokeRef.current.push(url);
-          cachedState[key] = { loading: false, url };
+          cachedState[key] = {
+            loading: false,
+            url: sharedPreviewRemember(scope, settings.baseUrl, item.job_id, item.image_id, cached),
+          };
         } else {
           misses.push({ item, key });
         }
@@ -9848,9 +9935,10 @@ function usePickerPreviewState(items: PickerSessionItem[]) {
               if (settings.cache.enabled) {
                 await imageCachePut(scope, settings.baseUrl, item.job_id, item.image_id!, "preview", blob, settings.cache);
               }
-              const url = URL.createObjectURL(blob);
-              revokeRef.current.push(url);
-              chunkState[key] = { loading: false, url };
+              chunkState[key] = {
+                loading: false,
+                url: sharedPreviewRemember(scope, settings.baseUrl, item.job_id, item.image_id!, blob),
+              };
             })
           );
 
@@ -9862,9 +9950,10 @@ function usePickerPreviewState(items: PickerSessionItem[]) {
                 if (settings.cache.enabled) {
                   await imageCachePut(scope, settings.baseUrl, item.job_id, item.image_id!, "preview", blob, settings.cache);
                 }
-                const url = URL.createObjectURL(blob);
-                revokeRef.current.push(url);
-                chunkState[key] = { loading: false, url };
+                chunkState[key] = {
+                  loading: false,
+                  url: sharedPreviewRemember(scope, settings.baseUrl, item.job_id, item.image_id!, blob),
+                };
               } catch (error: any) {
                 chunkState[key] = {
                   loading: false,
@@ -9888,9 +9977,10 @@ function usePickerPreviewState(items: PickerSessionItem[]) {
               if (settings.cache.enabled) {
                 await imageCachePut(scope, settings.baseUrl, item.job_id, item.image_id!, "preview", blob, settings.cache);
               }
-              const url = URL.createObjectURL(blob);
-              revokeRef.current.push(url);
-              fallbackState[key] = { loading: false, url };
+              fallbackState[key] = {
+                loading: false,
+                url: sharedPreviewRemember(scope, settings.baseUrl, item.job_id, item.image_id!, blob),
+              };
             } catch (error: any) {
               fallbackState[key] = {
                 loading: false,
@@ -9911,15 +10001,7 @@ function usePickerPreviewState(items: PickerSessionItem[]) {
       stopped = true;
       controller.abort();
     };
-  }, [
-    client,
-    itemsKey,
-    items,
-    scope,
-    settings.baseUrl,
-    settings.cache,
-    settings.jobAuthMode,
-  ]);
+  }, [client, imageItems, itemsKey, scope, settings.baseUrl, settings.cache, settings.jobAuthMode]);
 
   return imageState;
 }
@@ -11680,13 +11762,13 @@ function SettingsPage() {
         <Card className="lg:col-span-2">
           <div className="text-sm font-bold text-zinc-900 dark:text-zinc-50">图片缓存</div>
           <div className="mt-2 text-xs text-zinc-600 dark:text-zinc-300">
-            History 画廊预览图和 Task Detail 原图会优先命中浏览器缓存。缓存按当前登录用户隔离，默认保留 3 天且总上限 2 GB。
+            History 与 Picker 共用同一套预览缓存策略：当前标签页内会复用共享预览内存，浏览器持久缓存按当前登录用户隔离。Task Detail 原图仍按需读取浏览器持久缓存。默认保留 3 天且总上限 2 GB。
           </div>
           <div className="mt-3 grid grid-cols-1 gap-3 md:grid-cols-3">
             <div className="flex items-center justify-between rounded-2xl border border-zinc-200 bg-white/60 p-3 dark:border-white/10 dark:bg-zinc-950/30">
               <div>
                 <div className="text-sm font-semibold text-zinc-900 dark:text-zinc-50">启用缓存</div>
-                <div className="text-xs text-zinc-600 dark:text-zinc-300">命中后直接显示，不再请求服务器。</div>
+                <div className="text-xs text-zinc-600 dark:text-zinc-300">控制 History / Picker 共享预览缓存与浏览器持久缓存。关闭时会清空当前用户的共享与持久缓存。</div>
               </div>
               <Switch testId="settings-cache-enabled" value={cacheEnabled} onChange={setCacheEnabled} />
             </div>
@@ -11717,21 +11799,22 @@ function SettingsPage() {
           </div>
           <div className="mt-3 flex flex-wrap items-center gap-2 text-xs text-zinc-600 dark:text-zinc-300">
             <span className="rounded-full border border-zinc-200 bg-white px-3 py-1 dark:border-white/10 dark:bg-zinc-950/40">
-              Cached items {cacheStatsState.count}
+              Persistent items {cacheStatsState.count}
             </span>
             <span className="rounded-full border border-zinc-200 bg-white px-3 py-1 dark:border-white/10 dark:bg-zinc-950/40">
-              Used {formatBytes(cacheStatsState.size)}
+              Persistent size {formatBytes(cacheStatsState.size)}
             </span>
             <Button
               variant="ghost"
               testId="settings-clear-cache"
               onClick={async () => {
+                clearSharedPreviewMemory(user?.user_id || "__guest__");
                 await imageCacheClear(user?.user_id || "__guest__");
                 setCacheStatsState({ count: 0, size: 0 });
-                push({ kind: "success", title: "已清空当前用户图片缓存" });
+                push({ kind: "success", title: "已清空当前用户共享预览与持久缓存" });
               }}
             >
-              清空当前缓存
+              清空共享/持久缓存
             </Button>
           </div>
         </Card>

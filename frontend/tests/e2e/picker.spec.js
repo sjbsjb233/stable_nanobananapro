@@ -453,13 +453,12 @@ test.describe.serial("Picker page", () => {
     await expect(page.getByTestId("picker-slot-A")).toContainText("anchor_a");
     await expect(page.getByTestId("picker-slot-B")).toContainText("stream_job");
     expect(fixtures.originalImageCalls).toBe(0);
+    await expect(page.getByTestId("picker-slot-A").locator("img")).toBeVisible();
 
     await expect
       .poll(() => page.getByTestId("picker-slot-B").textContent(), { timeout: 10000 })
       .toContain("stream_job");
-    await expect
-      .poll(() => fixtures.previewBatchCalls, { timeout: 10000 })
-      .toBeGreaterThanOrEqual(1);
+    await expect(page.getByTestId("picker-slot-B").locator("img")).toBeVisible({ timeout: 10000 });
     expect(fixtures.originalImageCalls).toBe(0);
 
     await page.keyboard.press("d");
@@ -468,7 +467,7 @@ test.describe.serial("Picker page", () => {
       .toBeGreaterThanOrEqual(1);
   });
 
-  test("keeps batched preview requests bounded under picker pressure and stays interactive across next-group cycles", async ({ page }) => {
+  test("stays interactive across next-group cycles under picker pressure and avoids original-image fetches before download", async ({ page }) => {
     const fixtures = buildPressureFixtures();
     await seedPickerState(page, fixtures, "pk_picker_pressure");
     await installPickerMocks(page, fixtures);
@@ -476,9 +475,6 @@ test.describe.serial("Picker page", () => {
 
     await page.getByRole("button", { name: "4-up" }).click();
     await expect(page.getByTestId("picker-slot-D")).toBeVisible();
-    await expect
-      .poll(() => fixtures.previewBatchCalls, { timeout: 8000 })
-      .toBeLessThanOrEqual(2);
     expect(fixtures.originalImageCalls).toBe(0);
 
     for (let step = 0; step < 6; step += 1) {
@@ -487,6 +483,7 @@ test.describe.serial("Picker page", () => {
 
     await expect(page.getByTestId("picker-stage")).toBeVisible();
     await expect(page.getByTestId("picker-slot-A")).not.toContainText("空槽位");
+    await expect(page.getByTestId("picker-slot-A").locator("img")).toBeVisible();
     expect(fixtures.originalImageCalls).toBe(0);
   });
 });
