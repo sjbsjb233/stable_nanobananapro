@@ -373,12 +373,15 @@ async function installHistoryMocks(page, fixtures) {
       const active = [];
       const settled = [];
       Object.values(fixtures.metas).forEach((meta) => {
+        const firstImage = Array.isArray(meta.result?.images) && meta.result.images.length ? meta.result.images[0] : null;
         const snap = {
           job_id: meta.job_id,
           status: meta.status,
           model: meta.model,
           updated_at: meta.updated_at,
           timing: meta.timing,
+          first_image_id: firstImage?.image_id,
+          image_count: Array.isArray(meta.result?.images) ? meta.result.images.length : 0,
         };
         if (meta.status === "RUNNING" || meta.status === "QUEUED") active.push(snap);
         else settled.push(snap);
@@ -661,6 +664,7 @@ test.describe.serial("History page", () => {
         return runningRefreshCard.textContent();
       }, { timeout: 8000 })
       .toContain("SUCCEEDED");
+    await expect(runningRefreshCard.locator("img").first()).toBeVisible();
 
     await historyCards(page).filter({ hasText: "Queued storyboard task" }).click();
     await page.getByRole("dialog", { name: "History detail modal" }).getByRole("button", { name: "Delete" }).click();

@@ -923,6 +923,13 @@ def _parse_iso(value: Any) -> datetime | None:
 
 
 def _status_snapshot(meta: dict[str, Any]) -> dict[str, Any]:
+    result = meta.get("result") if isinstance(meta.get("result"), dict) else {}
+    images = result.get("images") if isinstance(result.get("images"), list) else []
+    first_image_id = None
+    if images:
+        first = images[0]
+        if isinstance(first, dict):
+            first_image_id = first.get("image_id") or first.get("id") or first.get("imageId")
     return {
         "job_id": meta.get("job_id"),
         "status": meta.get("status"),
@@ -930,6 +937,8 @@ def _status_snapshot(meta: dict[str, Any]) -> dict[str, Any]:
         "updated_at": meta.get("updated_at"),
         "timing": meta.get("timing") if isinstance(meta.get("timing"), dict) else {},
         "error": meta.get("error") if isinstance(meta.get("error"), dict) else None,
+        "first_image_id": first_image_id,
+        "image_count": len(images),
     }
 
 

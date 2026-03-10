@@ -300,6 +300,8 @@ type JobStatusSnapshot = {
   updated_at?: string;
   timing?: JobMeta["timing"];
   error?: JobError | null;
+  first_image_id?: string;
+  image_count?: number;
 };
 
 type BatchMetaResponse = {
@@ -6709,6 +6711,8 @@ function PickerSessionJobSync() {
       updateJob(snap.job_id, {
         status_cache: (snap.status || rec?.status_cache || "UNKNOWN") as JobStatus,
         model_cache: (snap.model as ModelId) || rec?.model_cache,
+        first_image_id: snap.first_image_id || rec?.first_image_id,
+        image_count_cache: typeof snap.image_count === "number" ? snap.image_count : rec?.image_count_cache,
         last_seen_at: isoNow(),
         ...jobTimingPatch({ job_id: snap.job_id, timing: snap.timing || {} } as JobMeta),
       });
@@ -7460,6 +7464,8 @@ function HistoryPage() {
         updateJob(snap.job_id, {
           status_cache: (snap.status || rec?.status_cache || "UNKNOWN") as JobStatus,
           model_cache: (snap.model as ModelId) || rec?.model_cache,
+          first_image_id: snap.first_image_id || rec?.first_image_id,
+          image_count_cache: typeof snap.image_count === "number" ? snap.image_count : rec?.image_count_cache,
           last_seen_at: isoNow(),
           ...jobTimingPatch({ job_id: snap.job_id, timing: snap.timing || {} } as JobMeta),
         });
