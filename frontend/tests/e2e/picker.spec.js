@@ -471,6 +471,74 @@ function buildLayoutRegressionFixtures() {
   };
 }
 
+function buildSessionNavigationRegressionFixtures(sessionCount = 10, imagesPerSession = 12) {
+  const jobs = [];
+  const metas = {};
+  const sessions = [];
+
+  for (let sessionIndex = 0; sessionIndex < sessionCount; sessionIndex += 1) {
+    const items = [];
+    for (let imageIndex = 0; imageIndex < imagesPerSession; imageIndex += 1) {
+      const jobId = `nav_s${String(sessionIndex).padStart(2, "0")}_i${String(imageIndex).padStart(2, "0")}`;
+      const createdAt = `2026-03-10T${String((sessionIndex + imageIndex) % 24).padStart(2, "0")}:${String(imageIndex).padStart(2, "0")}:00Z`;
+      const job = pickerJob(jobId, {
+        first_image_id: "image_0",
+        image_count_cache: 1,
+        created_at: createdAt,
+      });
+      jobs.push(job);
+      metas[jobId] = {
+        job_id: jobId,
+        model: job.model_cache,
+        status: job.status_cache,
+        created_at: job.created_at,
+        updated_at: job.last_seen_at,
+        timing: {
+          queued_at: job.created_at,
+          started_at: job.created_at,
+          finished_at: job.last_seen_at,
+          queue_wait_ms: 200,
+          run_duration_ms: 1200,
+        },
+        result: { images: [{ image_id: "image_0", mime: "image/png", width: 1, height: 1 }] },
+      };
+      items.push(
+        pickerImageItem(jobId, {
+          reviewed: imageIndex % 2 === 0,
+          rating: imageIndex % 5 === 0 ? 5 : undefined,
+          bucket: imageIndex >= imagesPerSession - 3 ? "PREFERRED" : "FILMSTRIP",
+        })
+      );
+    }
+
+    sessions.push({
+      session_id: `pk_nav_${sessionIndex}`,
+      name: `Navigation Session ${sessionIndex + 1}`,
+      created_at: `2026-03-${String(10 - (sessionIndex % 5)).padStart(2, "0")}T00:00:00Z`,
+      updated_at: `2026-03-${String(10 - (sessionIndex % 5)).padStart(2, "0")}T00:00:00Z`,
+      archived: false,
+      pinned: false,
+      items,
+      compare_mode: "FOUR",
+      layout_preset: "SYNC_ZOOM",
+      ui: { background: "light", showGrid: false, showInfo: false },
+      slots: [null, null, null, null],
+      focus_key: null,
+    });
+  }
+
+  return {
+    jobs,
+    metas,
+    sessions,
+    sidebarPinned: true,
+    previewBatchCalls: 0,
+    originalImageCalls: 0,
+    previewImageCalls: 0,
+    activeCalls: 0,
+  };
+}
+
 async function seedPickerState(page, fixtures, sessionId) {
   await page.addInitScript(
     ([adminUserId, jobs, sessions, seedSessionId, sidebarPinned]) => {
@@ -866,5 +934,46 @@ test.describe.serial("Picker page", () => {
       };
     });
     expect(layering.toggleOwnsCenter).toBe(true);
+  });
+
+  test("keeps non-picker routes rendered after switching among many image-filled sessions", async ({ page }) => {
+    const fixtures = buildSessionNavigationRegressionFixtures(10, 48);
+    const pageErrors = [];
+
+    page.on("pageerror", (error) => {
+      pageErrors.push(error.message);
+    });
+
+    await seedPickerState(page, fixtures, "pk_nav_0");
+    await installPickerMocks(page, fixtures);
+    await loginToPicker(page, "pk_nav_0");
+
+    for (const sessionIndex of [1, 3, 5, 7, 9, 0, 8, 2, 6, 4, 9, 1, 7]) {
+      await page.getByTestId(`picker-session-item-pk_nav_${sessionIndex}`).click();
+      await expect(page.getByText(`当前会话 · Navigation Session ${sessionIndex + 1}`)).toBeVisible();
+      await expect(page.getByTestId("picker-slot-A").locator("img")).toBeVisible();
+      await expect(page.getByTestId("picker-slot-D").locator("img")).toBeVisible();
+    }
+
+    await page.getByRole("link", { name: "Create" }).click();
+    await expect(page).toHaveURL(/\/create/);
+    await expect(page.getByText("Create Job")).toBeVisible();
+
+    await page.getByRole("link", { name: "History" }).click();
+    await expect(page).toHaveURL(/\/history/);
+    await expect(page.getByText("本地历史画廊")).toBeVisible();
+
+    await page.getByRole("link", { name: "Settings" }).click();
+    await expect(page).toHaveURL(/\/settings/);
+    await expect(page.getByText("Picker 调度参数")).toBeVisible();
+
+    await page.getByRole("link", { name: "Picker" }).click();
+    await expect(page).toHaveURL(/\/picker/);
+    await expect(page.getByText("Image Picker")).toBeVisible();
+
+    await page.getByRole("link", { name: "Create" }).click();
+    await expect(page).toHaveURL(/\/create/);
+    await expect(page.getByText("Create Job")).toBeVisible();
+    expect(pageErrors).toEqual([]);
   });
 });

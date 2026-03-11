@@ -3733,21 +3733,19 @@ function AnimatedRoutes() {
   const { isAdmin } = useAuthSession();
 
   return (
-    <AnimatePresence initial={false}>
-      <motion.div key={location.pathname} {...(page as any)} transition={transition}>
-        <Routes location={location}>
-          <Route path="/login" element={<Navigate to="/" replace />} />
-          <Route path="/" element={<DashboardPage />} />
-          <Route path="/create" element={<CreateJobPage />} />
-          <Route path="/batch" element={<BatchCreatePage />} />
-          <Route path="/history" element={<HistoryPage />} />
-          <Route path="/picker" element={<PickerPage />} />
-          <Route path="/admin" element={isAdmin ? <AdminPage /> : <Navigate to="/" replace />} />
-          <Route path="/settings" element={<SettingsPage />} />
-          <Route path="*" element={<NotFoundPage />} />
-        </Routes>
-      </motion.div>
-    </AnimatePresence>
+    <motion.div key={location.pathname} {...(page as any)} transition={transition}>
+      <Routes location={location}>
+        <Route path="/login" element={<Navigate to="/" replace />} />
+        <Route path="/" element={<DashboardPage />} />
+        <Route path="/create" element={<CreateJobPage />} />
+        <Route path="/batch" element={<BatchCreatePage />} />
+        <Route path="/history" element={<HistoryPage />} />
+        <Route path="/picker" element={<PickerPage />} />
+        <Route path="/admin" element={isAdmin ? <AdminPage /> : <Navigate to="/" replace />} />
+        <Route path="/settings" element={<SettingsPage />} />
+        <Route path="*" element={<NotFoundPage />} />
+      </Routes>
+    </motion.div>
   );
 }
 
