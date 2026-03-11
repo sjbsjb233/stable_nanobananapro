@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import io
+import inspect
 import queue
 import threading
 import time
@@ -697,6 +698,8 @@ class JobManager:
     def _run_job(self, job_id: str) -> None:
         meta = storage.load_meta(job_id)
         params = meta["params"]
+        watchdog_timeout_sec = max(int(settings.job_watchdog_timeout_sec), 1)
+        job_deadline_monotonic = time.monotonic() + watchdog_timeout_sec
 
         request_data = storage.load_request(job_id)
         refs: list[ReferenceImage] = []
@@ -715,13 +718,14 @@ class JobManager:
             try:
                 storage.write_job_log(job_id, f"Attempt {attempt + 1}/{attempts} started")
                 logger.info(
-                    "Gemini run start: job_id=%s attempt=%s/%s model=%s mode=%s timeout_sec=%s",
+                    "Gemini run start: job_id=%s attempt=%s/%s model=%s mode=%s timeout_sec=%s watchdog_timeout_sec=%s",
                     job_id,
                     attempt + 1,
                     attempts,
                     meta.get("model", settings.default_model),
                     meta["mode"],
                     params.get("timeout_sec"),
+                    watchdog_timeout_sec,
                 )
                 output = self._generate_image_with_watchdog(
                     job_id=job_id,
@@ -732,6 +736,8 @@ class JobManager:
                     mode=meta["mode"],
                     params=params,
                     reference_images=refs,
+                    watchdog_timeout_sec=watchdog_timeout_sec,
+                    job_deadline_monotonic=job_deadline_monotonic,
                 )
                 self._finalize_success(job_id, meta, output)
                 return
@@ -764,21 +770,29 @@ class JobManager:
         mode: str,
         params: dict[str, Any],
         reference_images: list[ReferenceImage],
+        watchdog_timeout_sec: int,
+        job_deadline_monotonic: float,
     ) -> dict[str, Any]:
-        watchdog_timeout_sec = max(
-            int(params.get("timeout_sec", settings.job_timeout_sec_default)) + int(settings.job_watchdog_grace_sec),
-            1,
-        )
         result_queue: queue.Queue[tuple[str, Any]] = queue.Queue(maxsize=1)
 
         def _target() -> None:
             try:
-                output = gemini_client.generate_image(
-                    prompt=prompt,
-                    model=model,
-                    mode=mode,
-                    params=params,
-                    reference_images=reference_images,
+                generate_image = gemini_client.generate_image
+                call_kwargs = {
+                    "prompt": prompt,
+                    "model": model,
+                    "mode": mode,
+                    "params": params,
+                    "reference_images": reference_images,
+                }
+                try:
+                    signature = inspect.signature(generate_image)
+                except (TypeError, ValueError):
+                    signature = None
+                if signature is None or "deadline_monotonic" in signature.parameters:
+                    call_kwargs["deadline_monotonic"] = job_deadline_monotonic
+                output = generate_image(
+                    **call_kwargs,
                 )
                 result_queue.put(("ok", output))
             except Exception as exc:  # noqa: BLE001
@@ -791,8 +805,25 @@ class JobManager:
         )
         thread.start()
 
+        remaining_watchdog_sec = max(job_deadline_monotonic - time.monotonic(), 0.0)
+        if remaining_watchdog_sec <= 0:
+            raise GeminiError(
+                code="WORKER_WATCHDOG_TIMEOUT",
+                message=(
+                    "Worker watchdog timeout while waiting Gemini response "
+                    f"(attempt {attempt}/{attempts}, watchdog={watchdog_timeout_sec}s)"
+                ),
+                retryable=True,
+                payload={
+                    "job_id": job_id,
+                    "attempt": attempt,
+                    "attempts": attempts,
+                    "watchdog_timeout_sec": watchdog_timeout_sec,
+                    "configured_timeout_sec": int(params.get("timeout_sec", settings.job_timeout_sec_default)),
+                },
+            )
         try:
-            kind, payload = result_queue.get(timeout=watchdog_timeout_sec)
+            kind, payload = result_queue.get(timeout=remaining_watchdog_sec)
         except queue.Empty as exc:
             raise GeminiError(
                 code="WORKER_WATCHDOG_TIMEOUT",

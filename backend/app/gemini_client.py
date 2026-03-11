@@ -63,6 +63,7 @@ class GeminiClient:
         mode: str,
         params: dict[str, Any],
         reference_images: list[ReferenceImage],
+        deadline_monotonic: float | None = None,
     ) -> dict[str, Any]:
         spec = get_model_spec(model)
         if not spec:
@@ -81,6 +82,15 @@ class GeminiClient:
         last_error: GeminiError | None = None
 
         for candidate in chain:
+            try:
+                self._ensure_within_deadline(
+                    deadline_monotonic,
+                    configured_timeout_sec=params.get("timeout_sec"),
+                    provider_id=str(candidate.get("provider_id") or ""),
+                )
+            except GeminiError as exc:
+                last_error = exc
+                break
             provider_id = str(candidate["provider_id"])
             provider_store.record_selection(provider_id)
             provider_store.acquire_slot(provider_id)
@@ -105,6 +115,7 @@ class GeminiClient:
                     mode=mode,
                     params=params,
                     reference_images=reference_images,
+                    deadline_monotonic=deadline_monotonic,
                 )
                 latency_ms = int(output.get("latency_ms") or max(0, int((time.perf_counter() - started) * 1000)))
                 cost_cny = max(0.0, float(config.cost_per_image_cny) * max(1, len(output.get("images") or [])))
@@ -180,6 +191,7 @@ class GeminiClient:
         mode: str,
         params: dict[str, Any],
         reference_images: list[ReferenceImage],
+        deadline_monotonic: float | None = None,
     ) -> dict[str, Any]:
         if config.adapter_type == "gemini_v1beta":
             return self._call_gemini_v1beta(
@@ -189,6 +201,7 @@ class GeminiClient:
                 mode=mode,
                 params=params,
                 reference_images=reference_images,
+                deadline_monotonic=deadline_monotonic,
             )
         if config.adapter_type == "openai_chat_image":
             return self._call_openai_chat_image(
@@ -198,6 +211,7 @@ class GeminiClient:
                 mode=mode,
                 params=params,
                 reference_images=reference_images,
+                deadline_monotonic=deadline_monotonic,
             )
         raise GeminiError(
             code="UNSUPPORTED_ADAPTER",
@@ -214,6 +228,7 @@ class GeminiClient:
         mode: str,
         params: dict[str, Any],
         reference_images: list[ReferenceImage],
+        deadline_monotonic: float | None = None,
     ) -> dict[str, Any]:
         upstream_model = self._resolve_gemini_upstream_model(model)
         if upstream_model is None:
@@ -259,7 +274,12 @@ class GeminiClient:
         if spec.supports_thinking_level and thinking_level:
             payload["generationConfig"]["thinkingConfig"] = {"thinkingLevel": thinking_level}
 
-        timeout = params["timeout_sec"]
+        timeout, deadline_capped = self._effective_timeout_sec(
+            params["timeout_sec"],
+            deadline_monotonic=deadline_monotonic,
+            configured_timeout_sec=params.get("timeout_sec"),
+            provider_id=config.provider_id,
+        )
         url = f"{config.base_url.rstrip('/')}/models/{upstream_model}:generateContent"
         start = time.perf_counter()
         try:
@@ -269,6 +289,18 @@ class GeminiClient:
             with httpx.Client(**client_kwargs) as client:
                 resp = client.post(url, params={"key": config.api_key}, json=payload)
         except httpx.TimeoutException as exc:
+            if deadline_capped:
+                raise GeminiError(
+                    code="WORKER_WATCHDOG_TIMEOUT",
+                    message="Job exceeded maximum runtime while waiting for Gemini upstream response",
+                    retryable=False,
+                    payload={
+                        "provider_id": config.provider_id,
+                        "configured_timeout_sec": int(params.get("timeout_sec", settings.job_timeout_sec_default)),
+                        "effective_timeout_sec": round(timeout, 3),
+                    },
+                    retry_other_providers=False,
+                ) from exc
             raise GeminiError(code="UPSTREAM_TIMEOUT", message="Gemini upstream timeout", retryable=True) from exc
         except httpx.HTTPError as exc:
             raise GeminiError(code="UPSTREAM_HTTP", message=f"Gemini HTTP error: {exc}", retryable=True) from exc
@@ -341,6 +373,7 @@ class GeminiClient:
         mode: str,
         params: dict[str, Any],
         reference_images: list[ReferenceImage],
+        deadline_monotonic: float | None = None,
     ) -> dict[str, Any]:
         upstream_model = self._resolve_openai_upstream_model(model, params)
         if upstream_model is None:
@@ -362,7 +395,12 @@ class GeminiClient:
             "stream": False,
         }
         url = self._openai_endpoint(config.base_url, "chat/completions")
-        timeout = params["timeout_sec"]
+        timeout, deadline_capped = self._effective_timeout_sec(
+            params["timeout_sec"],
+            deadline_monotonic=deadline_monotonic,
+            configured_timeout_sec=params.get("timeout_sec"),
+            provider_id=config.provider_id,
+        )
         start = time.perf_counter()
 
         try:
@@ -376,6 +414,18 @@ class GeminiClient:
                     json=payload,
                 )
         except httpx.TimeoutException as exc:
+            if deadline_capped:
+                raise GeminiError(
+                    code="WORKER_WATCHDOG_TIMEOUT",
+                    message="Job exceeded maximum runtime while waiting for provider response",
+                    retryable=False,
+                    payload={
+                        "provider_id": config.provider_id,
+                        "configured_timeout_sec": int(params.get("timeout_sec", settings.job_timeout_sec_default)),
+                        "effective_timeout_sec": round(timeout, 3),
+                    },
+                    retry_other_providers=False,
+                ) from exc
             raise GeminiError(code="UPSTREAM_TIMEOUT", message="OpenAI-compatible upstream timeout", retryable=True) from exc
         except httpx.HTTPError as exc:
             raise GeminiError(code="UPSTREAM_HTTP", message=f"OpenAI-compatible HTTP error: {exc}", retryable=True) from exc
@@ -408,7 +458,13 @@ class GeminiClient:
                 break
 
         if len(images) < settings.max_images_per_job:
-            with httpx.Client(timeout=30) as client:
+            download_timeout, _ = self._effective_timeout_sec(
+                30,
+                deadline_monotonic=deadline_monotonic,
+                configured_timeout_sec=params.get("timeout_sec"),
+                provider_id=config.provider_id,
+            )
+            with httpx.Client(timeout=download_timeout) as client:
                 for url_match in _URL_RE.findall(content_str):
                     if len(images) >= settings.max_images_per_job:
                         break
@@ -464,6 +520,52 @@ class GeminiClient:
                 snippet,
             )
             return {"raw_text_snippet": snippet}
+
+    def _ensure_within_deadline(
+        self,
+        deadline_monotonic: float | None,
+        *,
+        configured_timeout_sec: Any,
+        provider_id: str | None = None,
+    ) -> None:
+        if deadline_monotonic is None:
+            return
+        remaining_sec = deadline_monotonic - time.monotonic()
+        if remaining_sec > 0:
+            return
+        payload = {
+            "configured_timeout_sec": int(configured_timeout_sec or settings.job_timeout_sec_default),
+            "effective_timeout_sec": 0,
+        }
+        if provider_id:
+            payload["provider_id"] = provider_id
+        raise GeminiError(
+            code="WORKER_WATCHDOG_TIMEOUT",
+            message="Job exceeded maximum runtime before the next provider attempt could start",
+            retryable=False,
+            payload=payload,
+            retry_other_providers=False,
+        )
+
+    def _effective_timeout_sec(
+        self,
+        requested_timeout_sec: Any,
+        *,
+        deadline_monotonic: float | None,
+        configured_timeout_sec: Any,
+        provider_id: str | None = None,
+    ) -> tuple[float, bool]:
+        requested = max(float(requested_timeout_sec), 0.001)
+        if deadline_monotonic is None:
+            return requested, False
+        remaining_sec = deadline_monotonic - time.monotonic()
+        if remaining_sec <= 0:
+            self._ensure_within_deadline(
+                deadline_monotonic,
+                configured_timeout_sec=configured_timeout_sec,
+                provider_id=provider_id,
+            )
+        return max(min(requested, remaining_sec), 0.001), remaining_sec < requested
 
     def _raise_for_status(self, *, status_code: int, body: dict[str, Any], provider_id: str, upstream_model: str) -> None:
         message = self._extract_error_message(body, fallback=f"Provider request failed: HTTP {status_code}")

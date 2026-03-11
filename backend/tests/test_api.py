@@ -346,6 +346,82 @@ def test_multi_provider_prefers_cheaper_then_falls_back(client: TestClient, monk
     assert backup["success_count"] >= 1
 
 
+def test_generate_image_stops_fallback_when_job_deadline_is_exhausted(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    provider_store.path = tmp_path / "providers.json"
+    provider_store.reset_runtime_state()
+    monkeypatch.setattr(
+        settings,
+        "upstream_providers_json",
+        json.dumps(
+            [
+                {
+                    "provider_id": "zx2",
+                    "label": "ZX2",
+                    "adapter_type": "gemini_v1beta",
+                    "base_url": "http://cheap.example/v1beta",
+                    "api_key": "cheap-key",
+                    "cost_per_image_cny": 0.05,
+                    "initial_balance_cny": 10,
+                    "supported_models": ["gemini-3-pro-image-preview"],
+                },
+                {
+                    "provider_id": "mmw",
+                    "label": "MMW",
+                    "adapter_type": "openai_chat_image",
+                    "base_url": "https://api.example",
+                    "api_key": "backup-key",
+                    "cost_per_image_cny": 0.09,
+                    "initial_balance_cny": 20,
+                    "supported_models": ["gemini-3-pro-image-preview"],
+                },
+            ]
+        ),
+    )
+    provider_store.ensure_initialized()
+
+    fallback_called = False
+
+    def fail_cheap(*args, **kwargs):
+        time.sleep(0.06)
+        raise GeminiError(code="UPSTREAM_TIMEOUT", message="cheap timeout", retryable=True)
+
+    def should_not_run_backup(*args, **kwargs):
+        nonlocal fallback_called
+        fallback_called = True
+        return {
+            "raw": {},
+            "images": [{"mime": "image/png", "bytes": PNG_1X1}],
+            "usage_metadata": {},
+            "finish_reason": "STOP",
+            "safety_ratings": [],
+            "latency_ms": 10,
+        }
+
+    monkeypatch.setattr(gemini_client, "_call_gemini_v1beta", fail_cheap)
+    monkeypatch.setattr(gemini_client, "_call_openai_chat_image", should_not_run_backup)
+
+    with pytest.raises(GeminiError) as exc_info:
+        gemini_client.generate_image(
+            prompt="deadline test",
+            model="gemini-3-pro-image-preview",
+            mode="IMAGE_ONLY",
+            params={
+                "aspect_ratio": "1:1",
+                "image_size": "1K",
+                "temperature": 0.7,
+                "timeout_sec": 60,
+                "max_retries": 1,
+            },
+            reference_images=[],
+            deadline_monotonic=time.monotonic() + 0.05,
+        )
+
+    err = exc_info.value
+    assert err.code == "WORKER_WATCHDOG_TIMEOUT"
+    assert fallback_called is False
+    assert err.payload["attempts"][0]["provider_id"] == "zx2"
+
+
 def test_admin_provider_management_and_balance_updates(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         settings,
@@ -855,6 +931,56 @@ def test_running_concurrency_limit_queues_excess_jobs(client: TestClient, monkey
 
     assert final_statuses == ["SUCCEEDED", "SUCCEEDED", "SUCCEEDED"]
     assert max_active_calls == 1
+
+
+def test_job_watchdog_enforces_total_runtime_limit(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(settings, "job_watchdog_timeout_sec", 1)
+
+    def slow_generate_image(prompt, model, mode, params, reference_images, deadline_monotonic=None):
+        time.sleep(1.2)
+        return {
+            "raw": {"candidates": []},
+            "images": [{"mime": "image/png", "bytes": PNG_1X1}],
+            "usage_metadata": {"totalTokenCount": 10},
+            "finish_reason": "STOP",
+            "safety_ratings": [],
+            "latency_ms": 50,
+        }
+
+    monkeypatch.setattr("app.gemini_client.gemini_client.generate_image", slow_generate_image)
+    login(client)
+
+    created = client.post(
+        "/v1/jobs",
+        json={
+            "prompt": "watchdog prompt",
+            "params": {
+                "aspect_ratio": "1:1",
+                "image_size": "1K",
+                "temperature": 0.7,
+                "timeout_sec": 60,
+                "max_retries": 1,
+            },
+            "mode": "IMAGE_ONLY",
+        },
+    )
+    assert created.status_code == 201
+    job_id = created.json()["job_id"]
+
+    meta = None
+    for _ in range(40):
+        resp = client.get(f"/v1/jobs/{job_id}")
+        assert resp.status_code == 200
+        meta = resp.json()
+        if meta["status"] in {"SUCCEEDED", "FAILED"}:
+            break
+        time.sleep(0.05)
+
+    assert meta is not None
+    assert meta["status"] == "FAILED"
+    assert meta["error"]["code"] == "WORKER_WATCHDOG_TIMEOUT"
+    assert meta["error"]["details"]["watchdog_timeout_sec"] == 1
+    assert meta["error"]["details"]["configured_timeout_sec"] == 60
 
 
 def test_startup_recovery_marks_lingering_jobs_failed(client: TestClient) -> None:

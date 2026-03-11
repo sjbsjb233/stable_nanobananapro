@@ -383,8 +383,10 @@ docker compose -f docker-compose.prod.yml logs -f backend
 ### 检查容器内环境变量
 
 ```bash
-docker compose -f docker-compose.prod.yml exec backend env | grep -E 'GEMINI|JOB_AUTH_MODE|DATA_DIR'
+docker compose -f docker-compose.prod.yml exec backend env | grep -E 'GEMINI|JOB_AUTH_MODE|JOB_WATCHDOG_TIMEOUT_SEC|DATA_DIR'
 ```
+
+`JOB_WATCHDOG_TIMEOUT_SEC` 控制单个 job 的最大运行时长，超时后 job 会直接标记为 `FAILED`，不会继续等待后续 provider fallback 完成。
 
 ### 仅重建后端（env 改动后常用）
 
