@@ -1,9 +1,50 @@
+import { once } from "node:events";
+import http from "node:http";
 import { expect, test } from "@playwright/test";
 
 const BASE_URL = process.env.PW_BASE_URL || "http://127.0.0.1:5178";
 const ADMIN_COOKIE = "eyJ1c2VyX2lkIjogIjFmZjAxODI3YTkxNzA3NjhkMjY1NmMwYyJ9.aa6-cA.CPyq2oqG6B0uzph_K7ogDfTJHC0";
 const ADMIN_USER_ID = "1ff01827a9170768d2656c0c";
 const PNG_1X1_BASE64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO7m6XQAAAAASUVORK5CYII=";
+
+function writeMockJson(res, origin, body, status = 200) {
+  res.writeHead(status, {
+    "Content-Type": "application/json",
+    "Access-Control-Allow-Origin": origin,
+    "Access-Control-Allow-Credentials": "true",
+    "Access-Control-Allow-Headers": "Content-Type, X-Job-Token, X-Requested-Job-Count",
+    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+    Vary: "Origin",
+  });
+  res.end(JSON.stringify(body));
+}
+
+function writeMockPng(res, origin) {
+  res.writeHead(200, {
+    "Content-Type": "image/png",
+    "Access-Control-Allow-Origin": origin,
+    "Access-Control-Allow-Credentials": "true",
+    Vary: "Origin",
+  });
+  res.end(Buffer.from(PNG_1X1_BASE64, "base64"));
+}
+
+function readMockJson(req) {
+  return new Promise((resolve, reject) => {
+    let data = "";
+    req.on("data", (chunk) => {
+      data += chunk;
+    });
+    req.on("end", () => {
+      try {
+        resolve(data ? JSON.parse(data) : {});
+      } catch (error) {
+        reject(error);
+      }
+    });
+    req.on("error", reject);
+  });
+}
 
 function pickerJob(job_id, extra = {}) {
   return {
@@ -790,6 +831,278 @@ test.describe.serial("Picker page", () => {
     await expect
       .poll(() => fixtures.originalImageCalls, { timeout: 5000 })
       .toBeGreaterThanOrEqual(1);
+  });
+
+  test("hydrates one succeeded placeholder while sibling jobs keep polling without repeated aborts", async ({ page }) => {
+    const jobIds = ["job_1", "job_2", "job_3", "job_4"];
+    const detailAttempts = { job_1: 0 };
+    const requestFailures = [];
+    let activeCalls = 0;
+    let job1AbortedBeforeResponse = 0;
+    let job1CompletedResponses = 0;
+    let backendOrigin = "";
+
+    const buildMeta = (jobId, status, updatedAt = null) => ({
+      job_id: jobId,
+      model: "gemini-3-pro-image-preview",
+      status,
+      created_at: "2026-03-10T00:00:00Z",
+      updated_at: updatedAt || "2026-03-10T00:00:00Z",
+      timing: {
+        queued_at: "2026-03-10T00:00:00Z",
+        started_at: "2026-03-10T00:00:01Z",
+        finished_at: updatedAt,
+        queue_wait_ms: 100,
+        run_duration_ms: updatedAt ? 2000 : null,
+      },
+      result: status === "SUCCEEDED" ? { images: [{ image_id: "image_0", mime: "image/png", width: 1, height: 1 }] } : { images: [] },
+    });
+
+    const server = http.createServer(async (req, res) => {
+      const reqUrl = new URL(req.url || "/", backendOrigin || "http://127.0.0.1");
+      const origin = req.headers.origin || BASE_URL;
+
+      if (req.method === "OPTIONS") {
+        res.writeHead(204, {
+          "Access-Control-Allow-Origin": origin,
+          "Access-Control-Allow-Credentials": "true",
+          "Access-Control-Allow-Headers": "Content-Type, X-Job-Token, X-Requested-Job-Count",
+          "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+          Vary: "Origin",
+        });
+        res.end();
+        return;
+      }
+
+      if (reqUrl.pathname === "/v1/auth/me") {
+        writeMockJson(res, origin, {
+          authenticated: true,
+          user: {
+            user_id: ADMIN_USER_ID,
+            username: "admin",
+            role: "ADMIN",
+            enabled: true,
+            created_at: "2026-03-01T00:00:00Z",
+            updated_at: "2026-03-10T00:00:00Z",
+            last_login_at: "2026-03-10T00:00:00Z",
+            policy: {
+              daily_image_limit: null,
+              concurrent_jobs_limit: 20,
+              turnstile_job_count_threshold: null,
+              turnstile_daily_usage_threshold: null,
+              daily_image_access_limit: null,
+              image_access_turnstile_bonus_quota: null,
+              daily_image_access_hard_limit: null,
+            },
+          },
+          usage: {
+            date: "2026-03-10",
+            jobs_created_today: 0,
+            jobs_succeeded_today: 0,
+            jobs_failed_today: 0,
+            images_generated_today: 0,
+            quota_consumed_today: 0,
+            quota_resets_today: 0,
+            active_jobs: 0,
+            running_jobs: 0,
+            queued_jobs: 0,
+            remaining_images_today: null,
+            image_accesses_today: 0,
+            image_access_bonus_quota_today: 0,
+          },
+          generation_turnstile_verified_until: null,
+        });
+        return;
+      }
+
+      if (reqUrl.pathname === "/v1/models") {
+        writeMockJson(res, origin, {
+          default_model: "gemini-3-pro-image-preview",
+          models: [
+            {
+              model_id: "gemini-3-pro-image-preview",
+              label: "Nano Banana Pro",
+              description: "Gemini 3 Pro Image Preview",
+              supports_text_output: true,
+              supports_image_size: true,
+              supports_thinking_level: false,
+              supported_modes: ["IMAGE_ONLY", "TEXT_AND_IMAGE"],
+              supported_aspect_ratios: ["1:1", "16:9"],
+              supported_image_sizes: ["1K", "2K", "4K"],
+              supported_thinking_levels: [],
+              default_params: { aspect_ratio: "1:1", image_size: "1K", thinking_level: null, temperature: 1, timeout_sec: 120, max_retries: 0 },
+            },
+          ],
+        });
+        return;
+      }
+
+      if (reqUrl.pathname === "/v1/jobs/active") {
+        activeCalls += 1;
+        const body = await readMockJson(req);
+        const requested = new Set((body.jobs || []).map((item) => item.job_id));
+        const active = [];
+        const settled = [];
+
+        for (const jobId of requested) {
+          const status = jobId === "job_1" ? "SUCCEEDED" : activeCalls >= 6 ? "SUCCEEDED" : "RUNNING";
+          const meta = buildMeta(jobId, status, status === "SUCCEEDED" ? `2026-03-10T00:00:${String(activeCalls).padStart(2, "0")}Z` : null);
+          const snap = {
+            job_id: meta.job_id,
+            status: meta.status,
+            model: meta.model,
+            updated_at: meta.updated_at,
+            timing: meta.timing,
+            first_image_id: meta.result?.images?.[0]?.image_id,
+            image_count: meta.result?.images?.length || 0,
+          };
+          if (status === "SUCCEEDED") settled.push(snap);
+          else active.push(snap);
+        }
+
+        writeMockJson(res, origin, {
+          active,
+          settled,
+          forbidden: [],
+          not_found: [],
+          failed: [],
+          requested: active.length + settled.length,
+          active_count: active.length,
+          settled_count: settled.length,
+        });
+        return;
+      }
+
+      if (reqUrl.pathname === "/v1/jobs/previews/batch") {
+        const body = await readMockJson(req);
+        const items = (body.images || []).map((item) => ({
+          job_id: item.job_id,
+          image_id: item.image_id,
+          mime: "image/png",
+          size_bytes: Buffer.from(PNG_1X1_BASE64, "base64").length,
+          data_base64: PNG_1X1_BASE64,
+        }));
+        writeMockJson(res, origin, { items, forbidden: [], not_found: [], failed: [], requested: items.length, ok: items.length, limit: 72 });
+        return;
+      }
+
+      const jobMatch = reqUrl.pathname.match(/^\/v1\/jobs\/([^/]+)(?:\/(.*))?$/);
+      if (jobMatch && req.method === "GET") {
+        const jobId = decodeURIComponent(jobMatch[1]);
+        const suffix = jobMatch[2] || "";
+
+        if (suffix.startsWith("images/")) {
+          writeMockPng(res, origin);
+          return;
+        }
+
+        if (jobId === "job_1") detailAttempts.job_1 += 1;
+        const status = jobId === "job_1" ? "SUCCEEDED" : activeCalls >= 6 ? "SUCCEEDED" : "RUNNING";
+        const meta = buildMeta(jobId, status, status === "SUCCEEDED" ? "2026-03-10T00:00:10Z" : null);
+
+        if (jobId === "job_1" && activeCalls < 6) {
+          req.on("aborted", () => {
+            job1AbortedBeforeResponse += 1;
+          });
+          await new Promise((resolve) => setTimeout(resolve, 2600));
+          if (req.destroyed) return;
+        }
+
+        if (jobId === "job_1") job1CompletedResponses += 1;
+        writeMockJson(res, origin, meta);
+        return;
+      }
+
+      writeMockJson(res, origin, { error: { code: "NOT_FOUND", message: "Unhandled in test" } }, 404);
+    });
+
+    server.listen(0, "127.0.0.1");
+    await once(server, "listening");
+    backendOrigin = `http://127.0.0.1:${server.address().port}`;
+
+    try {
+      await page.addInitScript(([adminUserId, jobs, apiBaseUrl]) => {
+        const session = {
+          session_id: "pk_picker_hydration_race",
+          name: "Hydration Race",
+          created_at: "2026-03-10T00:00:00Z",
+          updated_at: "2026-03-10T00:00:00Z",
+          items: jobs.map((job) => ({
+            item_key: `${job.job_id}::__pending__`,
+            job_id: job.job_id,
+            job_access_token: job.job_access_token,
+            status: "RUNNING",
+            added_at: "2026-03-10T00:00:00Z",
+            bucket: "FILMSTRIP",
+            pool: "FILMSTRIP",
+            reviewed: false,
+            picked: true,
+          })),
+          compare_mode: "FOUR",
+          layout_preset: "SYNC_ZOOM",
+          ui: { background: "dark", showGrid: false, showInfo: false },
+          slots: jobs.map((job) => `${job.job_id}::__pending__`),
+          focus_key: `${jobs[0].job_id}::__pending__`,
+        };
+
+        window.localStorage.setItem("nbp_jobs_by_user_v2", JSON.stringify({ [adminUserId]: jobs }));
+        window.localStorage.setItem("nbp_picker_sessions_v1", JSON.stringify([session]));
+        window.localStorage.setItem("nbp_picker_recent_v1", JSON.stringify({ last_session_id: session.session_id, last_opened_at: new Date().toISOString() }));
+        window.localStorage.setItem(
+          "nbp_settings_v1",
+          JSON.stringify({
+            baseUrl: apiBaseUrl,
+            jobAuthMode: "TOKEN",
+            polling: {
+              intervalMs: 800,
+              maxIntervalMs: 5000,
+              concurrency: 5,
+            },
+            cache: {
+              enabled: true,
+              ttlDays: 3,
+              maxBytes: 2147483648,
+            },
+          })
+        );
+      }, [ADMIN_USER_ID, jobIds.map((jobId) => pickerJob(jobId, { status_cache: "RUNNING", first_image_id: undefined, image_count_cache: 0 })), backendOrigin]);
+
+      page.on("requestfailed", (request) => {
+        if (request.url().includes(`${backendOrigin}/v1/jobs/job_1`) && !request.url().includes("/images/")) {
+          requestFailures.push(request.failure()?.errorText || "unknown");
+        }
+      });
+
+      await loginToPicker(page, "pk_picker_hydration_race");
+
+      await expect.poll(
+        async () =>
+          page.evaluate(() => {
+            const sessions = JSON.parse(localStorage.getItem("nbp_picker_sessions_v1") || "[]");
+            const session = sessions.find((item) => item.session_id === "pk_picker_hydration_race");
+            return Boolean(session.items.find((item) => item.job_id === "job_1" && item.image_id === "image_0"));
+          }),
+        { timeout: 12000 }
+      ).toBe(true);
+
+      expect(activeCalls).toBeLessThan(6);
+      expect(job1AbortedBeforeResponse).toBeLessThanOrEqual(1);
+      expect(requestFailures.length).toBeLessThanOrEqual(1);
+      expect(detailAttempts.job_1).toBeGreaterThanOrEqual(1);
+      expect(job1CompletedResponses).toBeGreaterThanOrEqual(1);
+
+      await expect.poll(
+        async () =>
+          page.evaluate(() => {
+            const sessions = JSON.parse(localStorage.getItem("nbp_picker_sessions_v1") || "[]");
+            const session = sessions.find((item) => item.session_id === "pk_picker_hydration_race");
+            return session.items.filter((item) => !item.image_id).length;
+          }),
+        { timeout: 12000 }
+      ).toBeGreaterThanOrEqual(1);
+    } finally {
+      server.close();
+    }
   });
 
   test("stays interactive across next-group cycles under picker pressure and avoids original-image fetches before download", async ({ page }) => {

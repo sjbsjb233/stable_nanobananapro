@@ -7684,12 +7684,14 @@ function PickerSessionJobSync() {
   const addItems = usePickerStore((s) => s.addItems);
   const hydratedJobsRef = useRef<Record<string, true>>({});
   const hydratingJobsRef = useRef<Record<string, true>>({});
+  const tickRunningRef = useRef(false);
 
   const jobsById = useMemo(() => {
     const map = new Map<string, JobRecord>();
     jobs.forEach((job) => map.set(job.job_id, job));
     return map;
   }, [jobs]);
+  const jobsByIdRef = useLatestRef(jobsById);
 
   const pendingJobs = useMemo(() => {
     const map = new Map<
@@ -7724,6 +7726,7 @@ function PickerSessionJobSync() {
 
     return Array.from(map.values());
   }, [jobsById, sessions]);
+  const pendingJobsRef = useLatestRef(pendingJobs);
 
   useEffect(() => {
     const activeJobIds = new Set(pendingJobs.map((entry) => entry.job_id));
@@ -7736,12 +7739,12 @@ function PickerSessionJobSync() {
   }, [pendingJobs]);
 
   useEffect(() => {
-    if (!pendingJobs.length) return;
-
     const controller = new AbortController();
+    const readJobsById = () => jobsByIdRef.current;
+    const readPendingJobs = () => pendingJobsRef.current;
 
     const applySnapshot = (snap: JobStatusSnapshot) => {
-      const rec = jobsById.get(snap.job_id);
+      const rec = readJobsById().get(snap.job_id);
       updateJob(snap.job_id, {
         status_cache: (snap.status || rec?.status_cache || "UNKNOWN") as JobStatus,
         model_cache: (snap.model as ModelId) || rec?.model_cache,
@@ -7759,7 +7762,7 @@ function PickerSessionJobSync() {
         const meta = await client.getJob(entry.job_id, entry.job_access_token, controller.signal);
         updateJob(entry.job_id, {
           status_cache: (meta.status || "SUCCEEDED") as JobStatus,
-          model_cache: (meta.model as ModelId) || jobsById.get(entry.job_id)?.model_cache,
+          model_cache: (meta.model as ModelId) || readJobsById().get(entry.job_id)?.model_cache,
           last_seen_at: isoNow(),
           ...jobTimingPatch(meta),
         });
@@ -7778,7 +7781,7 @@ function PickerSessionJobSync() {
               imageIds.map((image_id) => ({
                 job_id: entry.job_id,
                 image_id,
-                job_access_token: entry.job_access_token || jobsById.get(entry.job_id)?.job_access_token,
+                job_access_token: entry.job_access_token || readJobsById().get(entry.job_id)?.job_access_token,
                 bucket: item.bucket || (item.pool === "PREFERRED" ? "PREFERRED" : "FILMSTRIP"),
                 pool: item.pool,
                 picked: item.picked,
@@ -7820,7 +7823,10 @@ function PickerSessionJobSync() {
     };
 
     const tick = async () => {
-      const unsettled = pendingJobs.filter((entry) => {
+      const latestPendingJobs = readPendingJobs();
+      if (!latestPendingJobs.length) return;
+
+      const unsettled = latestPendingJobs.filter((entry) => {
         const status = (useJobsStore.getState().jobs.find((job) => job.job_id === entry.job_id)?.status_cache || entry.status) as JobStatus;
         return status !== "SUCCEEDED" && status !== "FAILED";
       });
@@ -7841,7 +7847,7 @@ function PickerSessionJobSync() {
               const meta = await client.getJob(entry.job_id, entry.job_access_token, controller.signal);
               updateJob(entry.job_id, {
                 status_cache: (meta.status || "UNKNOWN") as JobStatus,
-                model_cache: (meta.model as ModelId) || jobsById.get(entry.job_id)?.model_cache,
+                model_cache: (meta.model as ModelId) || readJobsById().get(entry.job_id)?.model_cache,
                 last_seen_at: isoNow(),
                 ...jobTimingPatch(meta),
               });
@@ -7862,7 +7868,7 @@ function PickerSessionJobSync() {
               const meta = await client.getJob(entry.job_id, entry.job_access_token, controller.signal);
               updateJob(entry.job_id, {
                 status_cache: (meta.status || "UNKNOWN") as JobStatus,
-                model_cache: (meta.model as ModelId) || jobsById.get(entry.job_id)?.model_cache,
+                model_cache: (meta.model as ModelId) || readJobsById().get(entry.job_id)?.model_cache,
                 last_seen_at: isoNow(),
                 ...jobTimingPatch(meta),
               });
@@ -7874,7 +7880,7 @@ function PickerSessionJobSync() {
       }
 
       const latestJobs = new Map(useJobsStore.getState().jobs.map((job) => [job.job_id, job]));
-      const succeeded = pendingJobs.filter((entry) => {
+      const succeeded = readPendingJobs().filter((entry) => {
         const status = (latestJobs.get(entry.job_id)?.status_cache || entry.status || "UNKNOWN") as JobStatus;
         return status === "SUCCEEDED" && !hydratedJobsRef.current[entry.job_id];
       });
@@ -7886,21 +7892,24 @@ function PickerSessionJobSync() {
       }
     };
 
-    tick();
-    const hasActive = pendingJobs.some((entry) => {
-      const status = (jobsById.get(entry.job_id)?.status_cache || entry.status) as JobStatus;
-      return status !== "SUCCEEDED" && status !== "FAILED";
-    });
-    if (!hasActive) {
-      return () => controller.abort();
-    }
+    const runTick = async () => {
+      if (tickRunningRef.current) return;
+      tickRunningRef.current = true;
+      try {
+        await tick();
+      } finally {
+        tickRunningRef.current = false;
+      }
+    };
 
-    const timer = window.setInterval(tick, clamp(settings.polling.intervalMs || 1200, 800, 10000));
+    runTick();
+    const timer = window.setInterval(runTick, clamp(settings.polling.intervalMs || 1200, 800, 10000));
     return () => {
       controller.abort();
+      tickRunningRef.current = false;
       window.clearInterval(timer);
     };
-  }, [addItems, client, jobsById, patchSession, pendingJobs, settings.polling.concurrency, settings.polling.intervalMs, updateJob]);
+  }, [addItems, client, patchSession, settings.polling.concurrency, settings.polling.intervalMs, updateJob]);
 
   return null;
 }
@@ -7937,10 +7946,17 @@ function FailedBatchSessionCleanup() {
 function PendingSessionDirectHydrator() {
   const client = useApiClient();
   const settings = useSettingsStore((s) => s.settings);
+  const jobs = useJobsStore((s) => s.jobs);
   const sessions = usePickerStore((s) => s.sessions);
   const patchSession = usePickerStore((s) => s.patchSession);
   const addItems = usePickerStore((s) => s.addItems);
   const updateJob = useJobsStore((s) => s.updateJob);
+  const tickRunningRef = useRef(false);
+  const jobsById = useMemo(() => {
+    const map = new Map<string, JobRecord>();
+    jobs.forEach((job) => map.set(job.job_id, job));
+    return map;
+  }, [jobs]);
 
   const pendingEntries = useMemo(() => {
     const map = new Map<
@@ -7955,6 +7971,8 @@ function PendingSessionDirectHydrator() {
     sessions.forEach((session) => {
       session.items.forEach((item) => {
         if (pickerItemHasImage(item)) return;
+        const job = jobsById.get(item.job_id);
+        if (job?.status_cache && job.status_cache !== "UNKNOWN") return;
         const key = pickerItemKey(item);
         const found = map.get(item.job_id);
         if (found) {
@@ -7971,14 +7989,17 @@ function PendingSessionDirectHydrator() {
     });
 
     return Array.from(map.values());
-  }, [sessions]);
+  }, [jobsById, sessions]);
+  const pendingEntriesRef = useLatestRef(pendingEntries);
 
   useEffect(() => {
-    if (!pendingEntries.length) return;
     const controller = new AbortController();
 
     const tick = async () => {
-      await mapLimit(pendingEntries, 2, async (entry) => {
+      const latestPendingEntries = pendingEntriesRef.current;
+      if (!latestPendingEntries.length) return;
+
+      await mapLimit(latestPendingEntries, 2, async (entry) => {
         try {
           const meta = await client.getJob(entry.job_id, entry.job_access_token, controller.signal);
           const nextStatus = (meta.status || "UNKNOWN") as JobStatus;
@@ -8055,13 +8076,24 @@ function PendingSessionDirectHydrator() {
       });
     };
 
-    tick();
-    const timer = window.setInterval(tick, clamp(settings.polling.intervalMs || 1200, 800, 10000));
+    const runTick = async () => {
+      if (tickRunningRef.current) return;
+      tickRunningRef.current = true;
+      try {
+        await tick();
+      } finally {
+        tickRunningRef.current = false;
+      }
+    };
+
+    runTick();
+    const timer = window.setInterval(runTick, clamp(settings.polling.intervalMs || 1200, 800, 10000));
     return () => {
       controller.abort();
+      tickRunningRef.current = false;
       window.clearInterval(timer);
     };
-  }, [addItems, client, patchSession, pendingEntries, settings.polling.intervalMs, updateJob]);
+  }, [addItems, client, patchSession, settings.polling.intervalMs, updateJob]);
 
   return null;
 }
@@ -10325,6 +10357,14 @@ function LoadingRing({ className }: { className?: string }) {
       )}
     />
   );
+}
+
+function useLatestRef<T>(value: T) {
+  const ref = useRef(value);
+  useEffect(() => {
+    ref.current = value;
+  }, [value]);
+  return ref;
 }
 
 function PickerPendingVisual({ status }: { status: JobStatus }) {
