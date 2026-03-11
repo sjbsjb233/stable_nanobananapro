@@ -155,6 +155,16 @@ srv/stable/
 
 说明：`srv/` 已在 `.gitignore` 中忽略，仅作本地环境使用。
 
+前端 Docker 运行时配置：
+
+- `FRONTEND_DEFAULT_API_BASE_URL`
+- `FRONTEND_TURNSTILE_SITE_KEY`
+
+说明：
+
+- `FRONTEND_TURNSTILE_SITE_KEY` 由前端容器启动时写入 `runtime-config.js`
+- 这和后端的 `TURNSTILE_SITE_KEY` 不是同一条配置链路；改后端 env 不会自动改前端登录页使用的 site key
+
 ### 2. 构建本地仿真镜像（推荐用脚本）
 
 使用脚本：[`scripts/build-local-sim-images.sh`](./scripts/build-local-sim-images.sh)

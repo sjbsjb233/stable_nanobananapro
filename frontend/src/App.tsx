@@ -550,6 +550,7 @@ declare global {
   interface Window {
     __NBP_RUNTIME_CONFIG__?: {
       apiBaseUrl?: string;
+      turnstileSiteKey?: string;
     };
     turnstile?: {
       render: (container: HTMLElement, options: Record<string, any>) => string | number;
@@ -1481,7 +1482,13 @@ function useDebounced<T>(value: T, ms: number) {
 const ENV_BASE_URL = (import.meta.env.VITE_API_BASE_URL || "").trim();
 const RUNTIME_BASE_URL =
   typeof window !== "undefined" ? (window.__NBP_RUNTIME_CONFIG__?.apiBaseUrl || "").trim() : "";
-const TURNSTILE_SITE_KEY = (import.meta.env.VITE_TURNSTILE_SITE_KEY || "0x4AAAAAACoBxRJwxj2oUZDc").trim();
+const RUNTIME_TURNSTILE_SITE_KEY =
+  typeof window !== "undefined" ? (window.__NBP_RUNTIME_CONFIG__?.turnstileSiteKey || "").trim() : "";
+const TURNSTILE_SITE_KEY = (
+  RUNTIME_TURNSTILE_SITE_KEY ||
+  import.meta.env.VITE_TURNSTILE_SITE_KEY ||
+  "0x4AAAAAACoBxRJwxj2oUZDc"
+).trim();
 const FALLBACK_BASE_URL =
   typeof window !== "undefined"
     ? `${window.location.protocol}//${window.location.hostname}:8000`

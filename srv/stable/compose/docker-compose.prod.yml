@@ -15,6 +15,7 @@ services:
     image: ${REGISTRY}/stable-frontend:${TAG}
     environment:
       FRONTEND_DEFAULT_API_BASE_URL: ${FRONTEND_DEFAULT_API_BASE_URL:-http://127.0.0.1:8000}
+      FRONTEND_TURNSTILE_SITE_KEY: ${FRONTEND_TURNSTILE_SITE_KEY:-}
     ports:
       - "5178:80"
     depends_on:
