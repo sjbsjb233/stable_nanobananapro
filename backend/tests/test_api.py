@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import io
+import json
 import threading
 import time
 from pathlib import Path
@@ -11,9 +12,10 @@ from fastapi.testclient import TestClient
 from PIL import Image
 
 from app.config import settings
-from app.gemini_client import GeminiError
+from app.gemini_client import GeminiError, gemini_client
 from app.job_manager import job_manager
 from app.main import app
+from app.provider_store import provider_store
 from app.rate_limiter import InMemoryRateLimiter
 from app.storage import storage
 from app.user_store import user_store
@@ -52,6 +54,8 @@ def client(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> TestClient:
     storage.jobs_dir = tmp_path / "jobs"
     storage.jobs_dir.mkdir(parents=True, exist_ok=True)
     user_store.path = tmp_path / "auth" / "users.json"
+    provider_store.path = tmp_path / "providers.json"
+    provider_store.reset_runtime_state()
 
     async def fake_turnstile(token: str, remote_ip: str | None = None):
         assert token
@@ -241,6 +245,168 @@ def test_job_lifecycle(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> N
     assert deleted.status_code == 200
     not_found = client.get(f"/v1/jobs/{job_id}")
     assert not_found.status_code == 404
+
+
+def test_multi_provider_prefers_cheaper_then_falls_back(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        settings,
+        "upstream_providers_json",
+        json.dumps(
+            [
+                {
+                    "provider_id": "cheap-gemini",
+                    "label": "Cheap Gemini",
+                    "adapter_type": "gemini_v1beta",
+                    "base_url": "http://cheap.example/v1beta",
+                    "api_key": "cheap-key",
+                    "cost_per_image_cny": 0.05,
+                    "initial_balance_cny": 10,
+                    "supported_models": ["gemini-3-pro-image-preview"],
+                },
+                {
+                    "provider_id": "mmw-backup",
+                    "label": "MMW Backup",
+                    "adapter_type": "openai_chat_image",
+                    "base_url": "https://api.example",
+                    "api_key": "backup-key",
+                    "cost_per_image_cny": 0.09,
+                    "initial_balance_cny": 20,
+                    "supported_models": ["gemini-3-pro-image-preview"],
+                },
+            ]
+        ),
+    )
+    provider_store.ensure_initialized()
+
+    def fail_cheap(*args, **kwargs):
+        raise GeminiError(code="UPSTREAM_TIMEOUT", message="cheap timeout", retryable=True)
+
+    def succeed_backup(*args, **kwargs):
+        return {
+            "raw": {
+                "choices": [
+                    {
+                        "message": {
+                            "content": "![Generated Image](https://example.invalid/image.png)",
+                        },
+                        "finish_reason": "stop",
+                    }
+                ]
+            },
+            "images": [{"mime": "image/png", "bytes": PNG_1X1}],
+            "usage_metadata": {"promptTokenCount": 12, "candidatesTokenCount": 4, "totalTokenCount": 16},
+            "finish_reason": "STOP",
+            "safety_ratings": [],
+            "latency_ms": 234,
+            "upstream_model": "[A]gemini-3-pro-image-preview",
+        }
+
+    monkeypatch.setattr(gemini_client, "_call_gemini_v1beta", fail_cheap)
+    monkeypatch.setattr(gemini_client, "_call_openai_chat_image", succeed_backup)
+
+    login(client)
+    created = client.post(
+        "/v1/jobs",
+        json={
+            "prompt": "fallback prompt",
+            "model": "gemini-3-pro-image-preview",
+            "params": {
+                "aspect_ratio": "1:1",
+                "image_size": "1K",
+                "temperature": 0.6,
+                "timeout_sec": 60,
+                "max_retries": 2,
+            },
+            "mode": "IMAGE_ONLY",
+        },
+    )
+    assert created.status_code == 201
+    job_id = created.json()["job_id"]
+
+    meta = None
+    for _ in range(40):
+        resp = client.get(f"/v1/jobs/{job_id}")
+        assert resp.status_code == 200
+        meta = resp.json()
+        if meta["status"] in {"SUCCEEDED", "FAILED"}:
+            break
+        time.sleep(0.1)
+
+    assert meta is not None
+    assert meta["status"] == "SUCCEEDED"
+    assert meta["response"]["provider"]["provider_id"] == "mmw-backup"
+    assert meta["response"]["provider_attempts"][0]["provider_id"] == "cheap-gemini"
+
+    providers = client.get("/v1/admin/providers")
+    assert providers.status_code == 200
+    payload = providers.json()
+    cheap = next(item for item in payload["providers"] if item["provider_id"] == "cheap-gemini")
+    backup = next(item for item in payload["providers"] if item["provider_id"] == "mmw-backup")
+    assert cheap["fail_count"] >= 1
+    assert backup["success_count"] >= 1
+
+
+def test_admin_provider_management_and_balance_updates(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        settings,
+        "upstream_providers_json",
+        json.dumps(
+            [
+                {
+                    "provider_id": "mmw",
+                    "label": "MMW",
+                    "adapter_type": "openai_chat_image",
+                    "base_url": "https://api.mmw.ink",
+                    "api_key": "k1",
+                    "cost_per_image_cny": 0.09,
+                    "initial_balance_cny": 21.5,
+                    "supported_models": ["gemini-2.5-flash-image", "gemini-3-pro-image-preview"],
+                    "note": "main",
+                },
+                {
+                    "provider_id": "zx2",
+                    "label": "ZX2",
+                    "adapter_type": "gemini_v1beta",
+                    "base_url": "http://zx2.example/v1beta",
+                    "api_key": "k2",
+                    "cost_per_image_cny": 0.05,
+                    "initial_balance_cny": 10,
+                    "supported_models": ["gemini-3.1-flash-image-preview"],
+                    "note": "cheap",
+                },
+            ]
+        ),
+    )
+    provider_store.ensure_initialized()
+
+    login(client)
+
+    listed = client.get("/v1/admin/providers")
+    assert listed.status_code == 200
+    body = listed.json()
+    assert body["providers_total"] == 2
+    assert body["providers_enabled"] == 2
+
+    updated = client.patch("/v1/admin/providers/zx2", json={"enabled": False, "note": "maintenance"})
+    assert updated.status_code == 200
+    assert updated.json()["provider"]["enabled"] is False
+    assert updated.json()["provider"]["note"] == "maintenance"
+
+    set_balance = client.post("/v1/admin/providers/mmw/balance/set", json={"amount_cny": 18.5})
+    assert set_balance.status_code == 200
+    assert set_balance.json()["provider"]["remaining_balance_cny"] == 18.5
+
+    add_balance = client.post("/v1/admin/providers/mmw/balance/add", json={"delta_cny": 1.25})
+    assert add_balance.status_code == 200
+    assert add_balance.json()["provider"]["remaining_balance_cny"] == 19.75
+
+    overview = client.get("/v1/admin/overview")
+    assert overview.status_code == 200
+    assert overview.json()["providers"]["providers_total"] == 2
+    assert overview.json()["providers"]["providers_enabled"] == 1
+
+    gone = client.get("/v1/billing/google/remaining")
+    assert gone.status_code == 410
 
 
 def test_preview_access_does_not_consume_original_image_quota_and_supports_batch_fetch(

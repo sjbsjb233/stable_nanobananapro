@@ -392,24 +392,6 @@ type ModelsPayload = {
   models: ModelCapability[];
 };
 
-// Admin billing
-
-type BillingSummary = {
-  budget_usd?: number;
-  spent_usd?: number;
-  remaining_usd?: number;
-  last_updated_at?: string;
-  mode?: string;
-  [k: string]: any;
-};
-
-type GoogleRemaining = {
-  google_remaining_usd?: number;
-  notes?: string;
-  last_updated_at?: string;
-  [k: string]: any;
-};
-
 type UserRole = "ADMIN" | "USER";
 
 type UserPolicy = {
@@ -490,7 +472,65 @@ type AdminSystemOverview = {
 type AdminOverviewResponse = {
   system: AdminSystemOverview;
   policy: SystemPolicy;
-  billing: BillingSummary;
+  providers: ProviderSummary;
+};
+
+type ProviderCallSample = {
+  ts: string;
+  success: boolean;
+  latency_ms: number;
+  error_code?: string | null;
+};
+
+type ProviderSnapshot = {
+  provider_id: string;
+  label: string;
+  adapter_type: string;
+  base_url: string;
+  enabled: boolean;
+  note: string;
+  supported_models: string[];
+  cost_per_image_cny: number;
+  remaining_balance_cny?: number | null;
+  quota_state: string;
+  quota_confidence: number;
+  quota_score: number;
+  success_count: number;
+  fail_count: number;
+  consecutive_failures: number;
+  last_fail_reason?: string | null;
+  last_success_time?: string | null;
+  last_fail_time?: string | null;
+  cooldown_until?: string | null;
+  cooldown_active: boolean;
+  circuit_open_count: number;
+  success_rate_estimated: number;
+  recent_success_rate: number;
+  final_success_rate: number;
+  health_score: number;
+  effective_cost: number;
+  active_requests: number;
+  max_concurrency: number;
+  latency_p50_ms?: number | null;
+  latency_p95_ms?: number | null;
+  timeout_rate: number;
+  total_spent_cny: number;
+  total_generated_images: number;
+  balance_updated_at?: string | null;
+  last_selected_time?: string | null;
+  recent_calls: ProviderCallSample[];
+};
+
+type ProviderSummary = {
+  currency: string;
+  providers_total: number;
+  providers_enabled: number;
+  providers_healthy: number;
+  providers_cooldown: number;
+  remaining_balance_cny: number;
+  spent_cny: number;
+  last_updated_at?: string;
+  providers: ProviderSnapshot[];
 };
 
 type AdminUserItem = {
@@ -3086,16 +3126,12 @@ class ApiClient {
   }
 
   // Admin
-  billingSummary(signal?: AbortSignal) {
-    return this.request<BillingSummary>("/billing/summary", { method: "GET", signal });
-  }
-
-  billingGoogleRemaining(signal?: AbortSignal) {
-    return this.request<GoogleRemaining>("/billing/google/remaining", { method: "GET", signal });
-  }
-
   adminOverview(signal?: AbortSignal) {
     return this.request<AdminOverviewResponse>("/admin/overview", { method: "GET", signal });
+  }
+
+  adminProviders(signal?: AbortSignal) {
+    return this.request<ProviderSummary>("/admin/providers", { method: "GET", signal });
   }
 
   adminUsers(signal?: AbortSignal) {
@@ -3147,6 +3183,40 @@ class ApiClient {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
+      signal,
+    });
+  }
+
+  adminUpdateProvider(
+    providerId: string,
+    payload: {
+      enabled?: boolean;
+      note?: string;
+    },
+    signal?: AbortSignal
+  ) {
+    return this.request<{ provider: ProviderSnapshot }>(`/admin/providers/${encodeURIComponent(providerId)}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+      signal,
+    });
+  }
+
+  adminSetProviderBalance(providerId: string, amount_cny: number | null, signal?: AbortSignal) {
+    return this.request<{ provider: ProviderSnapshot }>(`/admin/providers/${encodeURIComponent(providerId)}/balance/set`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ amount_cny }),
+      signal,
+    });
+  }
+
+  adminAddProviderBalance(providerId: string, delta_cny: number, signal?: AbortSignal) {
+    return this.request<{ provider: ProviderSnapshot }>(`/admin/providers/${encodeURIComponent(providerId)}/balance/add`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ delta_cny }),
       signal,
     });
   }
@@ -4380,7 +4450,7 @@ function useDashboardData() {
 
   const [refreshing, setRefreshing] = useState(false);
   const [stats, setStats] = useState<DashboardStat | null>(null);
-  const [admin, setAdmin] = useState<{ summary?: BillingSummary; google?: GoogleRemaining } | null>(null);
+  const [admin, setAdmin] = useState<ProviderSummary | null>(null);
 
   const refresh = async ({ manual = false }: { manual?: boolean } = {}) => {
     const today = new Date().toISOString().slice(0, 10);
@@ -4484,11 +4554,8 @@ function useDashboardData() {
 
       if (isAdmin) {
         try {
-          const [summary, google] = await Promise.all([
-            client.billingSummary(),
-            client.billingGoogleRemaining().catch(() => null as any),
-          ]);
-          setAdmin({ summary, google: google || undefined });
+          const providers = await client.adminProviders();
+          setAdmin(providers);
         } catch (e: any) {
           setAdmin(null);
         }
@@ -4709,25 +4776,25 @@ function DashboardPage() {
           <Card>
             <div>
               <div className="text-sm font-bold text-zinc-900 dark:text-zinc-50">管理视图</div>
-              <div className="text-xs text-zinc-600 dark:text-zinc-300">系统账单和运行状态摘要。</div>
+              <div className="text-xs text-zinc-600 dark:text-zinc-300">多中转站余额与运行状态摘要。</div>
             </div>
             <Divider />
             {!admin ? (
               <EmptyHint text="管理数据暂不可用" />
             ) : (
               <div className="space-y-3">
-                <KeyValue k="Budget" v={currency(admin.summary?.budget_usd)} />
-                <KeyValue k="Spent" v={currency(admin.summary?.spent_usd)} />
-                <KeyValue k="Remaining" v={currency(admin.summary?.remaining_usd)} />
+                <KeyValue k="Providers" v={String(admin.providers_total)} />
+                <KeyValue k="Healthy" v={String(admin.providers_healthy)} />
+                <KeyValue k="Spent" v={`${numberish(admin.spent_cny)} CNY`} />
+                <KeyValue k="Remaining" v={`${numberish(admin.remaining_balance_cny)} CNY`} />
                 <div className="text-xs text-zinc-500 dark:text-zinc-400">
-                  {admin.summary?.mode ? `Mode: ${admin.summary.mode}` : ""}
-                  {admin.summary?.last_updated_at ? ` · ${formatLocal(admin.summary.last_updated_at)}` : ""}
+                  {admin.last_updated_at ? `Updated: ${formatLocal(admin.last_updated_at)}` : ""}
                 </div>
                 <Divider />
-                <KeyValue k="Google Remaining" v={currency(admin.google?.google_remaining_usd)} />
-                {admin.google?.notes ? (
-                  <div className="text-xs text-zinc-600 dark:text-zinc-300">{admin.google.notes}</div>
-                ) : null}
+                <MiniList
+                  title="Provider 状态"
+                  items={admin.providers.map((item) => ({ name: item.label, value: item.enabled && !item.cooldown_active ? 1 : 0 })).slice(0, 6)}
+                />
               </div>
             )}
           </Card>
@@ -5055,6 +5122,12 @@ function AdminPage() {
   const [overview, setOverview] = useState<AdminOverviewResponse | null>(null);
   const [users, setUsers] = useState<AdminUserItem[]>([]);
   const [selectedUserId, setSelectedUserId] = useState<string | null>(null);
+  const [providerNotes, setProviderNotes] = useState<Record<string, string>>({});
+  const [providerEnabledDrafts, setProviderEnabledDrafts] = useState<Record<string, boolean>>({});
+  const [providerSetBalanceDrafts, setProviderSetBalanceDrafts] = useState<Record<string, string>>({});
+  const [providerAddBalanceDrafts, setProviderAddBalanceDrafts] = useState<Record<string, string>>({});
+  const [savingProviderId, setSavingProviderId] = useState<string | null>(null);
+  const [savingProviderBalanceId, setSavingProviderBalanceId] = useState<string | null>(null);
 
   const [policyDraft, setPolicyDraft] = useState<SystemPolicy | null>(null);
   const [savingPolicy, setSavingPolicy] = useState(false);
@@ -5093,6 +5166,14 @@ function AdminPage() {
     return Math.max(0, Math.round(parsed));
   };
 
+  const parseOptionalMoney = (value: string) => {
+    const raw = value.trim();
+    if (!raw) return null;
+    const parsed = Number(raw);
+    if (!Number.isFinite(parsed)) return null;
+    return Math.max(0, Number(parsed.toFixed(4)));
+  };
+
   const loadAdminData = async ({ silent = false }: { silent?: boolean } = {}) => {
     if (!silent) setLoading(true);
     setRefreshing(true);
@@ -5103,6 +5184,13 @@ function AdminPage() {
       ]);
       setOverview(overviewPayload);
       setPolicyDraft(overviewPayload.policy);
+      const providerItems = overviewPayload.providers?.providers || [];
+      setProviderNotes(Object.fromEntries(providerItems.map((item) => [item.provider_id, item.note || ""])));
+      setProviderEnabledDrafts(Object.fromEntries(providerItems.map((item) => [item.provider_id, Boolean(item.enabled)])));
+      setProviderSetBalanceDrafts(
+        Object.fromEntries(providerItems.map((item) => [item.provider_id, item.remaining_balance_cny == null ? "" : String(item.remaining_balance_cny)]))
+      );
+      setProviderAddBalanceDrafts((prev) => Object.fromEntries(providerItems.map((item) => [item.provider_id, prev[item.provider_id] || ""])));
       const nextUsers = [...(usersPayload.users || [])].sort((a, b) => a.username.localeCompare(b.username));
       setUsers(nextUsers);
       setSelectedUserId((current) => current || nextUsers[0]?.user_id || null);
@@ -5277,6 +5365,54 @@ function AdminPage() {
     }
   };
 
+  const saveProvider = async (providerId: string) => {
+    setSavingProviderId(providerId);
+    try {
+      await client.adminUpdateProvider(providerId, {
+        enabled: providerEnabledDrafts[providerId],
+        note: providerNotes[providerId] || "",
+      });
+      await loadAdminData({ silent: true });
+      push({ kind: "success", title: `已更新 ${providerId}` });
+    } catch (e: any) {
+      push({ kind: "error", title: "Provider 更新失败", message: getApiErrorMessage(e, "请稍后重试") });
+    } finally {
+      setSavingProviderId(null);
+    }
+  };
+
+  const setProviderBalance = async (providerId: string) => {
+    setSavingProviderBalanceId(`set:${providerId}`);
+    try {
+      await client.adminSetProviderBalance(providerId, parseOptionalMoney(providerSetBalanceDrafts[providerId] || ""));
+      await loadAdminData({ silent: true });
+      push({ kind: "success", title: `已设置 ${providerId} 余额` });
+    } catch (e: any) {
+      push({ kind: "error", title: "余额设置失败", message: getApiErrorMessage(e, "请检查金额") });
+    } finally {
+      setSavingProviderBalanceId(null);
+    }
+  };
+
+  const addProviderBalance = async (providerId: string) => {
+    const delta = parseOptionalMoney(providerAddBalanceDrafts[providerId] || "");
+    if (delta == null || delta <= 0) {
+      push({ kind: "error", title: "请输入大于 0 的充值金额" });
+      return;
+    }
+    setSavingProviderBalanceId(`add:${providerId}`);
+    try {
+      await client.adminAddProviderBalance(providerId, delta);
+      setProviderAddBalanceDrafts((prev) => ({ ...prev, [providerId]: "" }));
+      await loadAdminData({ silent: true });
+      push({ kind: "success", title: `已为 ${providerId} 增加余额` });
+    } catch (e: any) {
+      push({ kind: "error", title: "余额增加失败", message: getApiErrorMessage(e, "请检查金额") });
+    } finally {
+      setSavingProviderBalanceId(null);
+    }
+  };
+
   return (
     <PageContainer>
       <PageTitle
@@ -5311,20 +5447,20 @@ function AdminPage() {
           <Divider />
           <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
             <div className="rounded-2xl border border-zinc-200 bg-white/60 p-3 dark:border-white/10 dark:bg-zinc-950/30">
-              <div className="text-xs font-semibold uppercase tracking-[0.18em] text-zinc-500 dark:text-zinc-400">Billing</div>
+              <div className="text-xs font-semibold uppercase tracking-[0.18em] text-zinc-500 dark:text-zinc-400">Providers</div>
               <div className="mt-3 grid grid-cols-2 gap-2 text-xs">
-                <KeyValue k="budget" v={currency(overview?.billing.budget_usd)} />
-                <KeyValue k="spent" v={currency(overview?.billing.spent_usd)} />
-                <KeyValue k="remaining" v={currency(overview?.billing.remaining_usd)} />
-                <KeyValue k="mode" v={overview?.billing.mode || "-"} />
+                <KeyValue k="enabled" v={String(overview?.providers.providers_enabled ?? "-")} />
+                <KeyValue k="healthy" v={String(overview?.providers.providers_healthy ?? "-")} />
+                <KeyValue k="cooldown" v={String(overview?.providers.providers_cooldown ?? "-")} />
+                <KeyValue k="remaining" v={`${numberish(overview?.providers.remaining_balance_cny)} CNY`} />
               </div>
             </div>
             <div className="rounded-2xl border border-zinc-200 bg-white/60 p-3 dark:border-white/10 dark:bg-zinc-950/30">
-              <div className="text-xs font-semibold uppercase tracking-[0.18em] text-zinc-500 dark:text-zinc-400">Timeline</div>
+              <div className="text-xs font-semibold uppercase tracking-[0.18em] text-zinc-500 dark:text-zinc-400">Runtime</div>
               <div className="mt-3 space-y-2 text-xs text-zinc-600 dark:text-zinc-300">
                 <div>部署时间：{formatLocal(overview?.system.deployed_at)}</div>
                 <div>当前时间：{formatLocal(overview?.system.now)}</div>
-                <div>账单更新时间：{formatLocal(overview?.billing.last_updated_at)}</div>
+                <div>Provider 更新时间：{formatLocal(overview?.providers.last_updated_at)}</div>
               </div>
             </div>
           </div>
@@ -5372,6 +5508,127 @@ function AdminPage() {
           )}
         </Card>
       </div>
+
+      <Card className="mt-4">
+        <div className="flex items-center justify-between gap-3">
+          <div>
+            <div className="text-sm font-bold text-zinc-900 dark:text-zinc-50">中转站状态</div>
+            <div className="text-xs text-zinc-600 dark:text-zinc-300">手动控制启用、备注和余额；运行状态来自后端调度器实时统计。</div>
+          </div>
+          <div className="rounded-full border border-zinc-200 bg-zinc-50 px-3 py-1 text-xs font-semibold text-zinc-600 dark:border-white/10 dark:bg-zinc-950/40 dark:text-zinc-300">
+            {overview?.providers.providers_total ?? 0} providers
+          </div>
+        </div>
+
+        <div className="mt-3 space-y-3">
+          {(overview?.providers.providers || []).length ? (overview?.providers.providers || []).map((provider) => (
+            <div
+              key={provider.provider_id}
+              className="rounded-2xl border border-zinc-200 bg-white/60 p-4 dark:border-white/10 dark:bg-zinc-950/30"
+            >
+              <div className="flex flex-col gap-3 xl:flex-row xl:items-start xl:justify-between">
+                <div className="min-w-0 flex-1">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <div className="text-sm font-bold text-zinc-900 dark:text-zinc-50">{provider.label}</div>
+                    <span className="rounded-full border border-zinc-200 px-2 py-0.5 text-[10px] font-semibold text-zinc-600 dark:border-white/10 dark:text-zinc-300">
+                      {provider.provider_id}
+                    </span>
+                    <span className="rounded-full border border-zinc-200 px-2 py-0.5 text-[10px] font-semibold text-zinc-600 dark:border-white/10 dark:text-zinc-300">
+                      {provider.adapter_type}
+                    </span>
+                    <span className={cn(
+                      "rounded-full px-2 py-0.5 text-[10px] font-semibold",
+                      provider.cooldown_active
+                        ? "bg-amber-100 text-amber-700 dark:bg-amber-500/20 dark:text-amber-200"
+                        : provider.enabled
+                          ? "bg-emerald-100 text-emerald-700 dark:bg-emerald-500/20 dark:text-emerald-200"
+                          : "bg-zinc-200 text-zinc-700 dark:bg-zinc-800 dark:text-zinc-200"
+                    )}>
+                      {provider.cooldown_active ? "cooldown" : provider.enabled ? "enabled" : "disabled"}
+                    </span>
+                  </div>
+                  <div className="mt-2 break-all text-xs text-zinc-500 dark:text-zinc-400">{provider.base_url}</div>
+                  <div className="mt-3 grid grid-cols-2 gap-2 text-xs md:grid-cols-4">
+                    <KeyValue k="cost" v={`${numberish(provider.cost_per_image_cny)} CNY`} />
+                    <KeyValue k="balance" v={provider.remaining_balance_cny == null ? "unknown" : `${numberish(provider.remaining_balance_cny)} CNY`} />
+                    <KeyValue k="quota" v={provider.quota_state} />
+                    <KeyValue k="active" v={`${provider.active_requests}/${provider.max_concurrency}`} />
+                    <KeyValue k="success" v={`${Math.round(provider.final_success_rate * 100)}%`} />
+                    <KeyValue k="fails" v={`${provider.fail_count} (${provider.consecutive_failures} 连续)`} />
+                    <KeyValue k="p50" v={provider.latency_p50_ms == null ? "-" : `${Math.round(provider.latency_p50_ms)} ms`} />
+                    <KeyValue k="p95" v={provider.latency_p95_ms == null ? "-" : `${Math.round(provider.latency_p95_ms)} ms`} />
+                  </div>
+                  <div className="mt-3 text-[11px] text-zinc-500 dark:text-zinc-400">
+                    models: {provider.supported_models.join(", ") || "-"}
+                  </div>
+                  <div className="mt-1 text-[11px] text-zinc-500 dark:text-zinc-400">
+                    last_success: {formatLocal(provider.last_success_time)} · last_fail: {formatLocal(provider.last_fail_time)} · reason: {provider.last_fail_reason || "-"}
+                  </div>
+                </div>
+
+                <div className="grid min-w-0 gap-2 xl:w-[420px] xl:grid-cols-2">
+                  <Field label="enabled">
+                    <div className="flex h-[42px] items-center">
+                      <Switch
+                        value={providerEnabledDrafts[provider.provider_id] ?? provider.enabled}
+                        onChange={(value) => setProviderEnabledDrafts((prev) => ({ ...prev, [provider.provider_id]: value }))}
+                      />
+                    </div>
+                  </Field>
+                  <Field label="note">
+                    <Input
+                      value={providerNotes[provider.provider_id] ?? provider.note ?? ""}
+                      onChange={(value) => setProviderNotes((prev) => ({ ...prev, [provider.provider_id]: value }))}
+                      placeholder="备注"
+                    />
+                  </Field>
+                  <Field label="set balance (CNY)">
+                    <div className="flex gap-2">
+                      <Input
+                        value={providerSetBalanceDrafts[provider.provider_id] ?? ""}
+                        onChange={(value) => setProviderSetBalanceDrafts((prev) => ({ ...prev, [provider.provider_id]: value }))}
+                        placeholder="可留空设为 unknown"
+                      />
+                      <Button
+                        variant="secondary"
+                        onClick={() => setProviderBalance(provider.provider_id)}
+                        disabled={savingProviderBalanceId === `set:${provider.provider_id}`}
+                      >
+                        {savingProviderBalanceId === `set:${provider.provider_id}` ? "设置中…" : "设置"}
+                      </Button>
+                    </div>
+                  </Field>
+                  <Field label="add balance (CNY)">
+                    <div className="flex gap-2">
+                      <Input
+                        value={providerAddBalanceDrafts[provider.provider_id] ?? ""}
+                        onChange={(value) => setProviderAddBalanceDrafts((prev) => ({ ...prev, [provider.provider_id]: value }))}
+                        placeholder="充值金额"
+                      />
+                      <Button
+                        variant="secondary"
+                        onClick={() => addProviderBalance(provider.provider_id)}
+                        disabled={savingProviderBalanceId === `add:${provider.provider_id}`}
+                      >
+                        {savingProviderBalanceId === `add:${provider.provider_id}` ? "增加中…" : "增加"}
+                      </Button>
+                    </div>
+                  </Field>
+                  <div className="xl:col-span-2 flex justify-end">
+                    <Button
+                      variant="primary"
+                      onClick={() => saveProvider(provider.provider_id)}
+                      disabled={savingProviderId === provider.provider_id}
+                    >
+                      {savingProviderId === provider.provider_id ? "保存中…" : "保存 Provider"}
+                    </Button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          )) : <EmptyHint text="暂无 provider 配置" />}
+        </div>
+      </Card>
 
       <div className="mt-4 grid grid-cols-1 gap-3 xl:grid-cols-[0.92fr_1.08fr]">
         <Card>
@@ -7323,18 +7580,6 @@ function CreateJobPage() {
                     step={1}
                     value={timeoutSec}
                     onChange={(e) => setTimeoutSec(Number(e.target.value))}
-                    className="w-full"
-                  />
-                </Field>
-
-                <Field label={<span className="inline-flex items-center gap-1.5">max_retries ({maxRetries}) <HelpTip text="当上游请求失败时，后端会自动重试的次数。设为 0 表示失败后立即返回，不再自动补试。" /></span>}>
-                  <input
-                    type="range"
-                    min={0}
-                    max={3}
-                    step={1}
-                    value={maxRetries}
-                    onChange={(e) => setMaxRetries(Number(e.target.value))}
                     className="w-full"
                   />
                 </Field>

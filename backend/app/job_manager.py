@@ -708,7 +708,7 @@ class JobManager:
                 if file_path.exists():
                     refs.append(ReferenceImage(mime_type=mime, data=file_path.read_bytes()))
 
-        attempts = 1 + int(params.get("max_retries", 0))
+        attempts = 1
         last_error: GeminiError | None = None
 
         for attempt in range(attempts):
@@ -882,6 +882,8 @@ class JobManager:
             "latency_ms": output.get("latency_ms", 0),
             "finish_reason": output.get("finish_reason", "OTHER"),
             "safety_ratings": output.get("safety_ratings", []),
+            "provider": output.get("provider"),
+            "provider_attempts": output.get("provider_attempts", []),
             "raw_summary": {
                 "parts_count": parts_count,
                 "has_inline_image": bool(image_metas),
@@ -900,6 +902,8 @@ class JobManager:
             "latency_ms": output.get("latency_ms", 0),
             "finish_reason": output.get("finish_reason", "OTHER"),
             "safety_ratings": output.get("safety_ratings", []),
+            "provider": output.get("provider"),
+            "provider_attempts": output.get("provider_attempts", []),
         }
         meta["error"] = None
         storage.save_meta(job_id, meta)

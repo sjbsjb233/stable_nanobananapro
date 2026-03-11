@@ -19,6 +19,7 @@ class Settings(BaseSettings):
     gemini_api_key: str = Field(default="", alias="GEMINI_API_KEY")
     gemini_api_base_url: str = Field(default="https://generativelanguage.googleapis.com/v1beta", alias="GEMINI_API_BASE_URL")
     gemini_http_proxy: str = Field(default="", alias="GEMINI_HTTP_PROXY")
+    upstream_providers_json: str = Field(default="", alias="UPSTREAM_PROVIDERS_JSON")
     default_model: str = Field(default=DEFAULT_MODEL_ID, alias="DEFAULT_MODEL")
 
     data_dir: Path = Field(default=Path("./data"), alias="DATA_DIR")

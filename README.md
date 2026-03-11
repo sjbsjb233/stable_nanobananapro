@@ -90,6 +90,44 @@ npm run dev
 - `DEFAULT_USER_TURNSTILE_JOB_COUNT_THRESHOLD`
 - `DEFAULT_USER_TURNSTILE_DAILY_USAGE_THRESHOLD`
 
+新增多中转站调度配置：
+
+- `UPSTREAM_PROVIDERS_JSON`
+
+示例：
+
+```json
+[
+  {
+    "provider_id": "mmw",
+    "label": "MMW",
+    "adapter_type": "openai_chat_image",
+    "base_url": "https://api.mmw.ink",
+    "api_key": "sk-xxx",
+    "cost_per_image_cny": 0.09,
+    "initial_balance_cny": 21.5,
+    "supported_models": ["gemini-2.5-flash-image", "gemini-3-pro-image-preview", "gemini-3.1-flash-image-preview"]
+  },
+  {
+    "provider_id": "zx2",
+    "label": "ZX2",
+    "adapter_type": "gemini_v1beta",
+    "base_url": "http://zx2.example/v1beta",
+    "api_key": "sk-xxx",
+    "cost_per_image_cny": 0.05,
+    "initial_balance_cny": 10,
+    "supported_models": ["gemini-3.1-flash-image-preview"]
+  }
+]
+```
+
+说明：
+
+- `adapter_type=openai_chat_image` 适配通过 `/v1/chat/completions` 返回图片链接或 data URI 的中转站
+- `adapter_type=gemini_v1beta` 适配 Gemini 原生 `v1beta/models/*:generateContent`
+- provider 的启用状态、备注、剩余余额、运行时成功率/熔断状态由后端持久化到 `data/providers.json`
+- 如果未配置 `UPSTREAM_PROVIDERS_JSON`，后端会退回旧的单一 `GEMINI_API_KEY + GEMINI_API_BASE_URL` 模式
+
 ### 3. 本地开发测试
 
 ```bash

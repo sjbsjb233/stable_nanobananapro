@@ -38,6 +38,8 @@
 - `backend/.env` 需要配置 `SESSION_SECRET_KEY`、`TURNSTILE_SECRET_KEY`
 - 首次启动会按 `BOOTSTRAP_ADMIN_USERNAME` / `BOOTSTRAP_ADMIN_PASSWORD` 自动创建管理员
 - 前端 Turnstile 站点密钥走 `frontend/.env` 的 `VITE_TURNSTILE_SITE_KEY`
+- 多中转站走 `UPSTREAM_PROVIDERS_JSON` 注入；provider 的启用状态、备注、余额与运行时状态由后端写入 `data/providers.json`
+- 如果未配置 `UPSTREAM_PROVIDERS_JSON`，后端会退回旧的单一 `GEMINI_API_KEY` / `GEMINI_API_BASE_URL` 模式
 
 ## 3. 开发环境运行（非 Docker）
 

@@ -16,7 +16,6 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.middleware.cors import CORSMiddleware
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from .billing import current_month_period
 from .config import cors_allow_all_origins, ensure_data_dirs, get_cors_origins, settings
 from .errors import api_error
 from .gemini_client import ReferenceImage
@@ -33,11 +32,12 @@ from .model_catalog import (
 )
 from .rate_limiter import job_read_rate_limit
 from .logging_setup import get_logger, setup_logging
+from .provider_store import provider_store
 from .schemas import (
     ActiveJobsRequest,
+    AddProviderBalanceRequest,
     BatchPreviewRequest,
     BatchMetaRequest,
-    BillingSummaryModelItem,
     CreateJobRequest,
     CreateJobResponse,
     CreateUserRequest,
@@ -53,7 +53,9 @@ from .schemas import (
     JobParams,
     JobStatus,
     RetryJobRequest,
+    SetProviderBalanceRequest,
     TurnstileVerifyRequest,
+    UpdateProviderRequest,
     UpdateSystemPolicyRequest,
     UpdateUserRequest,
 )
@@ -101,6 +103,7 @@ def _startup() -> None:
     setup_logging()
     ensure_data_dirs()
     user_store.ensure_initialized()
+    provider_store.ensure_initialized()
     recovered_jobs = job_manager.fail_incomplete_jobs_on_startup()
     logger.info(
         "Backend startup: version=%s deployed_at=%s data_dir=%s recovered_jobs=%s",
@@ -1588,6 +1591,32 @@ def _job_counts_by_user(metas: list[dict[str, Any]]) -> dict[str, dict[str, int]
     return counts
 
 
+def _provider_summary_payload() -> dict[str, Any]:
+    providers = provider_store.list_provider_snapshots()
+    enabled = sum(1 for item in providers if item.get("enabled"))
+    healthy = sum(
+        1
+        for item in providers
+        if item.get("enabled")
+        and not item.get("cooldown_active")
+        and item.get("quota_state") != "NO_QUOTA"
+        and int(item.get("consecutive_failures") or 0) < 3
+    )
+    total_remaining = sum(float(item.get("remaining_balance_cny") or 0.0) for item in providers if item.get("remaining_balance_cny") is not None)
+    total_spent = sum(float(item.get("total_spent_cny") or 0.0) for item in providers)
+    return {
+        "currency": "CNY",
+        "providers_total": len(providers),
+        "providers_enabled": enabled,
+        "providers_healthy": healthy,
+        "providers_cooldown": sum(1 for item in providers if item.get("cooldown_active")),
+        "remaining_balance_cny": round(total_remaining, 4),
+        "spent_cny": round(total_spent, 4),
+        "last_updated_at": now_local().isoformat(),
+        "providers": providers,
+    }
+
+
 def _admin_overview_payload() -> dict[str, Any]:
     now = now_local()
     metas = storage.iter_job_meta()
@@ -1643,7 +1672,7 @@ def _admin_overview_payload() -> dict[str, Any]:
             "image_accesses_today": image_accesses_today,
         },
         "policy": user_store.get_policy(),
-        "billing": _billing_summary_payload(),
+        "providers": _provider_summary_payload(),
     }
 
 
@@ -1735,80 +1764,59 @@ async def admin_update_policy(
     return {"policy": policy}
 
 
-def _billing_summary_payload() -> dict[str, Any]:
-    metas = storage.iter_job_meta()
-    spent = 0.0
-    by_model: dict[str, dict[str, Any]] = {}
-
-    for meta in metas:
-        if meta.get("status") not in {"SUCCEEDED", "FAILED"}:
-            continue
-        model = meta.get("model", "unknown")
-        cost = float(meta.get("billing", {}).get("estimated_cost_usd", 0.0))
-        spent += cost
-
-        if model not in by_model:
-            by_model[model] = {"model": model, "spent_usd": 0.0, "jobs": 0}
-        by_model[model]["spent_usd"] += cost
-        by_model[model]["jobs"] += 1
-
-    budget = float(settings.budget_usd)
-    payload = {
-        "currency": "USD",
-        "mode": "INTERNAL_ESTIMATE",
-        "budget_usd": round(budget, 6),
-        "spent_usd": round(spent, 6),
-        "remaining_usd": round(max(0.0, budget - spent), 6),
-        "period": current_month_period(),
-        "by_model": [BillingSummaryModelItem(**{**v, "spent_usd": round(v["spent_usd"], 6)}).model_dump() for v in by_model.values()],
-        "last_updated_at": now_local().isoformat(),
-        "notes": "Estimated from job-level usage + official pricing.",
-    }
-    return payload
+@app.get(f"{settings.api_prefix}/admin/providers")
+async def admin_providers(_: dict[str, Any] = Depends(get_admin_user)) -> dict[str, Any]:
+    return _provider_summary_payload()
 
 
 @app.get(f"{settings.api_prefix}/billing/summary", response_model=None)
 async def billing_summary(_: dict[str, Any] = Depends(get_admin_user)) -> dict[str, Any]:
-    return _billing_summary_payload()
+    return _provider_summary_payload()
+
+
+@app.patch(f"{settings.api_prefix}/admin/providers/{{provider_id}}")
+async def admin_update_provider(
+    provider_id: str,
+    payload: UpdateProviderRequest,
+    _: dict[str, Any] = Depends(get_admin_user),
+) -> dict[str, Any]:
+    updated = provider_store.update_provider(provider_id, enabled=payload.enabled, note=payload.note)
+    if updated is None:
+        raise api_error(ErrorCode.INVALID_INPUT, "Provider not found", http_status=404)
+    return {"provider": updated}
+
+
+@app.post(f"{settings.api_prefix}/admin/providers/{{provider_id}}/balance/set")
+async def admin_set_provider_balance(
+    provider_id: str,
+    payload: SetProviderBalanceRequest,
+    _: dict[str, Any] = Depends(get_admin_user),
+) -> dict[str, Any]:
+    updated = provider_store.set_balance(provider_id, payload.amount_cny)
+    if updated is None:
+        raise api_error(ErrorCode.INVALID_INPUT, "Provider not found", http_status=404)
+    return {"provider": updated}
+
+
+@app.post(f"{settings.api_prefix}/admin/providers/{{provider_id}}/balance/add")
+async def admin_add_provider_balance(
+    provider_id: str,
+    payload: AddProviderBalanceRequest,
+    _: dict[str, Any] = Depends(get_admin_user),
+) -> dict[str, Any]:
+    updated = provider_store.add_balance(provider_id, payload.delta_cny)
+    if updated is None:
+        raise api_error(ErrorCode.INVALID_INPUT, "Provider not found", http_status=404)
+    return {"provider": updated}
 
 
 @app.get(f"{settings.api_prefix}/billing/google/remaining")
 async def billing_google_remaining(
     _: dict[str, Any] = Depends(get_admin_user),
 ) -> dict[str, Any]:
-    if settings.billing_mode == "INTERNAL":
-        summary = _billing_summary_payload()
-        payload = GoogleRemainingConfiguredResponse(
-            mode="INTERNAL_ESTIMATE",
-            google_remaining_usd=summary["remaining_usd"],
-            google_spent_usd=summary["spent_usd"],
-            source="This service internal ledger (estimated)",
-            notes="Not an official Google balance. Configure BigQuery billing export for closer-to-official numbers.",
-        )
-        return payload.model_dump()
-
-    if settings.billing_mode == "BIGQUERY":
-        if settings.google_reported_spend_usd is None or settings.google_reported_remaining_usd is None:
-            return JSONResponse(
-                status_code=status.HTTP_501_NOT_IMPLEMENTED,
-                content=GoogleRemainingUnconfiguredResponse(
-                    message="Google balance cannot be fetched directly via Gemini API. Configure INTERNAL budget or BIGQUERY export."
-                ).model_dump(),
-            )
-
-        payload = GoogleRemainingConfiguredResponse(
-            mode="BIGQUERY_BILLING_EXPORT",
-            google_remaining_usd=settings.google_reported_remaining_usd,
-            google_spent_usd=settings.google_reported_spend_usd,
-            source="GCP Billing Export (BigQuery)",
-            notes="Data may be delayed depending on export schedule.",
-            as_of=now_local(),
-        )
-        return payload.model_dump()
-
     return JSONResponse(
-        status_code=status.HTTP_501_NOT_IMPLEMENTED,
+        status_code=status.HTTP_410_GONE,
         content=GoogleRemainingUnconfiguredResponse(
-            message="Google balance cannot be fetched directly via Gemini API. Configure INTERNAL budget or BIGQUERY export."
+            message="Legacy Google remaining endpoint has been removed. Use /v1/admin/providers instead."
         ).model_dump(),
     )

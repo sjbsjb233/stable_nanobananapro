@@ -341,3 +341,16 @@ class UpdateSystemPolicyRequest(BaseModel):
     default_user_daily_image_access_limit: int | None = Field(default=None, ge=0)
     default_user_image_access_turnstile_bonus_quota: int | None = Field(default=None, ge=0)
     default_user_daily_image_access_hard_limit: int | None = Field(default=None, ge=0)
+
+
+class UpdateProviderRequest(BaseModel):
+    enabled: bool | None = None
+    note: str | None = Field(default=None, max_length=500)
+
+
+class SetProviderBalanceRequest(BaseModel):
+    amount_cny: float | None = Field(default=None, ge=0)
+
+
+class AddProviderBalanceRequest(BaseModel):
+    delta_cny: float = Field(ge=0)
