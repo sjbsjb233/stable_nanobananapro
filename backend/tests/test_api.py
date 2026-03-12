@@ -143,6 +143,8 @@ def test_job_lifecycle(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> N
             "finish_reason": "STOP",
             "safety_ratings": [],
             "latency_ms": 123,
+            "upstream_model": "gemini-3.1-flash-image-4k",
+            "upstream_response_model": "gemini-3.1-flash-image-4k",
         }
 
     monkeypatch.setattr("app.gemini_client.gemini_client.generate_image", fake_generate_image)
@@ -193,6 +195,10 @@ def test_job_lifecycle(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> N
 
     resp = client.get(f"/v1/jobs/{job_id}/response")
     assert resp.status_code == 200
+    assert resp.json()["response"]["upstream_model"] == "gemini-3.1-flash-image-4k"
+    assert resp.json()["response"]["upstream_response_model"] == "gemini-3.1-flash-image-4k"
+    assert meta["response"]["upstream_model"] == "gemini-3.1-flash-image-4k"
+    assert meta["response"]["upstream_response_model"] == "gemini-3.1-flash-image-4k"
 
     batch = client.post(
         "/v1/jobs/batch-meta",
@@ -344,6 +350,49 @@ def test_multi_provider_prefers_cheaper_then_falls_back(client: TestClient, monk
     backup = next(item for item in payload["providers"] if item["provider_id"] == "mmw-backup")
     assert cheap["fail_count"] >= 1
     assert backup["success_count"] >= 1
+
+
+def test_mmw_model_resolution_uses_size_specific_models() -> None:
+    assert (
+        gemini_client._resolve_openai_upstream_model(
+            "gemini-3.1-flash-image-preview",
+            {"image_size": "4K"},
+            provider_profile="mmw",
+        )
+        == "gemini-3.1-flash-image-4k"
+    )
+    assert (
+        gemini_client._resolve_openai_upstream_model(
+            "gemini-3.1-flash-image-preview",
+            {"image_size": "2K"},
+            provider_profile="mmw",
+        )
+        == "gemini-3.1-flash-image-2k"
+    )
+    assert (
+        gemini_client._resolve_openai_upstream_model(
+            "gemini-3.1-flash-image-preview",
+            {"image_size": "1K"},
+            provider_profile="mmw",
+        )
+        == "gemini-3.1-flash-image"
+    )
+    assert (
+        gemini_client._resolve_openai_upstream_model(
+            "gemini-2.5-flash-image",
+            {"image_size": "4K"},
+            provider_profile="mmw",
+        )
+        == "gemini-2.5-flash-image-4k"
+    )
+    assert (
+        gemini_client._resolve_openai_upstream_model(
+            "gemini-2.5-flash-image",
+            {"image_size": "1K"},
+            provider_profile="mmw",
+        )
+        == "gemini-2.5-flash-image-2k"
+    )
 
 
 def test_generate_image_stops_fallback_when_job_deadline_is_exhausted(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

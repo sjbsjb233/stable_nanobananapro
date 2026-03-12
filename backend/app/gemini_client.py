@@ -213,6 +213,16 @@ class GeminiClient:
                 reference_images=reference_images,
                 deadline_monotonic=deadline_monotonic,
             )
+        if config.adapter_type == "mmw_openai_chat_image":
+            return self._call_mmw_openai_chat_image(
+                config=config,
+                prompt=prompt,
+                model=model,
+                mode=mode,
+                params=params,
+                reference_images=reference_images,
+                deadline_monotonic=deadline_monotonic,
+            )
         raise GeminiError(
             code="UNSUPPORTED_ADAPTER",
             message=f"Unsupported adapter_type '{config.adapter_type}' for provider '{config.provider_id}'",
@@ -375,7 +385,52 @@ class GeminiClient:
         reference_images: list[ReferenceImage],
         deadline_monotonic: float | None = None,
     ) -> dict[str, Any]:
-        upstream_model = self._resolve_openai_upstream_model(model, params)
+        return self._call_openai_chat_image_common(
+            config=config,
+            prompt=prompt,
+            model=model,
+            mode=mode,
+            params=params,
+            reference_images=reference_images,
+            deadline_monotonic=deadline_monotonic,
+            provider_profile="generic",
+        )
+
+    def _call_mmw_openai_chat_image(
+        self,
+        *,
+        config: Any,
+        prompt: str,
+        model: str,
+        mode: str,
+        params: dict[str, Any],
+        reference_images: list[ReferenceImage],
+        deadline_monotonic: float | None = None,
+    ) -> dict[str, Any]:
+        return self._call_openai_chat_image_common(
+            config=config,
+            prompt=prompt,
+            model=model,
+            mode=mode,
+            params=params,
+            reference_images=reference_images,
+            deadline_monotonic=deadline_monotonic,
+            provider_profile="mmw",
+        )
+
+    def _call_openai_chat_image_common(
+        self,
+        *,
+        config: Any,
+        prompt: str,
+        model: str,
+        mode: str,
+        params: dict[str, Any],
+        reference_images: list[ReferenceImage],
+        deadline_monotonic: float | None = None,
+        provider_profile: str,
+    ) -> dict[str, Any]:
+        upstream_model = self._resolve_openai_upstream_model(model, params, provider_profile=provider_profile)
         if upstream_model is None:
             raise GeminiError(
                 code="UPSTREAM_MODEL_UNAVAILABLE",
@@ -651,9 +706,38 @@ class GeminiClient:
             return "gemini-3.1-flash-image-preview"
         return None
 
-    def _resolve_openai_upstream_model(self, canonical_model: str, params: dict[str, Any]) -> str | None:
+    def _resolve_openai_upstream_model(
+        self,
+        canonical_model: str,
+        params: dict[str, Any],
+        *,
+        provider_profile: str = "generic",
+    ) -> str | None:
+        if provider_profile == "mmw":
+            return self._resolve_mmw_openai_upstream_model(canonical_model, params)
+
         image_size = str(params.get("image_size") or "").upper()
         if canonical_model == MODEL_GEMINI_2_5_FLASH_IMAGE:
+            return "gemini-2.5-flash-image-2k"
+        if canonical_model == MODEL_GEMINI_3_1_FLASH_IMAGE:
+            if image_size == "4K":
+                return "gemini-3.1-flash-image-4k"
+            if image_size == "2K":
+                return "gemini-3.1-flash-image-2k"
+            return "gemini-3.1-flash-image"
+        if canonical_model == MODEL_GEMINI_3_PRO_IMAGE:
+            if image_size == "4K":
+                return "[A]gemini-3-pro-image-preview-4k"
+            if image_size == "2K":
+                return "[A]gemini-3-pro-image-preview-2k"
+            return "[A]gemini-3-pro-image-preview"
+        return None
+
+    def _resolve_mmw_openai_upstream_model(self, canonical_model: str, params: dict[str, Any]) -> str | None:
+        image_size = str(params.get("image_size") or "").upper()
+        if canonical_model == MODEL_GEMINI_2_5_FLASH_IMAGE:
+            if image_size == "4K":
+                return "gemini-2.5-flash-image-4k"
             return "gemini-2.5-flash-image-2k"
         if canonical_model == MODEL_GEMINI_3_1_FLASH_IMAGE:
             if image_size == "4K":

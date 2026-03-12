@@ -915,6 +915,8 @@ class JobManager:
             "safety_ratings": output.get("safety_ratings", []),
             "provider": output.get("provider"),
             "provider_attempts": output.get("provider_attempts", []),
+            "upstream_model": output.get("upstream_model"),
+            "upstream_response_model": output.get("upstream_response_model"),
             "raw_summary": {
                 "parts_count": parts_count,
                 "has_inline_image": bool(image_metas),
@@ -935,6 +937,8 @@ class JobManager:
             "safety_ratings": output.get("safety_ratings", []),
             "provider": output.get("provider"),
             "provider_attempts": output.get("provider_attempts", []),
+            "upstream_model": output.get("upstream_model"),
+            "upstream_response_model": output.get("upstream_response_model"),
         }
         meta["error"] = None
         storage.save_meta(job_id, meta)
