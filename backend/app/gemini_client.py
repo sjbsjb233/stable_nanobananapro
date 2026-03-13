@@ -56,6 +56,16 @@ class ReferenceImage:
 
 
 class GeminiClient:
+    def _http_client_kwargs(self, timeout: float) -> dict[str, Any]:
+        client_kwargs: dict[str, Any] = {
+            "timeout": timeout,
+            # Upstream proxying must be controlled only via GEMINI_HTTP_PROXY.
+            "trust_env": False,
+        }
+        if settings.gemini_http_proxy:
+            client_kwargs["proxy"] = settings.gemini_http_proxy
+        return client_kwargs
+
     def generate_image(
         self,
         prompt: str,
@@ -293,10 +303,7 @@ class GeminiClient:
         url = f"{config.base_url.rstrip('/')}/models/{upstream_model}:generateContent"
         start = time.perf_counter()
         try:
-            client_kwargs: dict[str, Any] = {"timeout": timeout}
-            if settings.gemini_http_proxy:
-                client_kwargs["proxy"] = settings.gemini_http_proxy
-            with httpx.Client(**client_kwargs) as client:
+            with httpx.Client(**self._http_client_kwargs(timeout)) as client:
                 resp = client.post(url, params={"key": config.api_key}, json=payload)
         except httpx.TimeoutException as exc:
             if deadline_capped:
@@ -459,7 +466,7 @@ class GeminiClient:
         start = time.perf_counter()
 
         try:
-            with httpx.Client(timeout=timeout) as client:
+            with httpx.Client(**self._http_client_kwargs(timeout)) as client:
                 resp = client.post(
                     url,
                     headers={
@@ -519,7 +526,7 @@ class GeminiClient:
                 configured_timeout_sec=params.get("timeout_sec"),
                 provider_id=config.provider_id,
             )
-            with httpx.Client(timeout=download_timeout) as client:
+            with httpx.Client(**self._http_client_kwargs(download_timeout)) as client:
                 for url_match in _URL_RE.findall(content_str):
                     if len(images) >= settings.max_images_per_job:
                         break

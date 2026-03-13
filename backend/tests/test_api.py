@@ -395,6 +395,25 @@ def test_mmw_model_resolution_uses_size_specific_models() -> None:
     )
 
 
+def test_http_client_kwargs_only_use_gemini_http_proxy(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("HTTP_PROXY", "http://container-proxy:8080")
+    monkeypatch.setenv("HTTPS_PROXY", "http://container-proxy:8080")
+    monkeypatch.setenv("ALL_PROXY", "socks5://container-proxy:1080")
+
+    monkeypatch.setattr(settings, "gemini_http_proxy", "")
+    assert gemini_client._http_client_kwargs(12.5) == {
+        "timeout": 12.5,
+        "trust_env": False,
+    }
+
+    monkeypatch.setattr(settings, "gemini_http_proxy", "http://env-proxy:7890")
+    assert gemini_client._http_client_kwargs(8.0) == {
+        "timeout": 8.0,
+        "trust_env": False,
+        "proxy": "http://env-proxy:7890",
+    }
+
+
 def test_generate_image_stops_fallback_when_job_deadline_is_exhausted(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     provider_store.path = tmp_path / "providers.json"
     provider_store.reset_runtime_state()
