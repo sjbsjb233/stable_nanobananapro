@@ -135,13 +135,51 @@ npm run dev
 - 当它设为 `true` 时，后端会把所有需要登录的请求直接判定为 bootstrap admin / 现有可用 admin
 - 该模式下不会校验 cookie、session，也不会要求登录页 Turnstile；前端首屏 `/v1/auth/me` 会直接返回 admin 会话
 - 适合本地 Playwright 自动化与联调，不要在正式生产环境开启
-- 使用 Codex Playwright MCP 时，如果当前就是旁路模式，直接访问目标页面即可，不要额外伪造 cookie / session
+- 使用本地 Playwright CLI 时，如果当前就是旁路模式，直接访问目标页面即可，不要额外伪造 cookie / session
 
 ### 3. 本地开发测试
 
 ```bash
 cd backend
 pytest -q
+```
+
+### 4. 统一目录 Playwright CLI
+
+本项目把 Playwright 相关文件统一收拢到 `tools/playwright/`，不再把入口和缓存散落在仓库根目录。
+
+首次安装：
+
+```bash
+./tools/playwright/scripts/setup-playwright.sh
+```
+
+安装完成后可直接从仓库根目录调用：
+
+```bash
+./tools/playwright/scripts/playwright-cli.sh --help
+./tools/playwright/scripts/playwright-cli.sh open http://127.0.0.1:5178 --headed
+./tools/playwright/scripts/playwright-cli.sh snapshot
+```
+
+说明：
+
+- `tools/playwright/node_modules/` 保存 Playwright Node 依赖
+- `tools/playwright/.playwright-browsers/` 保存浏览器二进制
+- `tools/playwright/.playwright-home/` 保存 `playwright-cli` 的 daemon 与运行态缓存
+- `tools/playwright/.playwright-cli/` 保存 CLI 快照与控制台日志
+- `frontend/scripts/*.mjs` 会自动复用这套 Playwright 依赖
+- `./tools/playwright/scripts/playwright-cli.sh open ...` 不要传 `--browser chrome`
+- 默认 headless 模式优先走项目内 `chromium-headless-shell`
+- 传 `--headed` 时会切到项目内完整 Chromium
+- 后续需要重复执行、可回归的验证时，优先把流程沉淀到 `tools/playwright/tests/e2e/` 里
+- 如需安装全部浏览器，可执行 `npm --prefix tools/playwright run pw:install:all`
+
+可直接使用的 e2e 入口：
+
+```bash
+npm --prefix tools/playwright run test:e2e
+npm --prefix tools/playwright run test:e2e:headed
 ```
 
 ## 二、本地“生产仿真”流程（Docker）
@@ -234,9 +272,9 @@ docker compose -f docker-compose.prod.yml up -d --force-recreate --remove-orphan
 - 常见是 `GEMINI_HTTP_PROXY` 代理不可用
 - 先在容器内验证网络，再决定是否禁用代理
 
-### 6. 使用 Codex 内置 Playwright MCP 测试仿真环境
+### 6. 使用本地 Playwright CLI 测试仿真环境
 
-如果目标是“让 Codex 直接在真实浏览器里操作当前仿真环境”，本项目推荐优先使用 Codex 自带的 Playwright MCP/skill，而不是先写新的 Playwright 测试文件。
+如果目标是“在真实浏览器里操作当前仿真环境”，本项目统一使用 `tools/playwright/` 下的本地 Playwright CLI；需要长期回归时，优先补充同目录下的 e2e 测试。
 
 适用场景：
 
@@ -246,8 +284,8 @@ docker compose -f docker-compose.prod.yml up -d --force-recreate --remove-orphan
 
 推荐流程：
 
-1. 在会话里明确要求“使用 Playwright MCP”或“使用 playwright skill”
-2. 先确认仿真环境容器在线
+1. 先确认 `./tools/playwright/scripts/playwright-cli.sh --help` 可用
+2. 再确认仿真环境容器在线
 3. 先读取：
    - `srv/stable/compose/docker-compose.prod.yml`
    - `srv/stable/config/backend.prod.env`
@@ -255,19 +293,20 @@ docker compose -f docker-compose.prod.yml up -d --force-recreate --remove-orphan
    - 前端入口通常是 `http://127.0.0.1:5178`
    - 后端入口通常是 `http://127.0.0.1:8000`
    - `TEST_ENV_ADMIN_BYPASS` 当前是 `true` 还是 `false`
-5. 使用 Playwright MCP 的典型顺序：
-   - `browser_navigate`
-   - `browser_snapshot`
-   - `browser_click` / `browser_fill_form` / `browser_type`
-   - 页面变化后再次 `browser_snapshot`
-   - 需要排查报错时再看 `browser_console_messages`
-6. 必要时才使用 `browser_run_code`，不要一开始就大量依赖自定义脚本
+5. 使用本地 Playwright CLI 的典型顺序：
+   - `./tools/playwright/scripts/playwright-cli.sh open <url> --headed`
+   - `./tools/playwright/scripts/playwright-cli.sh snapshot`
+   - `./tools/playwright/scripts/playwright-cli.sh click e12` / `fill e8 "text"` / `type "text"`
+   - 页面变化后再次 `./tools/playwright/scripts/playwright-cli.sh snapshot`
+   - 需要排查报错时再看 `./tools/playwright/scripts/playwright-cli.sh console`
+6. 对一次性排查，可继续使用 CLI 直接操作；对会重复执行的流程，优先补到 `tools/playwright/tests/e2e/`
 
 关键约束：
 
 - `snapshot` 后拿到的元素 ref 只对当前页面状态可靠；页面变了就要重新 snapshot
-- 不要把“仓库里可能残留的旧 Playwright 测试代码”当成当前标准流程；当前标准是 Codex Playwright MCP 交互流程
+- 不要把“仓库里可能残留的旧浏览器测试代码”当成当前标准流程；当前标准是 `tools/playwright/` 下的本地 CLI 和 e2e 测试
 - 不要默认伪造 cookie / session，先看 `TEST_ENV_ADMIN_BYPASS`
+- 浏览器目录固定在 `tools/playwright/.playwright-browsers/`
 
 按鉴权模式区分：
 
@@ -281,7 +320,7 @@ docker compose -f docker-compose.prod.yml up -d --force-recreate --remove-orphan
 
 建议在每次测试结论里固定说明：
 
-- 是否使用了 Playwright MCP
+- 是否使用了本地 Playwright CLI，或者是否执行了根目录 e2e 测试
 - 实际访问的 URL
 - 当前 bypass 状态
 - 做了哪些页面操作

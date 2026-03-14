@@ -1,0 +1,17 @@
+{
+  "name": "stable-nanobananapro-playwright",
+  "private": true,
+  "version": "1.0.0",
+  "scripts": {
+    "pw:cli": "playwright-cli",
+    "pw:install": "PLAYWRIGHT_BROWSERS_PATH=./.playwright-browsers playwright install chromium",
+    "pw:install:all": "PLAYWRIGHT_BROWSERS_PATH=./.playwright-browsers playwright install",
+    "test:e2e": "PLAYWRIGHT_BROWSERS_PATH=./.playwright-browsers playwright test",
+    "test:e2e:headed": "PLAYWRIGHT_BROWSERS_PATH=./.playwright-browsers playwright test --headed"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.58.2",
+    "@playwright/cli": "^0.1.1",
+    "playwright": "^1.58.2"
+  }
+}

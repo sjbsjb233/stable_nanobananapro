@@ -55,6 +55,7 @@ class JobParams(BaseModel):
     aspect_ratio: str = "1:1"
     image_size: str = "1K"
     thinking_level: str | None = None
+    provider_id: str | None = None
     temperature: float = 0.7
     timeout_sec: int = 120
     max_retries: int = 1
@@ -90,6 +91,14 @@ class JobParams(BaseModel):
             return None
         canonical = raw[:1].upper() + raw[1:].lower()
         return canonical
+
+    @field_validator("provider_id")
+    @classmethod
+    def validate_provider_id(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        raw = str(value).strip()
+        return raw or None
 
     @field_validator("temperature")
     @classmethod

@@ -79,13 +79,24 @@ class GeminiClient:
         if not spec:
             raise GeminiError(code="INVALID_MODEL", message=f"Unsupported model: {model}", retryable=False, retry_other_providers=False)
 
-        chain = provider_store.candidate_chain(model)
+        requested_provider_id = str(params.get("provider_id") or "").strip() or None
+        if requested_provider_id:
+            candidate = provider_store.admin_override_candidate(model, requested_provider_id)
+            chain = [candidate] if candidate else []
+        else:
+            chain = provider_store.candidate_chain(model)
         if not chain:
+            if requested_provider_id:
+                message = f"Selected provider '{requested_provider_id}' is not currently available for model '{model}'"
+                payload = {"model": model, "provider_id": requested_provider_id}
+            else:
+                message = f"No enabled provider is currently available for model '{model}'"
+                payload = {"model": model}
             raise GeminiError(
                 code="NO_PROVIDER_AVAILABLE",
-                message=f"No enabled provider is currently available for model '{model}'",
+                message=message,
                 retryable=False,
-                payload={"model": model},
+                payload=payload,
             )
 
         attempts: list[dict[str, Any]] = []
@@ -103,6 +114,15 @@ class GeminiClient:
                 break
             provider_id = str(candidate["provider_id"])
             provider_store.record_selection(provider_id)
+            selection_mode = str(candidate.get("selection_mode") or "standard")
+            selection_reason = str(candidate.get("selection_reason") or selection_mode)
+            forced_activation = bool(candidate.get("forced_activation"))
+            if selection_mode != "standard" or forced_activation:
+                provider_store.record_forced_activation(
+                    provider_id,
+                    reason=selection_reason,
+                    selection_mode=selection_mode,
+                )
             provider_store.acquire_slot(provider_id)
             started = time.perf_counter()
             try:
@@ -141,6 +161,8 @@ class GeminiClient:
                     "adapter_type": config.adapter_type,
                     "base_url": config.base_url,
                     "cost_per_image_cny": round(float(config.cost_per_image_cny), 4),
+                    "selection_mode": selection_mode,
+                    "forced_activation": forced_activation,
                 }
                 if attempts:
                     output["provider_attempts"] = attempts
@@ -165,6 +187,8 @@ class GeminiClient:
                     "error_code": exc.code,
                     "message": exc.message,
                     "retryable": exc.retryable,
+                    "selection_mode": selection_mode,
+                    "forced_activation": forced_activation,
                 }
                 attempts.append(attempt_payload)
                 logger.warning(

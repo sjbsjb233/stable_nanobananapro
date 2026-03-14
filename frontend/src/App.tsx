@@ -73,6 +73,7 @@ type DefaultParams = {
   aspect_ratio: AspectRatio;
   image_size: ImageSize;
   thinking_level: string | null;
+  provider_id: string | null;
   temperature: number;
   timeout_sec: number;
   max_retries: number;
@@ -184,6 +185,7 @@ type BatchSection = {
   section_model: ModelId;
   section_aspect_ratio: AspectRatio;
   section_image_size: ImageSize;
+  section_provider_id: string | null;
   section_temperature: number;
   section_job_count: number;
   collection_mode: BatchCollectionMode;
@@ -504,6 +506,14 @@ type ProviderSnapshot = {
   cooldown_until?: string | null;
   cooldown_active: boolean;
   circuit_open_count: number;
+  last_circuit_open_time?: string | null;
+  last_circuit_open_reason?: string | null;
+  last_circuit_open_until?: string | null;
+  last_circuit_open_duration_sec?: number | null;
+  forced_activation_count: number;
+  last_forced_activation_time?: string | null;
+  last_forced_activation_reason?: string | null;
+  last_forced_activation_mode?: string | null;
   success_rate_estimated: number;
   recent_success_rate: number;
   final_success_rate: number;
@@ -673,6 +683,30 @@ function formatLocal(ts?: string) {
   return d.toLocaleString();
 }
 
+function providerSupportsModel(provider: ProviderSnapshot, modelId: string) {
+  return provider.supported_models.includes(modelId);
+}
+
+function providerOptionLabel(provider: ProviderSnapshot) {
+  const tags: string[] = [];
+  if (!provider.enabled) tags.push("disabled");
+  if (provider.cooldown_active) tags.push("cooldown");
+  if (provider.quota_state === "NO_QUOTA") tags.push("no quota");
+  return `${provider.label} (${provider.provider_id})${tags.length ? ` · ${tags.join(", ")}` : ""}`;
+}
+
+function providerSelectOptions(providers: ProviderSnapshot[], modelId: string) {
+  return [
+    { value: AUTO_PROVIDER_VALUE, label: "Auto Select" },
+    ...providers
+      .filter((provider) => providerSupportsModel(provider, modelId))
+      .map((provider) => ({
+        value: provider.provider_id,
+        label: providerOptionLabel(provider),
+      })),
+  ];
+}
+
 function shortId(id: string, keep = 8) {
   if (!id) return "";
   if (id.length <= keep * 2) return id;
@@ -739,6 +773,7 @@ type CreatePageDraft = {
   aspect: AspectRatio;
   size: ImageSize;
   thinkingLevel: string | null;
+  providerId: string | null;
   temperature: number;
   timeoutSec: number;
   maxRetries: number;
@@ -754,6 +789,7 @@ type BatchSectionDraftPersisted = {
   section_model: ModelId;
   section_aspect_ratio: AspectRatio;
   section_image_size: ImageSize;
+  section_provider_id: string | null;
   section_temperature: number;
   section_job_count: number;
   collection_mode: BatchCollectionMode;
@@ -775,6 +811,7 @@ type BatchPageDraft = {
   globalModel: ModelId;
   globalAspect: AspectRatio;
   globalSize: ImageSize;
+  globalProviderId: string | null;
   globalTemperature: number;
   globalJobCount: number;
   namingTemplate: string;
@@ -809,6 +846,8 @@ const BATCH_SUBMIT_MODE_OPTIONS: Array<{ value: BatchSubmitMode; label: string }
   { value: "IMMEDIATE", label: "Queue All Now" },
   { value: "STAGGERED", label: "Queue Per Section" },
 ];
+
+const AUTO_PROVIDER_VALUE = "__AUTO_PROVIDER__";
 
 function renderTemplate(
   template: string,
@@ -1681,6 +1720,7 @@ const DEFAULT_PARAMS_TEMPLATE: DefaultParams = {
   aspect_ratio: "1:1",
   image_size: "1K",
   thinking_level: null,
+  provider_id: null,
   temperature: 1,
   timeout_sec: 400,
   max_retries: 0,
@@ -1852,6 +1892,7 @@ function createBatchSectionDraft(args: {
     section_model: source?.section_model || args.fallbackModel,
     section_aspect_ratio: source?.section_aspect_ratio || params.aspect_ratio,
     section_image_size: source?.section_image_size || params.image_size,
+    section_provider_id: source?.section_provider_id || params.provider_id || null,
     section_temperature: source?.section_temperature ?? params.temperature,
     section_job_count: source?.section_job_count || 1,
     collection_mode: source?.collection_mode || args.defaultCollectionMode,
@@ -3504,6 +3545,38 @@ function useModelCatalog() {
   }, [client]);
 
   return catalog;
+}
+
+function useAdminProviderSummary(enabled: boolean) {
+  const client = useApiClient();
+  const [providerSummary, setProviderSummary] = useState<ProviderSummary | null>(null);
+
+  useEffect(() => {
+    if (!enabled) {
+      setProviderSummary(null);
+      return;
+    }
+    let stopped = false;
+    const abort = new AbortController();
+
+    client
+      .adminProviders(abort.signal)
+      .then((payload) => {
+        if (stopped) return;
+        setProviderSummary(payload);
+      })
+      .catch(() => {
+        if (stopped) return;
+        setProviderSummary(null);
+      });
+
+    return () => {
+      stopped = true;
+      abort.abort();
+    };
+  }, [client, enabled]);
+
+  return providerSummary;
 }
 
 // -----------------------------
@@ -5752,6 +5825,12 @@ function AdminPage() {
                   <div className="mt-1 text-[11px] text-zinc-500 dark:text-zinc-400">
                     last_success: {formatLocal(provider.last_success_time)} · last_fail: {formatLocal(provider.last_fail_time)} · reason: {provider.last_fail_reason || "-"}
                   </div>
+                  <div className="mt-1 text-[11px] text-zinc-500 dark:text-zinc-400">
+                    last_circuit: {formatLocal(provider.last_circuit_open_time)} · until: {formatLocal(provider.last_circuit_open_until)} · reason: {provider.last_circuit_open_reason || "-"}
+                  </div>
+                  <div className="mt-1 text-[11px] text-zinc-500 dark:text-zinc-400">
+                    last_forced_activation: {formatLocal(provider.last_forced_activation_time)} · mode: {provider.last_forced_activation_mode || "-"} · count: {provider.forced_activation_count}
+                  </div>
                 </div>
 
                 <div className="grid min-w-0 gap-2 xl:w-[420px] xl:grid-cols-2">
@@ -5960,7 +6039,8 @@ function BatchCreatePage() {
   const catalog = useModelCatalog();
   const navigate = useNavigate();
   const { push } = useToast();
-  const { session, user } = useAuthSession();
+  const { session, user, isAdmin } = useAuthSession();
+  const providerSummary = useAdminProviderSummary(isAdmin);
   const setSession = useAuthStore((s) => s.setSession);
   const settings = useSettingsStore((s) => s.settings);
   const pickerSessions = usePickerStore((s) => s.sessions);
@@ -5995,6 +6075,7 @@ function BatchCreatePage() {
   const [globalModel, setGlobalModel] = useState<ModelId>(initialModel);
   const [globalAspect, setGlobalAspect] = useState<AspectRatio>(initialParams.aspect_ratio);
   const [globalSize, setGlobalSize] = useState<ImageSize>(initialParams.image_size);
+  const [globalProviderId, setGlobalProviderId] = useState<string | null>(initialParams.provider_id ?? null);
   const [globalTemperature, setGlobalTemperature] = useState<number>(initialParams.temperature);
   const [globalJobCount, setGlobalJobCount] = useState<number>(1);
   const [namingTemplate, setNamingTemplate] = useState(BATCH_NAME_TEMPLATE_DEFAULT);
@@ -6026,6 +6107,11 @@ function BatchCreatePage() {
     () => modelMap.get(globalModel) || catalog.models[0] || null,
     [catalog.models, globalModel, modelMap]
   );
+  const availableProviders = providerSummary?.providers || [];
+  const globalProviderOptions = useMemo(
+    () => providerSelectOptions(availableProviders, globalModel),
+    [availableProviders, globalModel]
+  );
   const globalDraftFileMetas = useMemo(() => globalFiles.map((file) => toPersistedDraftFileMeta(file)), [globalFiles]);
   const batchDraftSections = useMemo<BatchSectionDraftPersisted[]>(
     () =>
@@ -6036,6 +6122,7 @@ function BatchCreatePage() {
         section_model: section.section_model,
         section_aspect_ratio: section.section_aspect_ratio,
         section_image_size: section.section_image_size,
+        section_provider_id: section.section_provider_id,
         section_temperature: section.section_temperature,
         section_job_count: section.section_job_count,
         collection_mode: section.collection_mode,
@@ -6071,6 +6158,7 @@ function BatchCreatePage() {
       globalModel,
       globalAspect,
       globalSize,
+      globalProviderId,
       globalTemperature,
       globalJobCount,
       namingTemplate,
@@ -6103,6 +6191,34 @@ function BatchCreatePage() {
       setGlobalSize("AUTO");
     }
   }, [globalAspect, globalModelMeta, globalSize]);
+
+  useEffect(() => {
+    if (!isAdmin) {
+      if (globalProviderId !== null) setGlobalProviderId(null);
+      setSections((prev) =>
+        prev.map((section) =>
+          section.section_provider_id == null ? section : { ...section, section_provider_id: null }
+        )
+      );
+      return;
+    }
+    if (
+      globalProviderId &&
+      !availableProviders.some((provider) => provider.provider_id === globalProviderId && providerSupportsModel(provider, globalModel))
+    ) {
+      setGlobalProviderId(null);
+    }
+    setSections((prev) =>
+      prev.map((section) =>
+        section.section_provider_id &&
+        !availableProviders.some(
+          (provider) => provider.provider_id === section.section_provider_id && providerSupportsModel(provider, section.section_model)
+        )
+          ? { ...section, section_provider_id: null }
+          : section
+      )
+    );
+  }, [availableProviders, globalModel, globalProviderId, isAdmin]);
 
   useEffect(() => {
     setSections((prev) =>
@@ -6179,6 +6295,7 @@ function BatchCreatePage() {
     section_model: globalModel,
     section_aspect_ratio: globalAspect,
     section_image_size: globalSize,
+    section_provider_id: globalProviderId,
     section_temperature: globalTemperature,
     section_job_count: globalJobCount,
     collection_mode: defaultCollectionStrategy,
@@ -6216,6 +6333,7 @@ function BatchCreatePage() {
             section_model: section.section_model || initialModel,
             section_aspect_ratio: section.section_aspect_ratio || initialParams.aspect_ratio,
             section_image_size: section.section_image_size || initialParams.image_size,
+            section_provider_id: section.section_provider_id ?? initialParams.provider_id ?? null,
             section_temperature: typeof section.section_temperature === "number" ? section.section_temperature : initialParams.temperature,
             section_job_count: typeof section.section_job_count === "number" ? section.section_job_count : 1,
             collection_mode: section.collection_mode || draft.defaultCollectionStrategy || "AUTO_BATCH",
@@ -6237,6 +6355,7 @@ function BatchCreatePage() {
         section_model: draft.globalModel || initialModel,
         section_aspect_ratio: draft.globalAspect || initialParams.aspect_ratio,
         section_image_size: draft.globalSize || initialParams.image_size,
+        section_provider_id: draft.globalProviderId ?? initialParams.provider_id ?? null,
         section_temperature: typeof draft.globalTemperature === "number" ? draft.globalTemperature : initialParams.temperature,
         section_job_count: typeof draft.globalJobCount === "number" ? draft.globalJobCount : 1,
         collection_mode: draft.defaultCollectionStrategy || "AUTO_BATCH",
@@ -6253,6 +6372,7 @@ function BatchCreatePage() {
       setGlobalModel(draft.globalModel || initialModel);
       setGlobalAspect(draft.globalAspect || initialParams.aspect_ratio);
       setGlobalSize(draft.globalSize || initialParams.image_size);
+      setGlobalProviderId(draft.globalProviderId ?? initialParams.provider_id ?? null);
       setGlobalTemperature(typeof draft.globalTemperature === "number" ? draft.globalTemperature : initialParams.temperature);
       setGlobalJobCount(typeof draft.globalJobCount === "number" ? draft.globalJobCount : 1);
       setNamingTemplate(draft.namingTemplate || BATCH_NAME_TEMPLATE_DEFAULT);
@@ -6301,6 +6421,11 @@ function BatchCreatePage() {
           ? section.section_image_size
           : defaults.image_size
         : "AUTO",
+      section_provider_id:
+        section.section_provider_id &&
+        availableProviders.some((provider) => provider.provider_id === section.section_provider_id && providerSupportsModel(provider, nextModel))
+          ? section.section_provider_id
+          : defaults.provider_id,
       section_temperature: section.section_temperature ?? defaults.temperature,
     }));
   };
@@ -6362,13 +6487,14 @@ function BatchCreatePage() {
         const previous = prev[index - 1];
         return {
           ...section,
-          section_model: previous.section_model,
-          section_aspect_ratio: previous.section_aspect_ratio,
-          section_image_size: previous.section_image_size,
-          section_temperature: previous.section_temperature,
-          section_job_count: previous.section_job_count,
-          collection_mode: previous.collection_mode,
-          inherit_previous_settings: true,
+      section_model: previous.section_model,
+      section_aspect_ratio: previous.section_aspect_ratio,
+      section_image_size: previous.section_image_size,
+      section_provider_id: previous.section_provider_id,
+      section_temperature: previous.section_temperature,
+      section_job_count: previous.section_job_count,
+      collection_mode: previous.collection_mode,
+      inherit_previous_settings: true,
         };
       })
     );
@@ -6552,6 +6678,7 @@ function BatchCreatePage() {
           aspect_ratio: section.section_aspect_ratio,
           image_size: modelMeta.supports_image_size ? section.section_image_size : "AUTO",
           thinking_level: modelMeta.supports_thinking_level ? fallbackParams.thinking_level : null,
+          provider_id: isAdmin ? section.section_provider_id : null,
           temperature: section.section_temperature,
           timeout_sec: fallbackParams.timeout_sec,
           max_retries: fallbackParams.max_retries,
@@ -6609,6 +6736,7 @@ function BatchCreatePage() {
               aspect_ratio: params.aspect_ratio,
               image_size: params.image_size,
               thinking_level: params.thinking_level,
+              provider_id: params.provider_id,
               temperature: params.temperature,
               timeout_sec: params.timeout_sec,
               max_retries: params.max_retries,
@@ -6753,6 +6881,7 @@ function BatchCreatePage() {
                   setBatchNote("");
                   setGlobalPrompt("");
                   setGlobalFiles([]);
+                  setGlobalProviderId(initialParams.provider_id ?? null);
                   setSections([
                     makeDefaultSection(),
                   ]);
@@ -6819,13 +6948,14 @@ function BatchCreatePage() {
                     setSections((prev) =>
                       prev.map((section) => ({
                         ...section,
-                        section_model: globalModel,
-                        section_aspect_ratio: globalAspect,
-                        section_image_size: globalSize,
-                        section_temperature: globalTemperature,
-                        section_job_count: globalJobCount,
-                        collection_mode: defaultCollectionStrategy,
-                      }))
+                      section_model: globalModel,
+                      section_aspect_ratio: globalAspect,
+                      section_image_size: globalSize,
+                      section_provider_id: globalProviderId,
+                      section_temperature: globalTemperature,
+                      section_job_count: globalJobCount,
+                      collection_mode: defaultCollectionStrategy,
+                    }))
                     );
                     push({ kind: "success", title: "已把全局默认应用到全部 section" });
                   }}
@@ -6874,6 +7004,16 @@ function BatchCreatePage() {
                       }
                     />
                   </Field>
+                  {isAdmin ? (
+                    <Field label={<span className="inline-flex items-center gap-1.5">default_provider <HelpTip text="仅管理员可见。Auto Select 会走普通调度；手动指定时，新 section 会继承这个 provider 设置。" /></span>}>
+                      <Select
+                        testId="batch-global-provider-select"
+                        value={globalProviderId || AUTO_PROVIDER_VALUE}
+                        onChange={(v) => setGlobalProviderId(v === AUTO_PROVIDER_VALUE ? null : v)}
+                        options={globalProviderOptions}
+                      />
+                    </Field>
+                  ) : null}
                   <Field label={<span className="inline-flex items-center gap-1.5">default_temperature ({globalTemperature.toFixed(2)}) <HelpTip text="越低越稳定，越高越发散。做同一套 PPT 页面时，通常不建议拉得过高。" /></span>}>
                     <input
                       type="range"
@@ -7123,10 +7263,25 @@ function BatchCreatePage() {
                             options={
                               cap?.supports_image_size
                                 ? (cap.supported_image_sizes || []).map((item) => ({ value: item, label: item }))
-                                : [{ value: "AUTO", label: "AUTO" }]
+                              : [{ value: "AUTO", label: "AUTO" }]
                             }
                           />
                         </Field>
+                        {isAdmin ? (
+                          <Field label={<span className="inline-flex items-center gap-1.5">section_provider <HelpTip text="仅管理员可见。可直接点名当前 section 使用某个 provider，包含 disabled / cooldown provider。" /></span>}>
+                            <Select
+                              testId={`batch-section-provider-${displayIndex}`}
+                              value={section.section_provider_id || AUTO_PROVIDER_VALUE}
+                              onChange={(v) =>
+                                updateSection(section.id, (current) => ({
+                                  ...current,
+                                  section_provider_id: v === AUTO_PROVIDER_VALUE ? null : v,
+                                }))
+                              }
+                              options={providerSelectOptions(availableProviders, section.section_model)}
+                            />
+                          </Field>
+                        ) : null}
                         <Field label={<span className="inline-flex items-center gap-1.5">section_job_count ({section.section_job_count}) <HelpTip text="当前 section 要生成几张。总任务数会按所有计划 section 的 job_count 求和。" /></span>}>
                           <input
                             type="range"
@@ -7235,6 +7390,7 @@ function CreateJobPage() {
   const { push } = useToast();
   const navigate = useNavigate();
   const { session, user, isAdmin } = useAuthSession();
+  const providerSummary = useAdminProviderSummary(isAdmin);
   const setSession = useAuthStore((s) => s.setSession);
   const settings = useSettingsStore((s) => s.settings);
   const setSettings = useSettingsStore((s) => s.setSettings);
@@ -7258,6 +7414,7 @@ function CreateJobPage() {
   const [aspect, setAspect] = useState<AspectRatio>(initParams.aspect_ratio);
   const [size, setSize] = useState<ImageSize>(initParams.image_size);
   const [thinkingLevel, setThinkingLevel] = useState<string | null>(initParams.thinking_level ?? null);
+  const [providerId, setProviderId] = useState<string | null>(initParams.provider_id ?? null);
   const [temperature, setTemperature] = useState<number>(initParams.temperature);
   const [timeoutSec, setTimeoutSec] = useState<number>(initParams.timeout_sec);
   const [maxRetries, setMaxRetries] = useState<number>(initParams.max_retries);
@@ -7290,6 +7447,11 @@ function CreateJobPage() {
       catalog.models[0]
     );
   }, [catalog, model]);
+  const availableProviders = providerSummary?.providers || [];
+  const createProviderOptions = useMemo(
+    () => providerSelectOptions(availableProviders, model),
+    [availableProviders, model]
+  );
   const pendingModelMeta = useMemo(
     () => catalog.models.find((m) => m.model_id === pendingModelChoice) || null,
     [catalog.models, pendingModelChoice]
@@ -7317,6 +7479,7 @@ function CreateJobPage() {
       aspect,
       size,
       thinkingLevel,
+      providerId,
       temperature,
       timeoutSec,
       maxRetries,
@@ -7369,6 +7532,7 @@ function CreateJobPage() {
         if (cloneDraft.params?.aspect_ratio) setAspect(cloneDraft.params.aspect_ratio as AspectRatio);
         if (cloneDraft.params?.image_size) setSize(cloneDraft.params.image_size as ImageSize);
         if (cloneDraft.params?.thinking_level !== undefined) setThinkingLevel(cloneDraft.params.thinking_level ?? null);
+        setProviderId(cloneDraft.params?.provider_id ?? null);
         if (typeof cloneDraft.params?.temperature === "number") setTemperature(cloneDraft.params.temperature);
         if (typeof cloneDraft.params?.timeout_sec === "number") setTimeoutSec(cloneDraft.params.timeout_sec);
         if (typeof cloneDraft.params?.max_retries === "number") setMaxRetries(cloneDraft.params.max_retries);
@@ -7398,6 +7562,7 @@ function CreateJobPage() {
       setAspect(draft.aspect || initParams.aspect_ratio);
       setSize(draft.size || initParams.image_size);
       setThinkingLevel(draft.thinkingLevel ?? initParams.thinking_level ?? null);
+      setProviderId(draft.providerId ?? initParams.provider_id ?? null);
       setTemperature(typeof draft.temperature === "number" ? draft.temperature : initParams.temperature);
       setTimeoutSec(typeof draft.timeoutSec === "number" ? draft.timeoutSec : initParams.timeout_sec);
       setMaxRetries(typeof draft.maxRetries === "number" ? draft.maxRetries : initParams.max_retries);
@@ -7420,6 +7585,7 @@ function CreateJobPage() {
     setAspect(saved.aspect_ratio as AspectRatio);
     setSize(saved.image_size as ImageSize);
     setThinkingLevel(saved.thinking_level ?? null);
+    setProviderId(saved.provider_id ?? null);
     setTemperature(saved.temperature);
     setTimeoutSec(saved.timeout_sec);
     setMaxRetries(saved.max_retries);
@@ -7429,6 +7595,17 @@ function CreateJobPage() {
   useEffect(() => {
     setBoundSessionIds((prev) => prev.filter((sessionId) => pickerSessions.some((session) => session.session_id === sessionId)));
   }, [pickerSessions]);
+
+  useEffect(() => {
+    if (!isAdmin) {
+      if (providerId !== null) setProviderId(null);
+      return;
+    }
+    if (!providerId) return;
+    if (!availableProviders.some((provider) => provider.provider_id === providerId && providerSupportsModel(provider, model))) {
+      setProviderId(null);
+    }
+  }, [availableProviders, isAdmin, model, providerId]);
 
   useEffect(() => {
     if (!createDraftHydratedRef.current) return;
@@ -7550,10 +7727,12 @@ function CreateJobPage() {
       const nextThinkingLevel = currentModel.supports_thinking_level
         ? (thinkingLevel || currentModel.default_params.thinking_level || currentModel.supported_thinking_levels[0] || null)
         : null;
+      const nextProviderId = isAdmin ? providerId : null;
       const changed =
         cur.aspect_ratio !== aspect ||
         cur.image_size !== nextImageSize ||
         (cur.thinking_level || null) !== nextThinkingLevel ||
+        (cur.provider_id || null) !== nextProviderId ||
         cur.temperature !== temperature ||
         cur.timeout_sec !== timeoutSec ||
         cur.max_retries !== maxRetries;
@@ -7562,6 +7741,7 @@ function CreateJobPage() {
           aspect_ratio: aspect,
           image_size: nextImageSize,
           thinking_level: nextThinkingLevel,
+          provider_id: nextProviderId,
           temperature,
           timeout_sec: timeoutSec,
           max_retries: maxRetries,
@@ -7578,9 +7758,11 @@ function CreateJobPage() {
     aspect,
     size,
     thinkingLevel,
+    providerId,
     temperature,
     timeoutSec,
     maxRetries,
+    isAdmin,
     settings.defaultModel,
     settings.defaultParamsByModel,
     setSettings,
@@ -7690,6 +7872,7 @@ function CreateJobPage() {
         aspect_ratio: aspect,
         image_size: currentModel.supports_image_size ? size : "AUTO",
         thinking_level: effectiveThinkingLevel,
+        provider_id: isAdmin ? providerId : null,
         temperature,
         timeout_sec: timeoutSec,
         max_retries: maxRetries,
@@ -7739,14 +7922,15 @@ function CreateJobPage() {
           status_cache: (resp?.status as JobStatus) || "QUEUED",
           prompt_preview: toPreview(prompt),
           prompt_text: prompt,
-          params_cache: {
-            aspect_ratio: params.aspect_ratio,
-            image_size: params.image_size,
-            thinking_level: params.thinking_level,
-            temperature,
-            timeout_sec: timeoutSec,
-            max_retries: maxRetries,
-          },
+            params_cache: {
+              aspect_ratio: params.aspect_ratio,
+              image_size: params.image_size,
+              thinking_level: params.thinking_level,
+              provider_id: params.provider_id,
+              temperature,
+              timeout_sec: timeoutSec,
+              max_retries: maxRetries,
+            },
           last_seen_at: isoNow(),
           pinned: false,
           tags: [],
@@ -8057,6 +8241,20 @@ function CreateJobPage() {
                     options={catalog.models.map((m) => ({ value: m.model_id, label: `${m.label} (${m.model_id})` }))}
                   />
                 </Field>
+
+                {isAdmin ? (
+                  <Field label="provider">
+                    <Select
+                      testId="create-provider-select"
+                      value={providerId || AUTO_PROVIDER_VALUE}
+                      onChange={(v) => setProviderId(v === AUTO_PROVIDER_VALUE ? null : v)}
+                      options={createProviderOptions}
+                    />
+                    <div className="mt-1 text-[11px] text-zinc-500 dark:text-zinc-400">
+                      仅管理员可见。`Auto Select` 走普通调度；手动指定时可临时测试 disabled / cooldown provider。
+                    </div>
+                  </Field>
+                ) : null}
 
                 <Field label="aspect_ratio">
                   <Select
@@ -10116,6 +10314,7 @@ function JobDetail({
         aspect_ratio: params.aspect_ratio,
         image_size: params.image_size,
         thinking_level: params.thinking_level,
+        provider_id: params.provider_id,
         temperature: params.temperature,
         timeout_sec: params.timeout_sec,
         max_retries: params.max_retries,
@@ -10429,6 +10628,7 @@ function JobDetail({
           <KeyValue k="aspect_ratio" v={(meta?.params?.aspect_ratio || rec.params_cache?.aspect_ratio || "-") as any} />
           <KeyValue k="image_size" v={(meta?.params?.image_size || rec.params_cache?.image_size || "-") as any} />
           <KeyValue k="thinking_level" v={(meta?.params?.thinking_level ?? rec.params_cache?.thinking_level ?? "-") as any} />
+          <KeyValue k="provider_id" v={(meta?.params?.provider_id ?? rec.params_cache?.provider_id ?? "AUTO") as any} />
           <KeyValue k="temperature" v={(meta?.params?.temperature ?? rec.params_cache?.temperature ?? "-") as any} />
           <KeyValue k="timeout_sec" v={(meta?.params?.timeout_sec ?? rec.params_cache?.timeout_sec ?? "-") as any} />
           <KeyValue k="max_retries" v={(meta?.params?.max_retries ?? rec.params_cache?.max_retries ?? "-") as any} />

@@ -81,6 +81,20 @@ def login(client: TestClient, username: str = "admin", password: str = "admin123
     return resp.json()
 
 
+def wait_for_job_terminal(client: TestClient, job_id: str, *, job_token: str | None = None, attempts: int = 40) -> dict:
+    headers = {"X-Job-Token": job_token} if job_token else None
+    meta = None
+    for _ in range(attempts):
+        resp = client.get(f"/v1/jobs/{job_id}", headers=headers)
+        assert resp.status_code == 200
+        meta = resp.json()
+        if meta["status"] in {"SUCCEEDED", "FAILED"}:
+            break
+        time.sleep(0.1)
+    assert meta is not None
+    return meta
+
+
 def test_auth_required_and_login(client: TestClient) -> None:
     unauthorized = client.get("/v1/models")
     assert unauthorized.status_code == 401
@@ -388,6 +402,226 @@ def test_multi_provider_prefers_cheaper_then_falls_back(client: TestClient, monk
     backup = next(item for item in payload["providers"] if item["provider_id"] == "mmw-backup")
     assert cheap["fail_count"] >= 1
     assert backup["success_count"] >= 1
+
+
+def test_provider_chain_forces_cooldown_provider_when_no_standard_provider_is_available(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        settings,
+        "upstream_providers_json",
+        json.dumps(
+            [
+                {
+                    "provider_id": "cooldown-only",
+                    "label": "Cooldown Only",
+                    "adapter_type": "gemini_v1beta",
+                    "base_url": "http://cooldown.example/v1beta",
+                    "api_key": "cooldown-key",
+                    "cost_per_image_cny": 0.06,
+                    "initial_balance_cny": 8,
+                    "supported_models": ["gemini-3-pro-image-preview"],
+                }
+            ]
+        ),
+    )
+    provider_store.ensure_initialized()
+    provider_store.record_failure(
+        "cooldown-only",
+        error_code="UPSTREAM_TIMEOUT",
+        latency_ms=18,
+        open_circuit=True,
+    )
+
+    def succeed_provider(*args, **kwargs):
+        return {
+            "raw": {"candidates": []},
+            "images": [{"mime": "image/png", "bytes": PNG_1X1}],
+            "usage_metadata": {"totalTokenCount": 11},
+            "finish_reason": "STOP",
+            "safety_ratings": [],
+            "latency_ms": 42,
+        }
+
+    monkeypatch.setattr(gemini_client, "_call_gemini_v1beta", succeed_provider)
+
+    login(client)
+    created = client.post(
+        "/v1/jobs",
+        json={
+            "prompt": "cooldown retry prompt",
+            "model": "gemini-3-pro-image-preview",
+            "params": {
+                "aspect_ratio": "1:1",
+                "image_size": "1K",
+                "temperature": 0.7,
+                "timeout_sec": 60,
+                "max_retries": 1,
+            },
+            "mode": "IMAGE_ONLY",
+        },
+    )
+    assert created.status_code == 201
+
+    meta = wait_for_job_terminal(client, created.json()["job_id"])
+    assert meta["status"] == "SUCCEEDED"
+    assert meta["response"]["provider"]["provider_id"] == "cooldown-only"
+    assert meta["response"]["provider"]["selection_mode"] == "forced_circuit_reactivation"
+    assert meta["response"]["provider"]["forced_activation"] is True
+
+    providers = client.get("/v1/admin/providers")
+    assert providers.status_code == 200
+    snapshot = providers.json()["providers"][0]
+    assert snapshot["provider_id"] == "cooldown-only"
+    assert snapshot["last_circuit_open_time"] is not None
+    assert snapshot["last_circuit_open_reason"] == "UPSTREAM_TIMEOUT"
+    assert snapshot["last_forced_activation_time"] is not None
+    assert snapshot["last_forced_activation_mode"] == "forced_circuit_reactivation"
+    assert snapshot["forced_activation_count"] >= 1
+
+
+def test_admin_can_pin_disabled_or_cooldown_provider_for_single_job(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        settings,
+        "upstream_providers_json",
+        json.dumps(
+            [
+                {
+                    "provider_id": "manual-off",
+                    "label": "Manual Off",
+                    "adapter_type": "gemini_v1beta",
+                    "base_url": "http://manual-off.example/v1beta",
+                    "api_key": "manual-off-key",
+                    "cost_per_image_cny": 0.05,
+                    "initial_balance_cny": 10,
+                    "supported_models": ["gemini-3-pro-image-preview"],
+                },
+                {
+                    "provider_id": "cooldown-picked",
+                    "label": "Cooldown Picked",
+                    "adapter_type": "gemini_v1beta",
+                    "base_url": "http://cooldown-picked.example/v1beta",
+                    "api_key": "cooldown-picked-key",
+                    "cost_per_image_cny": 0.08,
+                    "initial_balance_cny": 10,
+                    "supported_models": ["gemini-3-pro-image-preview"],
+                },
+            ]
+        ),
+    )
+    provider_store.ensure_initialized()
+    provider_store.update_provider("manual-off", enabled=False)
+    provider_store.record_failure(
+        "cooldown-picked",
+        error_code="UPSTREAM_TIMEOUT",
+        latency_ms=20,
+        open_circuit=True,
+    )
+
+    seen_provider_ids: list[str] = []
+
+    def succeed_provider(*args, **kwargs):
+        config = kwargs["config"]
+        seen_provider_ids.append(config.provider_id)
+        return {
+            "raw": {"candidates": []},
+            "images": [{"mime": "image/png", "bytes": PNG_1X1}],
+            "usage_metadata": {"totalTokenCount": 9},
+            "finish_reason": "STOP",
+            "safety_ratings": [],
+            "latency_ms": 31,
+        }
+
+    monkeypatch.setattr(gemini_client, "_call_gemini_v1beta", succeed_provider)
+
+    login(client)
+
+    for provider_id in ("manual-off", "cooldown-picked"):
+        created = client.post(
+            "/v1/jobs",
+            json={
+                "prompt": f"admin explicit provider {provider_id}",
+                "model": "gemini-3-pro-image-preview",
+                "params": {
+                    "aspect_ratio": "1:1",
+                    "image_size": "1K",
+                    "provider_id": provider_id,
+                    "temperature": 0.7,
+                    "timeout_sec": 60,
+                    "max_retries": 1,
+                },
+                "mode": "IMAGE_ONLY",
+            },
+        )
+        assert created.status_code == 201
+        meta = wait_for_job_terminal(client, created.json()["job_id"])
+        assert meta["status"] == "SUCCEEDED"
+        assert meta["response"]["provider"]["provider_id"] == provider_id
+        assert meta["response"]["provider"]["selection_mode"] == "admin_override"
+        assert meta["response"]["provider"]["forced_activation"] is True
+
+    assert seen_provider_ids == ["manual-off", "cooldown-picked"]
+
+
+def test_regular_user_cannot_specify_provider_id(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        settings,
+        "upstream_providers_json",
+        json.dumps(
+            [
+                {
+                    "provider_id": "admin-only-provider",
+                    "label": "Admin Only Provider",
+                    "adapter_type": "gemini_v1beta",
+                    "base_url": "http://admin-only.example/v1beta",
+                    "api_key": "admin-only-key",
+                    "cost_per_image_cny": 0.05,
+                    "initial_balance_cny": 10,
+                    "supported_models": ["gemini-3-pro-image-preview"],
+                }
+            ]
+        ),
+    )
+    provider_store.ensure_initialized()
+
+    login(client)
+    created_user = client.post(
+        "/v1/admin/users",
+        json={
+            "username": "plainuser",
+            "password": "plainuser123",
+            "role": "USER",
+            "enabled": True,
+        },
+    )
+    assert created_user.status_code == 201
+
+    logout = client.post("/v1/auth/logout")
+    assert logout.status_code == 200
+    login(client, username="plainuser", password="plainuser123")
+
+    created = client.post(
+        "/v1/jobs",
+        json={
+            "prompt": "user should not pick provider",
+            "model": "gemini-3-pro-image-preview",
+            "params": {
+                "aspect_ratio": "1:1",
+                "image_size": "1K",
+                "provider_id": "admin-only-provider",
+                "temperature": 0.7,
+                "timeout_sec": 60,
+                "max_retries": 1,
+            },
+            "mode": "IMAGE_ONLY",
+        },
+    )
+    assert created.status_code == 403
+    assert created.json()["error"]["code"] == "FORBIDDEN"
 
 
 def test_mmw_model_resolution_uses_size_specific_models() -> None:

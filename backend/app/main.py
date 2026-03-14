@@ -791,6 +791,23 @@ def _validate_and_normalize_request(req: CreateJobRequest) -> CreateJobRequest:
     )
 
 
+def _assert_provider_override_allowed(req: CreateJobRequest, current_user: dict[str, Any]) -> None:
+    provider_id = req.params.provider_id
+    if not provider_id:
+        return
+    if str(current_user.get("role") or "").upper() != "ADMIN":
+        raise api_error(ErrorCode.FORBIDDEN, "Only admins can specify provider_id", http_status=403)
+    config = provider_store.get_provider_config(provider_id)
+    if config is None:
+        raise api_error(ErrorCode.INVALID_INPUT, f"Unknown provider_id '{provider_id}'", http_status=400)
+    if req.model not in config.supported_models:
+        raise api_error(
+            ErrorCode.INVALID_INPUT,
+            f"Provider '{provider_id}' does not support model '{req.model}'",
+            http_status=400,
+        )
+
+
 def _build_overquota_batch(
     request: Request,
     *,
@@ -872,6 +889,7 @@ async def _parse_create_request(request: Request) -> tuple[CreateJobRequest, lis
                 "aspect_ratio": form.get("aspect_ratio", "1:1"),
                 "image_size": form.get("image_size", "1K"),
                 "thinking_level": form.get("thinking_level"),
+                "provider_id": form.get("provider_id"),
                 "temperature": float(form.get("temperature", 0.7)),
                 "timeout_sec": int(form.get("timeout_sec", settings.job_timeout_sec_default)),
                 "max_retries": int(form.get("max_retries", 1)),
@@ -1355,6 +1373,7 @@ async def create_job(
 
     gate = _assert_generation_allowed(request, current_user, requested_job_count=requested_job_count)
     req, refs = await _parse_create_request(request)
+    _assert_provider_override_allowed(req, current_user)
     if gate["overflow_quota_mode"]:
         batch_job = _build_overquota_batch(
             request,
@@ -1603,6 +1622,17 @@ async def retry_job(
     if not validate_job_id(job_id):
         raise api_error(ErrorCode.JOB_NOT_FOUND, "Job not found", http_status=404)
     gate = _assert_generation_allowed(request, current_user, requested_job_count=1)
+    if payload.override_params and payload.override_params.provider_id:
+        current_meta = job_manager.get_meta(job_id, x_job_token, current_user)
+        _assert_provider_override_allowed(
+            CreateJobRequest(
+                prompt="retry",
+                model=current_meta.get("model", settings.default_model),
+                params=payload.override_params,
+                mode=current_meta.get("mode", MODE_IMAGE_ONLY),
+            ),
+            current_user,
+        )
     new_job_id, new_token, _ = job_manager.retry_job(job_id, x_job_token, current_user, payload.override_params)
     if gate["consume_turnstile_batch_allowance"]:
         _consume_generation_turnstile_batch_allowance(request, 1)

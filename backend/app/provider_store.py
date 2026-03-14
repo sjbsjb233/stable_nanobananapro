@@ -65,6 +65,14 @@ def _default_state(config: ProviderConfig) -> dict[str, Any]:
         "last_fail_time": None,
         "cooldown_until": None,
         "circuit_open_count": 0,
+        "last_circuit_open_time": None,
+        "last_circuit_open_reason": None,
+        "last_circuit_open_until": None,
+        "last_circuit_open_duration_sec": None,
+        "forced_activation_count": 0,
+        "last_forced_activation_time": None,
+        "last_forced_activation_reason": None,
+        "last_forced_activation_mode": None,
         "recent_calls": [],
         "total_spent_cny": 0.0,
         "total_generated_images": 0,
@@ -307,6 +315,19 @@ class ProviderStore:
             state["last_selected_time"] = now_local().isoformat()
             self._save_state_locked(state_doc)
 
+    def record_forced_activation(self, provider_id: str, *, reason: str, selection_mode: str) -> None:
+        with self._lock:
+            configs, state_doc = self._merged_locked()
+            cfg = next((item for item in configs if item.provider_id == provider_id), None)
+            if cfg is None:
+                return
+            state = state_doc["providers"].setdefault(provider_id, _default_state(cfg))
+            state["forced_activation_count"] = int(state.get("forced_activation_count") or 0) + 1
+            state["last_forced_activation_time"] = now_local().isoformat()
+            state["last_forced_activation_reason"] = str(reason or "").strip() or None
+            state["last_forced_activation_mode"] = str(selection_mode or "").strip() or None
+            self._save_state_locked(state_doc)
+
     def record_success(self, provider_id: str, *, latency_ms: int, image_count: int, cost_cny: float) -> None:
         with self._lock:
             configs, state_doc = self._merged_locked()
@@ -362,7 +383,13 @@ class ProviderStore:
                 open_count = int(state.get("circuit_open_count") or 0) + 1
                 state["circuit_open_count"] = open_count
                 idx = min(open_count - 1, len(_FAILURE_COOLDOWNS_SEC) - 1)
-                state["cooldown_until"] = (now_local() + timedelta(seconds=_FAILURE_COOLDOWNS_SEC[idx])).isoformat()
+                cooldown_duration_sec = int(_FAILURE_COOLDOWNS_SEC[idx])
+                cooldown_until = (now_local() + timedelta(seconds=cooldown_duration_sec)).isoformat()
+                state["cooldown_until"] = cooldown_until
+                state["last_circuit_open_time"] = state["last_fail_time"]
+                state["last_circuit_open_reason"] = error_code
+                state["last_circuit_open_until"] = cooldown_until
+                state["last_circuit_open_duration_sec"] = cooldown_duration_sec
             self._append_recent_call(
                 state,
                 {
@@ -374,56 +401,98 @@ class ProviderStore:
             )
             self._save_state_locked(state_doc)
 
+    def _rank_candidates_locked(self, candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        if not candidates:
+            return []
+        candidates.sort(key=lambda item: (item["cost_per_image_cny"], item["provider_id"]))
+        current_tier = 0
+        previous_cost = None
+        for item in candidates:
+            cost = float(item["cost_per_image_cny"])
+            if previous_cost is None:
+                current_tier = 0
+            elif previous_cost <= 0:
+                current_tier += 1
+            elif cost > previous_cost * 1.05:
+                current_tier += 1
+            item["cost_tier"] = current_tier
+            previous_cost = cost
+
+        ordered: list[dict[str, Any]] = []
+        tiers = sorted({int(item["cost_tier"]) for item in candidates})
+        for tier in tiers:
+            tier_items = [item for item in candidates if int(item["cost_tier"]) == tier]
+            tier_items.sort(
+                key=lambda item: (
+                    -float(item["quota_score"]),
+                    -float(item["health_score"]),
+                    float(item["effective_cost"]),
+                    item["provider_id"],
+                )
+            )
+            ordered.extend(tier_items)
+        return ordered
+
     def candidate_chain(self, model: str) -> list[dict[str, Any]]:
         with self._lock:
             configs, state_doc = self._merged_locked()
             states = state_doc["providers"]
             candidates: list[dict[str, Any]] = []
+            forced_cooldown_candidates: list[dict[str, Any]] = []
             for cfg in configs:
                 if model not in cfg.supported_models:
                     continue
                 state = states.get(cfg.provider_id) or _default_state(cfg)
                 snap = self._snapshot_locked(cfg, state)
+                if snap["active_requests"] >= snap["max_concurrency"]:
+                    continue
                 if not snap["enabled"]:
                     continue
                 if snap["cooldown_active"]:
+                    if snap["quota_state"] != QUOTA_NO:
+                        forced_cooldown_candidates.append(
+                            {
+                                **snap,
+                                "selection_mode": "forced_circuit_reactivation",
+                                "selection_reason": "NO_STANDARD_PROVIDER_AVAILABLE",
+                                "forced_activation": True,
+                            }
+                        )
                     continue
                 if snap["quota_state"] == QUOTA_NO:
                     continue
-                if snap["active_requests"] >= snap["max_concurrency"]:
-                    continue
-                candidates.append(snap)
-            if not candidates:
-                return []
-
-            candidates.sort(key=lambda item: (item["cost_per_image_cny"], item["provider_id"]))
-            current_tier = 0
-            previous_cost = None
-            for item in candidates:
-                cost = float(item["cost_per_image_cny"])
-                if previous_cost is None:
-                    current_tier = 0
-                elif previous_cost <= 0:
-                    current_tier += 1
-                elif cost > previous_cost * 1.05:
-                    current_tier += 1
-                item["cost_tier"] = current_tier
-                previous_cost = cost
-
-            ordered: list[dict[str, Any]] = []
-            tiers = sorted({int(item["cost_tier"]) for item in candidates})
-            for tier in tiers:
-                tier_items = [item for item in candidates if int(item["cost_tier"]) == tier]
-                tier_items.sort(
-                    key=lambda item: (
-                        -float(item["quota_score"]),
-                        -float(item["health_score"]),
-                        float(item["effective_cost"]),
-                        item["provider_id"],
-                    )
+                candidates.append(
+                    {
+                        **snap,
+                        "selection_mode": "standard",
+                        "selection_reason": None,
+                        "forced_activation": False,
+                    }
                 )
-                ordered.extend(tier_items)
-            return ordered
+            if not candidates:
+                return self._rank_candidates_locked(forced_cooldown_candidates)
+            return self._rank_candidates_locked(candidates)
+
+    def admin_override_candidate(self, model: str, provider_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            configs, state_doc = self._merged_locked()
+            cfg = next((item for item in configs if item.provider_id == provider_id), None)
+            if cfg is None or model not in cfg.supported_models:
+                return None
+            state = state_doc["providers"].get(provider_id) or _default_state(cfg)
+            snap = self._snapshot_locked(cfg, state)
+            if snap["active_requests"] >= snap["max_concurrency"]:
+                return None
+            return {
+                **snap,
+                "selection_mode": "admin_override",
+                "selection_reason": "ADMIN_OVERRIDE",
+                "forced_activation": bool(
+                    (not snap["enabled"])
+                    or snap["cooldown_active"]
+                    or snap["quota_state"] == QUOTA_NO
+                ),
+            }
 
     def _snapshot_locked(self, cfg: ProviderConfig, state: dict[str, Any]) -> dict[str, Any]:
         success_count = int(state.get("success_count") or 0)
@@ -519,6 +588,14 @@ class ProviderStore:
             "cooldown_until": cooldown_until,
             "cooldown_active": cooldown_active,
             "circuit_open_count": int(state.get("circuit_open_count") or 0),
+            "last_circuit_open_time": state.get("last_circuit_open_time"),
+            "last_circuit_open_reason": state.get("last_circuit_open_reason"),
+            "last_circuit_open_until": state.get("last_circuit_open_until"),
+            "last_circuit_open_duration_sec": state.get("last_circuit_open_duration_sec"),
+            "forced_activation_count": int(state.get("forced_activation_count") or 0),
+            "last_forced_activation_time": state.get("last_forced_activation_time"),
+            "last_forced_activation_reason": state.get("last_forced_activation_reason"),
+            "last_forced_activation_mode": state.get("last_forced_activation_mode"),
             "success_rate_estimated": round(smoothed_success, 4),
             "recent_success_rate": round(recent_success_rate, 4),
             "final_success_rate": round(final_success, 4),

@@ -11,10 +11,16 @@ frontend/dist/
 frontend/tmp/
 frontend/video/
 frontend/videos/
+tools/playwright/node_modules/
+tools/playwright/.playwright-browsers/
+tools/playwright/.npm-cache/
+tools/playwright/.cache/
+tools/playwright/.playwright-home/
+tools/playwright/.playwright-cli/
+tools/playwright/output/
 srv/stable/compose/.env
 srv/stable/config/backend.prod.env
 srv/stable/data
 srv_server/config/backend.env.example
-.playwright-cli/
 data/logs/
 .codex-tmp/

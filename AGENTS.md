@@ -173,39 +173,53 @@ srv/stable/
 - 常见原因是 `GEMINI_HTTP_PROXY` 不可用
 - 先在容器内验证代理链路，再决定是否关闭代理
 
-## 8. Playwright MCP 使用约定
+## 8. Playwright 本地 CLI 使用约定
 
-后续 Agent 如果需要“在真实浏览器里测试当前仿真环境”，优先使用 Codex 自带的 Playwright MCP/skill，不要切到仓库内自定义浏览器测试链路，也不要先手工伪造 cookie。
+后续 Agent 如果需要“在真实浏览器里测试当前仿真环境”，统一使用 `tools/playwright/` 下的本地 Playwright CLI，也不要先手工伪造 cookie。
+
+项目内固定入口：
+
+- `./tools/playwright/scripts/setup-playwright.sh`：首次安装 Playwright 依赖与 Chromium
+- `./tools/playwright/scripts/playwright-cli.sh`：后续统一 CLI 入口
+- `tools/playwright/node_modules/`：Playwright Node 依赖
+- `tools/playwright/.playwright-browsers/`：浏览器二进制缓存目录
+- `tools/playwright/.playwright-home/`：`playwright-cli` daemon 与运行态缓存目录
+- `tools/playwright/.playwright-cli/`：CLI 快照与控制台日志
+- `./tools/playwright/scripts/playwright-cli.sh open ...` 不要传 `--browser chrome`
+- 默认 headless 模式优先走项目内 `chromium-headless-shell`
+- 传 `--headed` 时切到项目内完整 Chromium
+- `tools/playwright/playwright.config.ts` 与 `tools/playwright/tests/e2e/`：后续沉淀回归测试的标准位置
 
 ### 8.1 什么时候用
 
-- 用户明确要求“用 Playwright / MCP / 浏览器自动化测试”
+- 用户明确要求“用 Playwright / 浏览器自动化测试”
 - 需要确认仿真环境当前页面是否真的能打开、跳转、加载数据
 - 需要复现前端交互问题、登录流程问题、路由问题、控制台报错
 
 ### 8.2 默认做法
 
-1. 先使用 `playwright` skill
-2. 先确认 `npx` 可用
+1. 先确认 `npx` 可用
+2. 确认 `./tools/playwright/scripts/playwright-cli.sh --help` 可用；如果不可用，先执行 `./tools/playwright/scripts/setup-playwright.sh`
 3. 再确认仿真容器是否在线，例如前端 `5178`、后端 `8000`
-4. 优先直接调用 Playwright MCP 工具进行浏览器操作
-5. 默认先 `navigate`，再 `snapshot`，再根据最新 ref 做 `click/fill/type`
+4. 优先直接调用本地 Playwright CLI 进行浏览器操作
+5. 默认先 `open`，再 `snapshot`，再根据最新 ref 做 `click/fill/type`
 6. 页面发生明显变化后重新 `snapshot`，不要复用旧 ref
+7. 如果某个流程需要重复回归，优先补到 `tools/playwright/tests/e2e/` 并通过 `npm --prefix tools/playwright run test:e2e` 执行
 
 ### 8.3 推荐工具顺序
 
-- `browser_navigate`
-- `browser_snapshot`
-- `browser_click` / `browser_fill_form` / `browser_type`
-- `browser_wait_for`
-- `browser_console_messages`
-- 必要时再用 `browser_run_code`
+- `./tools/playwright/scripts/playwright-cli.sh open <url> --headed`
+- `./tools/playwright/scripts/playwright-cli.sh snapshot`
+- `./tools/playwright/scripts/playwright-cli.sh click e12` / `fill e8 "text"` / `type "text"`
+- `./tools/playwright/scripts/playwright-cli.sh wait-for "text"`
+- `./tools/playwright/scripts/playwright-cli.sh console`
+- 需要长期保留的验证流程时，补 `tools/playwright/tests/e2e/` 里的 spec 并执行 `npm --prefix tools/playwright run test:e2e`
 
 说明：
 
 - `snapshot` 是核心步骤；没有新快照时，不要假设旧元素 ref 仍然有效
-- 优先用 MCP 原生命令，不要上来就写大段 `run_code`
-- 只有在 snapshot 无法覆盖的场景下，才补充 `run_code`
+- 优先用本地 CLI 原生命令，不要上来就写大段脚本
+- 一次性排查可用 CLI；重复回归场景优先沉淀为 e2e 测试
 
 ### 8.4 针对本项目的固定入口
 
@@ -242,7 +256,7 @@ srv/stable/
 
 ### 8.7 输出结果时至少说明
 
-- 这次是否使用了 Playwright MCP/skill
+- 这次是否使用了本地 Playwright CLI，或者是否执行了根目录 e2e 测试
 - 访问的入口地址
 - 当前 `TEST_ENV_ADMIN_BYPASS` 状态
 - 实际执行了哪些页面操作
