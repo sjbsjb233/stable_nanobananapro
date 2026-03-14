@@ -707,6 +707,8 @@ function providerSelectOptions(providers: ProviderSnapshot[], modelId: string) {
   ];
 }
 
+const EMPTY_PROVIDER_LIST: ProviderSnapshot[] = [];
+
 function shortId(id: string, keep = 8) {
   if (!id) return "";
   if (id.length <= keep * 2) return id;
@@ -6107,7 +6109,7 @@ function BatchCreatePage() {
     () => modelMap.get(globalModel) || catalog.models[0] || null,
     [catalog.models, globalModel, modelMap]
   );
-  const availableProviders = providerSummary?.providers || [];
+  const availableProviders = providerSummary?.providers ?? EMPTY_PROVIDER_LIST;
   const globalProviderOptions = useMemo(
     () => providerSelectOptions(availableProviders, globalModel),
     [availableProviders, globalModel]
@@ -6195,11 +6197,12 @@ function BatchCreatePage() {
   useEffect(() => {
     if (!isAdmin) {
       if (globalProviderId !== null) setGlobalProviderId(null);
-      setSections((prev) =>
-        prev.map((section) =>
+      setSections((prev) => {
+        if (!prev.some((section) => section.section_provider_id != null)) return prev;
+        return prev.map((section) =>
           section.section_provider_id == null ? section : { ...section, section_provider_id: null }
-        )
-      );
+        );
+      });
       return;
     }
     if (
@@ -6208,16 +6211,24 @@ function BatchCreatePage() {
     ) {
       setGlobalProviderId(null);
     }
-    setSections((prev) =>
-      prev.map((section) =>
+    setSections((prev) => {
+      const hasInvalidProvider = prev.some(
+        (section) =>
+          section.section_provider_id &&
+          !availableProviders.some(
+            (provider) => provider.provider_id === section.section_provider_id && providerSupportsModel(provider, section.section_model)
+          )
+      );
+      if (!hasInvalidProvider) return prev;
+      return prev.map((section) =>
         section.section_provider_id &&
         !availableProviders.some(
           (provider) => provider.provider_id === section.section_provider_id && providerSupportsModel(provider, section.section_model)
         )
           ? { ...section, section_provider_id: null }
           : section
-      )
-    );
+      );
+    });
   }, [availableProviders, globalModel, globalProviderId, isAdmin]);
 
   useEffect(() => {
@@ -7447,7 +7458,7 @@ function CreateJobPage() {
       catalog.models[0]
     );
   }, [catalog, model]);
-  const availableProviders = providerSummary?.providers || [];
+  const availableProviders = providerSummary?.providers ?? EMPTY_PROVIDER_LIST;
   const createProviderOptions = useMemo(
     () => providerSelectOptions(availableProviders, model),
     [availableProviders, model]
