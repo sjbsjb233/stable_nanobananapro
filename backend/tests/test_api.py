@@ -49,6 +49,7 @@ def client(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> TestClient:
     monkeypatch.setattr(settings, "turnstile_secret_key", "test-secret")
     monkeypatch.setattr(settings, "turnstile_site_key", "test-site-key")
     monkeypatch.setattr(settings, "session_secret_key", "test-session-secret")
+    monkeypatch.setattr(settings, "test_env_admin_bypass", False)
 
     storage.data_dir = tmp_path
     storage.jobs_dir = tmp_path / "jobs"
@@ -98,6 +99,43 @@ def test_invalid_session_cookie_does_not_crash(client: TestClient) -> None:
     me = client.get("/v1/auth/me")
     assert me.status_code == 401
     assert me.json()["error"]["code"] == "AUTH_REQUIRED"
+
+
+def test_test_env_admin_bypass_authenticates_without_session(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(settings, "test_env_admin_bypass", True)
+    client.cookies.clear()
+    client.cookies.set("nbp_session", "definitely-not-a-valid-session-cookie")
+
+    me = client.get("/v1/auth/me")
+    assert me.status_code == 200
+    assert me.json()["authenticated"] is True
+    assert me.json()["user"]["username"] == "admin"
+    assert me.json()["user"]["role"] == "ADMIN"
+
+    models = client.get("/v1/models")
+    assert models.status_code == 200
+    assert models.json()["default_model"]
+
+
+def test_test_env_admin_bypass_login_ignores_credentials_and_turnstile(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "test_env_admin_bypass", True)
+
+    resp = client.post(
+        "/v1/auth/login",
+        json={
+            "username": "nobody",
+            "password": "whatever123",
+            "turnstile_token": "ignored-in-test-mode",
+        },
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["authenticated"] is True
+    assert body["user"]["username"] == "admin"
+    assert body["user"]["role"] == "ADMIN"
 
 
 def test_cors_preflight_allows_patch_for_admin_endpoints(client: TestClient) -> None:

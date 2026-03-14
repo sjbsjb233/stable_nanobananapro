@@ -169,7 +169,30 @@ def _parse_session_datetime(value: Any) -> datetime | None:
         return None
 
 
+def _get_test_env_admin_user_or_none() -> dict[str, Any] | None:
+    if not settings.test_env_admin_bypass:
+        return None
+
+    user_store.ensure_initialized()
+
+    preferred_username = str(settings.bootstrap_admin_username or "").strip()
+    if preferred_username:
+        preferred = user_store.get_user_by_username(preferred_username)
+        if preferred and preferred.get("enabled") and str(preferred.get("role") or "").upper() == "ADMIN":
+            return preferred
+
+    for user in user_store.list_users():
+        if user.get("enabled") and str(user.get("role") or "").upper() == "ADMIN":
+            return user
+    return None
+
+
 def _get_authenticated_user_or_none(request: Request) -> dict[str, Any] | None:
+    bypass_user = _get_test_env_admin_user_or_none()
+    if bypass_user:
+        request.state.current_user = bypass_user
+        return bypass_user
+
     session = request.scope.get("session")
     user_id = session.get("user_id") if isinstance(session, dict) else None
     if not user_id:
@@ -389,6 +412,12 @@ def _session_payload(request: Request, user: dict[str, Any]) -> dict[str, Any]:
 
 
 async def _verify_turnstile_or_raise(request: Request, token: str) -> dict[str, Any]:
+    if settings.test_env_admin_bypass:
+        bypass_user = _get_test_env_admin_user_or_none()
+        if bypass_user:
+            request.state.current_user = bypass_user
+            return {"success": True, "hostname": "test-env-admin-bypass"}
+
     if not settings.turnstile_secret_key:
         raise api_error(
             ErrorCode.INVALID_INPUT,
@@ -611,6 +640,12 @@ async def health() -> HealthResponse:
 
 @app.post(f"{settings.api_prefix}/auth/login")
 async def login(payload: LoginRequest, request: Request) -> dict[str, Any]:
+    bypass_user = _get_test_env_admin_user_or_none()
+    if bypass_user:
+        request.state.current_user = bypass_user
+        request.session.clear()
+        return _session_payload(request, bypass_user)
+
     await _verify_turnstile_or_raise(request, payload.turnstile_token)
 
     user = user_store.authenticate(payload.username, payload.password)

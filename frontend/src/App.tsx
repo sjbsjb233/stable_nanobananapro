@@ -572,8 +572,16 @@ const KEY_PICKER_RECENT = "nbp_picker_recent_v1";
 const KEY_PICKER_SIDEBAR_PREF = "nbp_picker_sidebar_pref_v1";
 const KEY_HISTORY_AUTO_REFRESH_PREF = "nbp_history_auto_refresh_pref_v1";
 const KEY_CREATE_CLONE_DRAFT = "nbp_create_clone_draft_v1";
+const KEY_CREATE_PAGE_DRAFT = "nbp_create_page_draft_v1";
+const KEY_BATCH_PAGE_DRAFT = "nbp_batch_page_draft_v1";
 const IMAGE_CACHE_DB = "nbp_image_cache_v1";
 const IMAGE_CACHE_STORE = "images";
+const DRAFT_BLOB_BASE_URL = "__draft__";
+const DRAFT_CACHE_CONFIG = {
+  enabled: true,
+  ttlDays: 30,
+  maxBytes: 512 * 1024 * 1024,
+} satisfies SettingsV1["cache"];
 
 // -----------------------------
 // Utils
@@ -710,6 +718,78 @@ type CreateCloneDraft = {
   model: ModelId;
   mode: JobMode;
   params: Partial<DefaultParams>;
+};
+
+type PersistedDraftFileMeta = {
+  id: string;
+  name: string;
+  type: string;
+  size: number;
+  lastModified: number;
+};
+
+type CreatePageDraft = {
+  scope: string;
+  prompt: string;
+  model: ModelId;
+  mode: CreateMode;
+  sessionSearch: string;
+  newSessionName: string;
+  boundSessionIds: string[];
+  aspect: AspectRatio;
+  size: ImageSize;
+  thinkingLevel: string | null;
+  temperature: number;
+  timeoutSec: number;
+  maxRetries: number;
+  jobCount: number;
+  files: PersistedDraftFileMeta[];
+  updated_at: string;
+};
+
+type BatchSectionDraftPersisted = {
+  id: string;
+  section_title: string;
+  section_prompt: string;
+  section_model: ModelId;
+  section_aspect_ratio: AspectRatio;
+  section_image_size: ImageSize;
+  section_temperature: number;
+  section_job_count: number;
+  collection_mode: BatchCollectionMode;
+  collection_name: string;
+  existing_session_ids: string[];
+  inherit_previous_settings: boolean;
+  enabled: boolean;
+  section_reference_images: PersistedDraftFileMeta[];
+};
+
+type BatchPageDraft = {
+  scope: string;
+  batchName: string;
+  batchNote: string;
+  defaultCollectionStrategy: BatchCollectionMode;
+  submitMode: BatchSubmitMode;
+  globalPrompt: string;
+  globalFiles: PersistedDraftFileMeta[];
+  globalModel: ModelId;
+  globalAspect: AspectRatio;
+  globalSize: ImageSize;
+  globalTemperature: number;
+  globalJobCount: number;
+  namingTemplate: string;
+  submitEnabledOnly: boolean;
+  submitStartFrom: string;
+  autoInjectPageNo: boolean;
+  removeFailedFromSession: boolean;
+  selectedSectionIds: string[];
+  sections: BatchSectionDraftPersisted[];
+  updated_at: string;
+};
+
+type DraftFileEntry = {
+  namespace: string;
+  meta: PersistedDraftFileMeta;
 };
 
 function createDraftId(prefix: string) {
@@ -1321,6 +1401,109 @@ function loadCreateCloneDraft(): CreateCloneDraft | null {
 
 function clearCreateCloneDraft() {
   storageRemove(KEY_CREATE_CLONE_DRAFT);
+}
+
+function draftBlobScope(scope: string) {
+  return `draft:${scope || "__guest__"}`;
+}
+
+function draftBlobJobId(draftKey: string, namespace: string) {
+  return `${draftKey}:${namespace}`;
+}
+
+function persistedDraftFileId(file: Pick<File, "name" | "size" | "type" | "lastModified">) {
+  return `${file.name}::${file.size}::${file.type || "application/octet-stream"}::${file.lastModified}`;
+}
+
+function toPersistedDraftFileMeta(file: File): PersistedDraftFileMeta {
+  return {
+    id: persistedDraftFileId(file),
+    name: file.name,
+    type: file.type || "application/octet-stream",
+    size: file.size,
+    lastModified: file.lastModified || Date.now(),
+  };
+}
+
+async function imageCacheDelete(scope: string, baseUrl: string, jobId: string, imageId: string, variant: ImageVariant) {
+  try {
+    const db = await openImageCacheDb();
+    await new Promise<void>((resolve, reject) => {
+      const tx = db.transaction(IMAGE_CACHE_STORE, "readwrite");
+      tx.objectStore(IMAGE_CACHE_STORE).delete(imageCacheKey(imageCacheRecordScope(scope), baseUrl, jobId, imageId, variant));
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error || new Error("Failed to delete image cache entry"));
+      tx.onabort = () => reject(tx.error || new Error("Failed to delete image cache entry"));
+    });
+  } catch {
+    // ignore
+  }
+}
+
+async function putDraftFileBlob(scope: string, draftKey: string, namespace: string, file: File, meta: PersistedDraftFileMeta) {
+  await imageCachePut(
+    draftBlobScope(scope),
+    DRAFT_BLOB_BASE_URL,
+    draftBlobJobId(draftKey, namespace),
+    meta.id,
+    "original",
+    file,
+    DRAFT_CACHE_CONFIG
+  );
+}
+
+async function deleteDraftFileBlob(scope: string, draftKey: string, namespace: string, meta: PersistedDraftFileMeta) {
+  await imageCacheDelete(
+    draftBlobScope(scope),
+    DRAFT_BLOB_BASE_URL,
+    draftBlobJobId(draftKey, namespace),
+    meta.id,
+    "original"
+  );
+}
+
+async function restoreDraftFiles(scope: string, draftKey: string, namespace: string, metas: PersistedDraftFileMeta[]) {
+  const files = await Promise.all(
+    (metas || []).map(async (meta) => {
+      const blob = await imageCacheGet(
+        draftBlobScope(scope),
+        DRAFT_BLOB_BASE_URL,
+        draftBlobJobId(draftKey, namespace),
+        meta.id,
+        "original"
+      );
+      if (!blob) return null;
+      return new File([blob], meta.name, {
+        type: meta.type || blob.type || "application/octet-stream",
+        lastModified: meta.lastModified || Date.now(),
+      });
+    })
+  );
+  return files.filter((file): file is File => Boolean(file));
+}
+
+function saveCreatePageDraft(draft: CreatePageDraft) {
+  storageSet(KEY_CREATE_PAGE_DRAFT, JSON.stringify(draft));
+}
+
+function loadCreatePageDraft(): CreatePageDraft | null {
+  return safeJsonParse<CreatePageDraft | null>(storageGet(KEY_CREATE_PAGE_DRAFT), null);
+}
+
+function clearCreatePageDraft() {
+  storageRemove(KEY_CREATE_PAGE_DRAFT);
+}
+
+function saveBatchPageDraft(draft: BatchPageDraft) {
+  storageSet(KEY_BATCH_PAGE_DRAFT, JSON.stringify(draft));
+}
+
+function loadBatchPageDraft(): BatchPageDraft | null {
+  return safeJsonParse<BatchPageDraft | null>(storageGet(KEY_BATCH_PAGE_DRAFT), null);
+}
+
+function clearBatchPageDraft() {
+  storageRemove(KEY_BATCH_PAGE_DRAFT);
 }
 
 function invalidatePickerEntriesForDeletedJob(jobId: string) {
@@ -5797,7 +5980,10 @@ function BatchCreatePage() {
     [catalog.models]
   );
   const initialModel = settings.defaultModel || catalog.default_model;
-  const initialParams = getParamsForModel(settings, initialModel, modelMap.get(initialModel)?.default_params);
+  const initialParams = useMemo(
+    () => getParamsForModel(settings, initialModel, modelMap.get(initialModel)?.default_params),
+    [initialModel, modelMap, settings.defaultParams, settings.defaultParamsByModel]
+  );
 
   const [batchName, setBatchName] = useState("");
   const [batchNote, setBatchNote] = useState("");
@@ -5832,10 +6018,70 @@ function BatchCreatePage() {
   const [generationTurnstileKey, setGenerationTurnstileKey] = useState(0);
   const [verifyingGenerationTurnstile, setVerifyingGenerationTurnstile] = useState(false);
   const [pendingGenerationTargetCount, setPendingGenerationTargetCount] = useState<number | null>(null);
+  const batchDraftHydratedRef = useRef(false);
+  const batchDraftFileEntriesRef = useRef<DraftFileEntry[]>([]);
+  const batchDraftScope = user?.user_id || "__guest__";
 
   const globalModelMeta = useMemo(
     () => modelMap.get(globalModel) || catalog.models[0] || null,
     [catalog.models, globalModel, modelMap]
+  );
+  const globalDraftFileMetas = useMemo(() => globalFiles.map((file) => toPersistedDraftFileMeta(file)), [globalFiles]);
+  const batchDraftSections = useMemo<BatchSectionDraftPersisted[]>(
+    () =>
+      sections.map((section) => ({
+        id: section.id,
+        section_title: section.section_title,
+        section_prompt: section.section_prompt,
+        section_model: section.section_model,
+        section_aspect_ratio: section.section_aspect_ratio,
+        section_image_size: section.section_image_size,
+        section_temperature: section.section_temperature,
+        section_job_count: section.section_job_count,
+        collection_mode: section.collection_mode,
+        collection_name: section.collection_name,
+        existing_session_ids: [...section.existing_session_ids],
+        inherit_previous_settings: section.inherit_previous_settings,
+        enabled: section.enabled,
+        section_reference_images: section.section_reference_images.map((file) => toPersistedDraftFileMeta(file)),
+      })),
+    [sections]
+  );
+  const batchDraftFileEntries = useMemo<DraftFileEntry[]>(
+    () => [
+      ...globalDraftFileMetas.map((meta) => ({ namespace: "global", meta })),
+      ...batchDraftSections.flatMap((section) =>
+        section.section_reference_images.map((meta) => ({
+          namespace: `section:${section.id}`,
+          meta,
+        }))
+      ),
+    ],
+    [batchDraftSections, globalDraftFileMetas]
+  );
+  const batchDraftSnapshot = useDebounced(
+    {
+      scope: batchDraftScope,
+      batchName,
+      batchNote,
+      defaultCollectionStrategy,
+      submitMode,
+      globalPrompt,
+      globalFiles: globalDraftFileMetas,
+      globalModel,
+      globalAspect,
+      globalSize,
+      globalTemperature,
+      globalJobCount,
+      namingTemplate,
+      submitEnabledOnly,
+      submitStartFrom,
+      autoInjectPageNo,
+      removeFailedFromSession,
+      selectedSectionIds,
+      sections: batchDraftSections,
+    },
+    250
   );
 
   useEffect(() => {
@@ -5869,6 +6115,55 @@ function BatchCreatePage() {
     );
   }, [sortedPickerSessions]);
 
+  useEffect(() => {
+    if (!batchDraftHydratedRef.current) return;
+    let cancelled = false;
+
+    const syncBatchDraftFiles = async () => {
+      const prevEntries = batchDraftFileEntriesRef.current;
+      const prevMap = new Map(prevEntries.map((entry) => [`${entry.namespace}::${entry.meta.id}`, entry]));
+      const nextMap = new Map(batchDraftFileEntries.map((entry) => [`${entry.namespace}::${entry.meta.id}`, entry]));
+      const liveFilesByKey = new Map<string, File>();
+
+      globalFiles.forEach((file) => {
+        liveFilesByKey.set(`global::${persistedDraftFileId(file)}`, file);
+      });
+      sections.forEach((section) => {
+        section.section_reference_images.forEach((file) => {
+          liveFilesByKey.set(`section:${section.id}::${persistedDraftFileId(file)}`, file);
+        });
+      });
+
+      for (const [key, entry] of prevMap.entries()) {
+        if (nextMap.has(key)) continue;
+        await deleteDraftFileBlob(batchDraftScope, KEY_BATCH_PAGE_DRAFT, entry.namespace, entry.meta);
+      }
+
+      for (const [key, entry] of nextMap.entries()) {
+        if (prevMap.has(key)) continue;
+        const file = liveFilesByKey.get(key);
+        if (!file) continue;
+        await putDraftFileBlob(batchDraftScope, KEY_BATCH_PAGE_DRAFT, entry.namespace, file, entry.meta);
+      }
+
+      if (cancelled) return;
+      batchDraftFileEntriesRef.current = batchDraftFileEntries;
+    };
+
+    void syncBatchDraftFiles();
+    return () => {
+      cancelled = true;
+    };
+  }, [batchDraftFileEntries, batchDraftScope, globalFiles, sections]);
+
+  useEffect(() => {
+    if (!batchDraftHydratedRef.current) return;
+    saveBatchPageDraft({
+      ...batchDraftSnapshot,
+      updated_at: isoNow(),
+    });
+  }, [batchDraftSnapshot]);
+
   const updateSection = (sectionId: string, updater: (section: BatchSection, index: number) => BatchSection) => {
     setSections((prev) =>
       prev.map((section, index) => (section.id === sectionId ? updater(section, index) : section))
@@ -5891,6 +6186,100 @@ function BatchCreatePage() {
     ...(seed || {}),
     id: createDraftId("sec"),
   });
+
+  useEffect(() => {
+    let cancelled = false;
+    batchDraftHydratedRef.current = false;
+    batchDraftFileEntriesRef.current = [];
+
+    const hydrate = async () => {
+      const draft = loadBatchPageDraft();
+      if (!draft || draft.scope !== batchDraftScope) {
+        batchDraftHydratedRef.current = true;
+        return;
+      }
+
+      const restoredGlobalFiles = await restoreDraftFiles(batchDraftScope, KEY_BATCH_PAGE_DRAFT, "global", draft.globalFiles || []);
+      const restoredSectionsRaw = await Promise.all(
+        (draft.sections || []).map(async (section) => {
+          const restoredFiles = await restoreDraftFiles(
+            batchDraftScope,
+            KEY_BATCH_PAGE_DRAFT,
+            `section:${section.id}`,
+            section.section_reference_images || []
+          );
+          return {
+            id: section.id || createDraftId("sec"),
+            section_title: section.section_title || "",
+            section_prompt: section.section_prompt || "",
+            section_reference_images: restoredFiles,
+            section_model: section.section_model || initialModel,
+            section_aspect_ratio: section.section_aspect_ratio || initialParams.aspect_ratio,
+            section_image_size: section.section_image_size || initialParams.image_size,
+            section_temperature: typeof section.section_temperature === "number" ? section.section_temperature : initialParams.temperature,
+            section_job_count: typeof section.section_job_count === "number" ? section.section_job_count : 1,
+            collection_mode: section.collection_mode || draft.defaultCollectionStrategy || "AUTO_BATCH",
+            collection_name: section.collection_name || "",
+            existing_session_ids: Array.isArray(section.existing_session_ids) ? section.existing_session_ids : [],
+            inherit_previous_settings: Boolean(section.inherit_previous_settings),
+            enabled: section.enabled !== false,
+          } satisfies BatchSection;
+        })
+      );
+      if (cancelled) return;
+
+      const fallbackSection = {
+        ...createBatchSectionDraft({
+          fallbackModel: draft.globalModel || initialModel,
+          settings,
+          defaultCollectionMode: draft.defaultCollectionStrategy || "AUTO_BATCH",
+        }),
+        section_model: draft.globalModel || initialModel,
+        section_aspect_ratio: draft.globalAspect || initialParams.aspect_ratio,
+        section_image_size: draft.globalSize || initialParams.image_size,
+        section_temperature: typeof draft.globalTemperature === "number" ? draft.globalTemperature : initialParams.temperature,
+        section_job_count: typeof draft.globalJobCount === "number" ? draft.globalJobCount : 1,
+        collection_mode: draft.defaultCollectionStrategy || "AUTO_BATCH",
+        inherit_previous_settings: false,
+      } satisfies BatchSection;
+      const restoredSections = restoredSectionsRaw.length ? restoredSectionsRaw : [fallbackSection];
+
+      setBatchName(draft.batchName || "");
+      setBatchNote(draft.batchNote || "");
+      setDefaultCollectionStrategy(draft.defaultCollectionStrategy || "AUTO_BATCH");
+      setSubmitMode(draft.submitMode || "IMMEDIATE");
+      setGlobalPrompt(draft.globalPrompt || "");
+      setGlobalFiles(restoredGlobalFiles);
+      setGlobalModel(draft.globalModel || initialModel);
+      setGlobalAspect(draft.globalAspect || initialParams.aspect_ratio);
+      setGlobalSize(draft.globalSize || initialParams.image_size);
+      setGlobalTemperature(typeof draft.globalTemperature === "number" ? draft.globalTemperature : initialParams.temperature);
+      setGlobalJobCount(typeof draft.globalJobCount === "number" ? draft.globalJobCount : 1);
+      setNamingTemplate(draft.namingTemplate || BATCH_NAME_TEMPLATE_DEFAULT);
+      setSubmitEnabledOnly(draft.submitEnabledOnly !== false);
+      setSubmitStartFrom(draft.submitStartFrom || "1");
+      setAutoInjectPageNo(draft.autoInjectPageNo !== false);
+      setRemoveFailedFromSession(draft.removeFailedFromSession !== false);
+      setSections(restoredSections);
+      setSelectedSectionIds((draft.selectedSectionIds || []).filter((id) => restoredSections.some((section) => section.id === id)));
+      batchDraftFileEntriesRef.current = [
+        ...(draft.globalFiles || []).map((meta) => ({ namespace: "global", meta })),
+        ...(draft.sections || []).flatMap((section) =>
+          (section.section_reference_images || []).map((meta) => ({
+            namespace: `section:${section.id}`,
+            meta,
+          }))
+        ),
+      ];
+      batchDraftHydratedRef.current = true;
+      push({ kind: "info", title: "已恢复未完成编辑", message: "Batch 页面草稿已自动回填" });
+    };
+
+    void hydrate();
+    return () => {
+      cancelled = true;
+    };
+  }, [batchDraftScope]);
 
   const toggleSelectedSection = (sectionId: string, checked: boolean) => {
     setSelectedSectionIds((prev) => {
@@ -5995,6 +6384,15 @@ function BatchCreatePage() {
       existing_session_ids: Array.from(new Set([sessionId, ...section.existing_session_ids])),
     }));
     push({ kind: "success", title: "已创建并选中 session" });
+  };
+
+  const clearBatchAutosave = async () => {
+    const entries = batchDraftFileEntriesRef.current;
+    await Promise.all(
+      entries.map((entry) => deleteDraftFileBlob(batchDraftScope, KEY_BATCH_PAGE_DRAFT, entry.namespace, entry.meta))
+    );
+    batchDraftFileEntriesRef.current = [];
+    clearBatchPageDraft();
   };
 
   const plannedSections = useMemo(() => {
@@ -6247,6 +6645,7 @@ function BatchCreatePage() {
         throw { error: { code: "BAD_RESPONSE", message: firstError || "批量提交失败" } };
       }
 
+      await clearBatchAutosave();
       push({
         kind: createdCount === totalTargetCount ? "success" : "info",
         title: `Batch queued ${createdCount}/${totalTargetCount}`,
@@ -6350,6 +6749,7 @@ function BatchCreatePage() {
               <Button
                 variant="secondary"
                 onClick={() => {
+                  void clearBatchAutosave();
                   setBatchName("");
                   setBatchNote("");
                   setGlobalPrompt("");
@@ -6852,7 +7252,10 @@ function CreateJobPage() {
   const [newSessionName, setNewSessionName] = useState("");
   const [boundSessionIds, setBoundSessionIds] = useState<string[]>([]);
 
-  const initParams = getParamsForModel(settings, settings.defaultModel || catalog.default_model);
+  const initParams = useMemo(
+    () => getParamsForModel(settings, settings.defaultModel || catalog.default_model),
+    [catalog.default_model, settings.defaultModel, settings.defaultParams, settings.defaultParamsByModel]
+  );
   const [aspect, setAspect] = useState<AspectRatio>(initParams.aspect_ratio);
   const [size, setSize] = useState<ImageSize>(initParams.image_size);
   const [thinkingLevel, setThinkingLevel] = useState<string | null>(initParams.thinking_level ?? null);
@@ -6870,6 +7273,8 @@ function CreateJobPage() {
   const [modelRecommendationOpen, setModelRecommendationOpen] = useState(false);
   const [pendingModelChoice, setPendingModelChoice] = useState<ModelId | null>(null);
   const hydratedModelRef = useRef<ModelId | null>(null);
+  const createDraftHydratedRef = useRef(false);
+  const createDraftFileEntriesRef = useRef<DraftFileEntry[]>([]);
   const lastPasteAtRef = useRef<number>(0);
   const MAX_REF_FILES = 14;
   const recommendedModelId: ModelId = "gemini-3.1-flash-image-preview";
@@ -6877,6 +7282,7 @@ function CreateJobPage() {
     () => ["gemini-3-pro-image-preview", "gemini-2.5-flash-image"],
     []
   );
+  const createDraftScope = user?.user_id || "__guest__";
 
   const currentModel = useMemo(() => {
     return (
@@ -6895,6 +7301,31 @@ function CreateJobPage() {
     return pickerSessions.filter((session) => session.name.toLowerCase().includes(query));
   }, [pickerSessions, sessionSearch]);
   const boundSessionIdSet = useMemo(() => new Set(boundSessionIds), [boundSessionIds]);
+  const createDraftFileMetas = useMemo(() => files.map((file) => toPersistedDraftFileMeta(file)), [files]);
+  const createDraftFileEntries = useMemo(
+    () => createDraftFileMetas.map((meta) => ({ namespace: "create", meta })),
+    [createDraftFileMetas]
+  );
+  const createDraftSnapshot = useDebounced(
+    {
+      scope: createDraftScope,
+      prompt,
+      model,
+      mode,
+      sessionSearch,
+      newSessionName,
+      boundSessionIds,
+      aspect,
+      size,
+      thinkingLevel,
+      temperature,
+      timeoutSec,
+      maxRetries,
+      jobCount,
+      files: createDraftFileMetas,
+    },
+    250
+  );
 
   const applyModelChoice = (nextModel: ModelId) => {
     setModel(nextModel);
@@ -6919,24 +7350,70 @@ function CreateJobPage() {
   }, [catalog.models, currentModel, model]);
 
   useEffect(() => {
-    const draft = loadCreateCloneDraft();
-    if (!draft) return;
-    setPrompt(draft.prompt || "");
-    if (draft.model) {
-      setModel(draft.model);
-      hydratedModelRef.current = null;
-    }
-    if (draft.mode) setMode(draft.mode);
-    if (draft.params?.aspect_ratio) setAspect(draft.params.aspect_ratio as AspectRatio);
-    if (draft.params?.image_size) setSize(draft.params.image_size as ImageSize);
-    if (draft.params?.thinking_level !== undefined) setThinkingLevel(draft.params.thinking_level ?? null);
-    if (typeof draft.params?.temperature === "number") setTemperature(draft.params.temperature);
-    if (typeof draft.params?.timeout_sec === "number") setTimeoutSec(draft.params.timeout_sec);
-    if (typeof draft.params?.max_retries === "number") setMaxRetries(draft.params.max_retries);
-    clearCreateCloneDraft();
-    push({ kind: "info", title: "已导入历史任务参数", message: "参考图不会自动回填，请按需重新上传" });
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+    let cancelled = false;
+    createDraftHydratedRef.current = false;
+    createDraftFileEntriesRef.current = [];
+
+    const hydrate = async () => {
+      const cloneDraft = loadCreateCloneDraft();
+      if (cloneDraft) {
+        if (cancelled) return;
+        setPrompt(cloneDraft.prompt || "");
+        setFiles([]);
+        setMode(cloneDraft.mode || "IMAGE_ONLY");
+        setSessionSearch("");
+        setNewSessionName("");
+        setBoundSessionIds([]);
+        if (cloneDraft.model) {
+          setModel(cloneDraft.model);
+        }
+        if (cloneDraft.params?.aspect_ratio) setAspect(cloneDraft.params.aspect_ratio as AspectRatio);
+        if (cloneDraft.params?.image_size) setSize(cloneDraft.params.image_size as ImageSize);
+        if (cloneDraft.params?.thinking_level !== undefined) setThinkingLevel(cloneDraft.params.thinking_level ?? null);
+        if (typeof cloneDraft.params?.temperature === "number") setTemperature(cloneDraft.params.temperature);
+        if (typeof cloneDraft.params?.timeout_sec === "number") setTimeoutSec(cloneDraft.params.timeout_sec);
+        if (typeof cloneDraft.params?.max_retries === "number") setMaxRetries(cloneDraft.params.max_retries);
+        hydratedModelRef.current = cloneDraft.model || settings.defaultModel || catalog.default_model;
+        createDraftHydratedRef.current = true;
+        clearCreateCloneDraft();
+        push({ kind: "info", title: "已导入历史任务参数", message: "参考图不会自动回填，请按需重新上传" });
+        return;
+      }
+
+      const draft = loadCreatePageDraft();
+      if (!draft || draft.scope !== createDraftScope) {
+        createDraftHydratedRef.current = true;
+        return;
+      }
+
+      const restoredFiles = await restoreDraftFiles(createDraftScope, KEY_CREATE_PAGE_DRAFT, "create", draft.files || []);
+      if (cancelled) return;
+
+      setPrompt(draft.prompt || "");
+      setFiles(restoredFiles);
+      setModel(draft.model || settings.defaultModel || catalog.default_model);
+      setMode(draft.mode || "IMAGE_ONLY");
+      setSessionSearch(draft.sessionSearch || "");
+      setNewSessionName(draft.newSessionName || "");
+      setBoundSessionIds(Array.isArray(draft.boundSessionIds) ? draft.boundSessionIds : []);
+      setAspect(draft.aspect || initParams.aspect_ratio);
+      setSize(draft.size || initParams.image_size);
+      setThinkingLevel(draft.thinkingLevel ?? initParams.thinking_level ?? null);
+      setTemperature(typeof draft.temperature === "number" ? draft.temperature : initParams.temperature);
+      setTimeoutSec(typeof draft.timeoutSec === "number" ? draft.timeoutSec : initParams.timeout_sec);
+      setMaxRetries(typeof draft.maxRetries === "number" ? draft.maxRetries : initParams.max_retries);
+      setJobCount(typeof draft.jobCount === "number" ? draft.jobCount : 1);
+      hydratedModelRef.current = draft.model || settings.defaultModel || catalog.default_model;
+      createDraftFileEntriesRef.current = (draft.files || []).map((meta) => ({ namespace: "create", meta }));
+      createDraftHydratedRef.current = true;
+      push({ kind: "info", title: "已恢复未完成编辑", message: "Create 页面草稿已自动回填" });
+    };
+
+    void hydrate();
+    return () => {
+      cancelled = true;
+    };
+  }, [createDraftScope]);
 
   useEffect(() => {
     if (!currentModel) return;
@@ -6954,6 +7431,45 @@ function CreateJobPage() {
   useEffect(() => {
     setBoundSessionIds((prev) => prev.filter((sessionId) => pickerSessions.some((session) => session.session_id === sessionId)));
   }, [pickerSessions]);
+
+  useEffect(() => {
+    if (!createDraftHydratedRef.current) return;
+    let cancelled = false;
+
+    const syncCreateDraftFiles = async () => {
+      const prevEntries = createDraftFileEntriesRef.current;
+      const prevMap = new Map(prevEntries.map((entry) => [`${entry.namespace}::${entry.meta.id}`, entry]));
+      const nextMap = new Map(createDraftFileEntries.map((entry) => [`${entry.namespace}::${entry.meta.id}`, entry]));
+
+      for (const [key, entry] of prevMap.entries()) {
+        if (nextMap.has(key)) continue;
+        await deleteDraftFileBlob(createDraftScope, KEY_CREATE_PAGE_DRAFT, entry.namespace, entry.meta);
+      }
+
+      for (const [key, entry] of nextMap.entries()) {
+        if (prevMap.has(key)) continue;
+        const file = files.find((candidate) => persistedDraftFileId(candidate) === entry.meta.id);
+        if (!file) continue;
+        await putDraftFileBlob(createDraftScope, KEY_CREATE_PAGE_DRAFT, entry.namespace, file, entry.meta);
+      }
+
+      if (cancelled) return;
+      createDraftFileEntriesRef.current = createDraftFileEntries;
+    };
+
+    void syncCreateDraftFiles();
+    return () => {
+      cancelled = true;
+    };
+  }, [createDraftFileEntries, createDraftScope, files]);
+
+  useEffect(() => {
+    if (!createDraftHydratedRef.current) return;
+    saveCreatePageDraft({
+      ...createDraftSnapshot,
+      updated_at: isoNow(),
+    });
+  }, [createDraftSnapshot]);
 
   useEffect(() => {
     const onPaste = (evt: ClipboardEvent) => {
@@ -7124,6 +7640,15 @@ function CreateJobPage() {
     push({ kind: "success", title: "已创建并绑定 session" });
   };
 
+  const clearCreateAutosave = async () => {
+    const entries = createDraftFileEntriesRef.current;
+    await Promise.all(
+      entries.map((entry) => deleteDraftFileBlob(createDraftScope, KEY_CREATE_PAGE_DRAFT, entry.namespace, entry.meta))
+    );
+    createDraftFileEntriesRef.current = [];
+    clearCreatePageDraft();
+  };
+
   const attachJobToBoundSessions = (job: {
     job_id: string;
     job_access_token?: string;
@@ -7246,6 +7771,7 @@ function CreateJobPage() {
 
       // remember last used as defaults for this model
       updateDefaultParams(model, params);
+      await clearCreateAutosave();
 
       if (created.length === 1) {
         push({ kind: "success", title: "创建成功", message: `job_id: ${shortId(created[0].job_id)}` });
@@ -7368,8 +7894,12 @@ function CreateJobPage() {
                 </div>
               ) : null}
               <Button variant="secondary" onClick={() => {
+                void clearCreateAutosave();
                 setPrompt("");
                 setFiles([]);
+                setSessionSearch("");
+                setNewSessionName("");
+                setBoundSessionIds([]);
                 setJobCount(1);
                 push({ kind: "info", title: "已清空" });
               }}>
@@ -12257,7 +12787,7 @@ function SettingsPage() {
         <Card>
           <div className="text-sm font-bold text-zinc-900 dark:text-zinc-50">生图默认参数</div>
           <div className="mt-2 text-xs text-zinc-600 dark:text-zinc-300">
-            提示：在 Create 页面调整参数会自动保存（刷新网页也会保留）。这里仅提供“恢复默认”。
+            提示：Create 和 Batch 页面都会自动保存未完成编辑（刷新网页也会保留）。这里仅提供“恢复默认”。
           </div>
           <Divider />
           <div className="grid grid-cols-2 gap-2 text-xs">

@@ -62,6 +62,7 @@ class Settings(BaseSettings):
     session_cookie_name: str = Field(default="nbp_session", alias="SESSION_COOKIE_NAME")
     session_max_age_sec: int = Field(default=7 * 24 * 3600, alias="SESSION_MAX_AGE_SEC")
     session_https_only: bool = Field(default=False, alias="SESSION_HTTPS_ONLY")
+    test_env_admin_bypass: bool = Field(default=False, alias="TEST_ENV_ADMIN_BYPASS")
 
     bootstrap_admin_username: str = Field(default="admin", alias="BOOTSTRAP_ADMIN_USERNAME")
     bootstrap_admin_password: str = Field(default="admin123456", alias="BOOTSTRAP_ADMIN_PASSWORD")
