@@ -36,10 +36,13 @@
 认证相关额外关注：
 
 - `backend/.env` 需要配置 `SESSION_SECRET_KEY`、`TURNSTILE_SECRET_KEY`
+- `TEST_ENV_ADMIN_BYPASS` 是后端测试环境开关，默认 `false`
 - 首次启动会按 `BOOTSTRAP_ADMIN_USERNAME` / `BOOTSTRAP_ADMIN_PASSWORD` 自动创建管理员
 - 前端 Turnstile 站点密钥在开发环境走 `frontend/.env` 的 `VITE_TURNSTILE_SITE_KEY`，Docker 环境走前端容器的 `FRONTEND_TURNSTILE_SITE_KEY`
 - 多中转站走 `UPSTREAM_PROVIDERS_JSON` 注入；provider 的启用状态、备注、余额与运行时状态由后端写入 `data/providers.json`
 - 如果未配置 `UPSTREAM_PROVIDERS_JSON`，后端会退回旧的单一 `GEMINI_API_KEY` / `GEMINI_API_BASE_URL` 模式
+- 当 `TEST_ENV_ADMIN_BYPASS=true` 时，后端会把所有受保护请求直接视为 admin 访问，不校验 cookie / session，也不会要求登录页 Turnstile
+- 在上述测试环境下使用 Playwright 时，无需注入任何 cookie 或 session，直接访问目标页面即可开始测试
 
 ## 3. 开发环境运行（非 Docker）
 
@@ -170,7 +173,83 @@ srv/stable/
 - 常见原因是 `GEMINI_HTTP_PROXY` 不可用
 - 先在容器内验证代理链路，再决定是否关闭代理
 
-## 8. Agent 执行约定
+## 8. Playwright MCP 使用约定
+
+后续 Agent 如果需要“在真实浏览器里测试当前仿真环境”，优先使用 Codex 自带的 Playwright MCP/skill，不要切到仓库内自定义浏览器测试链路，也不要先手工伪造 cookie。
+
+### 8.1 什么时候用
+
+- 用户明确要求“用 Playwright / MCP / 浏览器自动化测试”
+- 需要确认仿真环境当前页面是否真的能打开、跳转、加载数据
+- 需要复现前端交互问题、登录流程问题、路由问题、控制台报错
+
+### 8.2 默认做法
+
+1. 先使用 `playwright` skill
+2. 先确认 `npx` 可用
+3. 再确认仿真容器是否在线，例如前端 `5178`、后端 `8000`
+4. 优先直接调用 Playwright MCP 工具进行浏览器操作
+5. 默认先 `navigate`，再 `snapshot`，再根据最新 ref 做 `click/fill/type`
+6. 页面发生明显变化后重新 `snapshot`，不要复用旧 ref
+
+### 8.3 推荐工具顺序
+
+- `browser_navigate`
+- `browser_snapshot`
+- `browser_click` / `browser_fill_form` / `browser_type`
+- `browser_wait_for`
+- `browser_console_messages`
+- 必要时再用 `browser_run_code`
+
+说明：
+
+- `snapshot` 是核心步骤；没有新快照时，不要假设旧元素 ref 仍然有效
+- 优先用 MCP 原生命令，不要上来就写大段 `run_code`
+- 只有在 snapshot 无法覆盖的场景下，才补充 `run_code`
+
+### 8.4 针对本项目的固定入口
+
+- 本地仿真前端通常是 `http://127.0.0.1:5178`
+- 本地仿真后端通常是 `http://127.0.0.1:8000`
+- 先读 `srv/stable/compose/docker-compose.prod.yml`
+- 再读 `srv/stable/config/backend.prod.env`
+
+重点确认：
+
+- 前端端口映射是否还是 `5178:80`
+- 后端端口映射是否还是 `8000:8000`
+- `TEST_ENV_ADMIN_BYPASS` 当前是 `true` 还是 `false`
+
+### 8.5 本项目测试时的规则
+
+- 当 `TEST_ENV_ADMIN_BYPASS=true` 时：
+  - 直接访问目标页面即可
+  - 不需要注入 cookie / session
+  - 不需要先走登录页
+
+- 当 `TEST_ENV_ADMIN_BYPASS=false` 时：
+  - 这是“真实登录模式”
+  - 应按页面当前真实行为测试，不要人为跳过登录
+  - 若登录页启用了 Turnstile，则按实际页面状态处理
+
+### 8.6 不推荐的做法
+
+- 不要默认改代码去“方便测试”
+- 不要默认新增 e2e spec，除非用户明确要求写测试文件
+- 不要先假设必须运行仓库内残留的旧浏览器测试入口
+- 不要在没有确认当前 env 的情况下，直接断言旁路模式一定开启
+- 不要使用过期 snapshot 的 ref 连续操作多个页面
+
+### 8.7 输出结果时至少说明
+
+- 这次是否使用了 Playwright MCP/skill
+- 访问的入口地址
+- 当前 `TEST_ENV_ADMIN_BYPASS` 状态
+- 实际执行了哪些页面操作
+- 控制台是否有报错或 warning
+- 是否只做了浏览器验证，还是还执行了真实提交/写操作
+
+## 9. Agent 执行约定
 
 后续 Agent 在本项目应优先遵循：
 

@@ -80,6 +80,7 @@ npm run dev
 新增后端认证/配额相关 env：
 
 - `SESSION_SECRET_KEY`
+- `TEST_ENV_ADMIN_BYPASS`
 - `BOOTSTRAP_ADMIN_USERNAME`
 - `BOOTSTRAP_ADMIN_PASSWORD`
 - `TURNSTILE_SITE_KEY`
@@ -127,6 +128,14 @@ npm run dev
 - `adapter_type=gemini_v1beta` 适配 Gemini 原生 `v1beta/models/*:generateContent`
 - provider 的启用状态、备注、剩余余额、运行时成功率/熔断状态由后端持久化到 `data/providers.json`
 - 如果未配置 `UPSTREAM_PROVIDERS_JSON`，后端会退回旧的单一 `GEMINI_API_KEY + GEMINI_API_BASE_URL` 模式
+
+测试环境直通 admin：
+
+- 新增后端开关 `TEST_ENV_ADMIN_BYPASS=false`
+- 当它设为 `true` 时，后端会把所有需要登录的请求直接判定为 bootstrap admin / 现有可用 admin
+- 该模式下不会校验 cookie、session，也不会要求登录页 Turnstile；前端首屏 `/v1/auth/me` 会直接返回 admin 会话
+- 适合本地 Playwright 自动化与联调，不要在正式生产环境开启
+- 使用 Codex Playwright MCP 时，如果当前就是旁路模式，直接访问目标页面即可，不要额外伪造 cookie / session
 
 ### 3. 本地开发测试
 
@@ -225,7 +234,60 @@ docker compose -f docker-compose.prod.yml up -d --force-recreate --remove-orphan
 - 常见是 `GEMINI_HTTP_PROXY` 代理不可用
 - 先在容器内验证网络，再决定是否禁用代理
 
-## 三、发布到 Docker Hub（开发机）
+### 6. 使用 Codex 内置 Playwright MCP 测试仿真环境
+
+如果目标是“让 Codex 直接在真实浏览器里操作当前仿真环境”，本项目推荐优先使用 Codex 自带的 Playwright MCP/skill，而不是先写新的 Playwright 测试文件。
+
+适用场景：
+
+- 验证当前仿真页面是否可打开
+- 验证登录、跳转、弹窗、表单、路由、控制台报错
+- 复现前端交互 bug
+
+推荐流程：
+
+1. 在会话里明确要求“使用 Playwright MCP”或“使用 playwright skill”
+2. 先确认仿真环境容器在线
+3. 先读取：
+   - `srv/stable/compose/docker-compose.prod.yml`
+   - `srv/stable/config/backend.prod.env`
+4. 确认：
+   - 前端入口通常是 `http://127.0.0.1:5178`
+   - 后端入口通常是 `http://127.0.0.1:8000`
+   - `TEST_ENV_ADMIN_BYPASS` 当前是 `true` 还是 `false`
+5. 使用 Playwright MCP 的典型顺序：
+   - `browser_navigate`
+   - `browser_snapshot`
+   - `browser_click` / `browser_fill_form` / `browser_type`
+   - 页面变化后再次 `browser_snapshot`
+   - 需要排查报错时再看 `browser_console_messages`
+6. 必要时才使用 `browser_run_code`，不要一开始就大量依赖自定义脚本
+
+关键约束：
+
+- `snapshot` 后拿到的元素 ref 只对当前页面状态可靠；页面变了就要重新 snapshot
+- 不要把“仓库里可能残留的旧 Playwright 测试代码”当成当前标准流程；当前标准是 Codex Playwright MCP 交互流程
+- 不要默认伪造 cookie / session，先看 `TEST_ENV_ADMIN_BYPASS`
+
+按鉴权模式区分：
+
+- `TEST_ENV_ADMIN_BYPASS=true`
+  - 可直接访问受保护页面
+  - 通常无需登录、无需注入 cookie
+
+- `TEST_ENV_ADMIN_BYPASS=false`
+  - 应按真实登录流程测试
+  - 如果页面启用了 Turnstile，就按页面当前行为处理，不要先假设可以跳过
+
+建议在每次测试结论里固定说明：
+
+- 是否使用了 Playwright MCP
+- 实际访问的 URL
+- 当前 bypass 状态
+- 做了哪些页面操作
+- 控制台是否存在错误或 warning
+- 是否执行了会写入数据的操作
+
 
 ### 1. 初始化 buildx（首次）
 
