@@ -17,3 +17,4 @@ srv/stable/data
 srv_server/config/backend.env.example
 .playwright-cli/
 data/logs/
+.codex-tmp/

@@ -6272,7 +6272,6 @@ function BatchCreatePage() {
         ),
       ];
       batchDraftHydratedRef.current = true;
-      push({ kind: "info", title: "已恢复未完成编辑", message: "Batch 页面草稿已自动回填" });
     };
 
     void hydrate();
@@ -7406,7 +7405,6 @@ function CreateJobPage() {
       hydratedModelRef.current = draft.model || settings.defaultModel || catalog.default_model;
       createDraftFileEntriesRef.current = (draft.files || []).map((meta) => ({ namespace: "create", meta }));
       createDraftHydratedRef.current = true;
-      push({ kind: "info", title: "已恢复未完成编辑", message: "Create 页面草稿已自动回填" });
     };
 
     void hydrate();
