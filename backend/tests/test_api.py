@@ -1821,3 +1821,155 @@ def test_job_read_rate_limit_is_scoped_by_user_id(client: TestClient, monkeypatc
 
     third = client.post("/v1/jobs/batch-meta", json={"jobs": []})
     assert third.status_code == 200
+
+
+def test_admin_user_jobs_list_filters_and_retry_preserves_owner(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_generate_image(prompt, model, mode, params, reference_images):
+        return {
+            "raw": {"candidates": []},
+            "images": [{"mime": "image/png", "bytes": PNG_1X1}],
+            "usage_metadata": {"totalTokenCount": 10},
+            "finish_reason": "STOP",
+            "safety_ratings": [],
+            "latency_ms": 50,
+        }
+
+    monkeypatch.setattr("app.gemini_client.gemini_client.generate_image", fake_generate_image)
+    login(client)
+
+    alice_resp = client.post(
+        "/v1/admin/users",
+        json={"username": "alice_jobs", "password": "alicepass123", "role": "USER", "enabled": True},
+    )
+    assert alice_resp.status_code == 201
+    alice = alice_resp.json()
+
+    bob_resp = client.post(
+        "/v1/admin/users",
+        json={"username": "bob_jobs", "password": "bobpass123", "role": "USER", "enabled": True},
+    )
+    assert bob_resp.status_code == 201
+    bob = bob_resp.json()
+
+    client.post("/v1/auth/logout")
+    login(client, username="alice_jobs", password="alicepass123")
+
+    alice_job_ids: list[str] = []
+    for prompt in ["sunrise cat", "moon dog", "storm eagle"]:
+        created = client.post(
+            "/v1/jobs",
+            json={
+                "prompt": prompt,
+                "params": {
+                    "aspect_ratio": "1:1",
+                    "image_size": "1K",
+                    "temperature": 0.7,
+                    "timeout_sec": 60,
+                    "max_retries": 1,
+                },
+                "mode": "IMAGE_ONLY",
+            },
+        )
+        assert created.status_code == 201
+        alice_job_ids.append(created.json()["job_id"])
+
+    for job_id in alice_job_ids:
+        wait_for_job_terminal(client, job_id)
+
+    failed_meta = storage.load_meta(alice_job_ids[2])
+    failed_meta["status"] = "FAILED"
+    failed_meta["updated_at"] = failed_meta["created_at"]
+    failed_meta["result"] = {"images": []}
+    failed_meta["error"] = {"code": "UPSTREAM_TIMEOUT", "message": "storm failed"}
+    failed_meta["timing"]["run_duration_ms"] = 321
+    storage.save_meta(alice_job_ids[2], failed_meta)
+
+    client.post("/v1/auth/logout")
+    login(client, username="bob_jobs", password="bobpass123")
+    bob_created = client.post(
+        "/v1/jobs",
+        json={
+            "prompt": "bob private prompt",
+            "params": {
+                "aspect_ratio": "1:1",
+                "image_size": "1K",
+                "temperature": 0.7,
+                "timeout_sec": 60,
+                "max_retries": 1,
+            },
+            "mode": "IMAGE_ONLY",
+        },
+    )
+    assert bob_created.status_code == 201
+    wait_for_job_terminal(client, bob_created.json()["job_id"])
+
+    client.post("/v1/auth/logout")
+    login(client)
+
+    listed = client.get(f"/v1/admin/users/{alice['user_id']}/jobs", params={"limit": 2})
+    assert listed.status_code == 200
+    body = listed.json()
+    assert body["stats"]["total"] == 3
+    assert body["stats"]["failed"] == 1
+    assert body["next_cursor"] == "2"
+    assert len(body["items"]) == 2
+    assert all(item["owner"]["user_id"] == alice["user_id"] for item in body["items"])
+    assert all(item["job_id"] != bob_created.json()["job_id"] for item in body["items"])
+
+    searched = client.get(
+        f"/v1/admin/users/{alice['user_id']}/jobs",
+        params={"q": "moon", "status": "SUCCEEDED", "has_images": "true"},
+    )
+    assert searched.status_code == 200
+    searched_items = searched.json()["items"]
+    assert len(searched_items) == 1
+    assert searched_items[0]["prompt_preview"] == "moon dog"
+    assert searched_items[0]["image_count"] == 1
+    assert searched_items[0]["first_image_id"]
+
+    failed_only = client.get(
+        f"/v1/admin/users/{alice['user_id']}/jobs",
+        params={"failed_only": "true", "has_images": "false"},
+    )
+    assert failed_only.status_code == 200
+    failed_items = failed_only.json()["items"]
+    assert len(failed_items) == 1
+    assert failed_items[0]["status"] == "FAILED"
+    assert failed_items[0]["error"]["code"] == "UPSTREAM_TIMEOUT"
+    assert failed_items[0]["image_count"] == 0
+
+    retried = client.post(f"/v1/jobs/{alice_job_ids[0]}/retry", json={})
+    assert retried.status_code == 201
+    retry_meta = wait_for_job_terminal(client, retried.json()["new_job_id"])
+    assert retry_meta["owner"]["user_id"] == alice["user_id"]
+
+
+def test_admin_user_jobs_endpoint_requires_admin(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    def fake_generate_image(prompt, model, mode, params, reference_images):
+        return {
+            "raw": {"candidates": []},
+            "images": [{"mime": "image/png", "bytes": PNG_1X1}],
+            "usage_metadata": {"totalTokenCount": 10},
+            "finish_reason": "STOP",
+            "safety_ratings": [],
+            "latency_ms": 50,
+        }
+
+    monkeypatch.setattr("app.gemini_client.gemini_client.generate_image", fake_generate_image)
+    login(client)
+    created = client.post(
+        "/v1/admin/users",
+        json={"username": "viewer_jobs", "password": "viewerpass123", "role": "USER", "enabled": True},
+    )
+    assert created.status_code == 201
+    viewer = created.json()
+
+    client.post("/v1/auth/logout")
+    login(client, username="viewer_jobs", password="viewerpass123")
+
+    denied = client.get(f"/v1/admin/users/{viewer['user_id']}/jobs")
+    assert denied.status_code == 403
+    assert denied.json()["error"]["code"] == "FORBIDDEN"

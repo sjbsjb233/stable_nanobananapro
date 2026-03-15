@@ -9,7 +9,7 @@ import base64
 from datetime import datetime, timedelta
 from typing import Any, AsyncIterator
 
-from fastapi import Depends, FastAPI, Header, Request, Response, status
+from fastapi import Depends, FastAPI, Header, Query, Request, Response, status
 from fastapi import HTTPException
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -609,9 +609,132 @@ def _daily_user_payload(
             "quota_resets_today": int(usage["quota_resets"]),
             "active_jobs": int(counts["active_jobs"]),
             "remaining_images_today": remaining,
+            **_image_access_usage_payload(user, policy),
         },
         "total_jobs": int(counts["total_jobs"]),
     }
+
+
+def _parse_admin_time_bound(value: str | None, *, end_of_day: bool = False) -> datetime | None:
+    dt = _parse_iso(value)
+    if dt is None or not value:
+        return None
+    raw = str(value).strip()
+    if "T" not in raw and " " not in raw and end_of_day:
+        dt = dt + timedelta(days=1) - timedelta(microseconds=1)
+    return dt
+
+
+def _request_prompt_preview(job_id: str, max_len: int = 120) -> str:
+    try:
+        request_payload = storage.load_request(job_id)
+    except Exception:
+        return ""
+    prompt = str(request_payload.get("prompt") or "").strip()
+    if not prompt:
+        return ""
+    prompt = " ".join(prompt.split())
+    if len(prompt) <= max_len:
+        return prompt
+    return prompt[:max_len] + "…"
+
+
+def _admin_job_summary(meta: dict[str, Any]) -> dict[str, Any]:
+    result = meta.get("result") if isinstance(meta.get("result"), dict) else {}
+    images = result.get("images") if isinstance(result.get("images"), list) else []
+    first_image_id = None
+    for item in images:
+        if isinstance(item, dict):
+            first_image_id = item.get("image_id") or item.get("id") or item.get("imageId")
+            if first_image_id:
+                break
+        elif isinstance(item, str) and item:
+            first_image_id = item
+            break
+    timing = meta.get("timing") if isinstance(meta.get("timing"), dict) else {}
+    error = meta.get("error") if isinstance(meta.get("error"), dict) else {}
+    owner = meta.get("owner") if isinstance(meta.get("owner"), dict) else {}
+    return {
+        "job_id": str(meta.get("job_id") or ""),
+        "created_at": meta.get("created_at"),
+        "updated_at": meta.get("updated_at"),
+        "status": str(meta.get("status") or "UNKNOWN"),
+        "model": meta.get("model"),
+        "prompt_preview": _request_prompt_preview(str(meta.get("job_id") or "")),
+        "batch_id": meta.get("batch_id"),
+        "batch_name": meta.get("batch_name"),
+        "batch_note": meta.get("batch_note"),
+        "batch_size": meta.get("batch_size"),
+        "batch_index": meta.get("batch_index"),
+        "section_index": meta.get("section_index"),
+        "section_title": meta.get("section_title"),
+        "timing": {
+            "queued_at": timing.get("queued_at"),
+            "started_at": timing.get("started_at"),
+            "finished_at": timing.get("finished_at"),
+            "queue_wait_ms": timing.get("queue_wait_ms"),
+            "run_duration_ms": timing.get("run_duration_ms"),
+        },
+        "error": {
+            "code": error.get("code"),
+            "message": error.get("message"),
+        }
+        if error
+        else None,
+        "first_image_id": first_image_id,
+        "image_count": len(images),
+        "owner": {
+            "user_id": owner.get("user_id"),
+            "username": owner.get("username"),
+            "role": owner.get("role"),
+        },
+    }
+
+
+def _admin_job_sort_value(summary: dict[str, Any], sort: str) -> tuple[Any, ...]:
+    created = _parse_iso(summary.get("created_at"))
+    updated = _parse_iso(summary.get("updated_at"))
+    duration = summary.get("timing", {}).get("run_duration_ms") if isinstance(summary.get("timing"), dict) else None
+    created_ts = created.timestamp() if created else 0.0
+    updated_ts = updated.timestamp() if updated else created_ts
+    duration_ms = int(duration) if isinstance(duration, (int, float)) and math.isfinite(duration) else -1
+    job_id = str(summary.get("job_id") or "")
+    if sort == "created_asc":
+        return (created_ts, job_id)
+    if sort == "updated_desc":
+        return (-updated_ts, job_id)
+    if sort == "updated_asc":
+        return (updated_ts, job_id)
+    if sort == "duration_desc":
+        return (-duration_ms, -created_ts, job_id)
+    return (-created_ts, job_id)
+
+
+def _admin_filtered_job_stats(items: list[dict[str, Any]]) -> dict[str, int]:
+    stats = {
+        "total": len(items),
+        "active": 0,
+        "running": 0,
+        "queued": 0,
+        "succeeded": 0,
+        "failed": 0,
+        "cancelled": 0,
+    }
+    for item in items:
+        status_value = str(item.get("status") or "")
+        if status_value in {"RUNNING", "QUEUED"}:
+            stats["active"] += 1
+        if status_value == "RUNNING":
+            stats["running"] += 1
+        elif status_value == "QUEUED":
+            stats["queued"] += 1
+        elif status_value == "SUCCEEDED":
+            stats["succeeded"] += 1
+        elif status_value == "FAILED":
+            stats["failed"] += 1
+        elif status_value == "CANCELLED":
+            stats["cancelled"] += 1
+    return stats
 
 
 @app.exception_handler(StarletteHTTPException)
@@ -1757,6 +1880,93 @@ async def admin_users(_: dict[str, Any] = Depends(get_admin_user)) -> dict[str, 
         for user in users
     ]
     return {"users": items}
+
+
+@app.get(f"{settings.api_prefix}/admin/users/{{user_id}}/jobs")
+async def admin_user_jobs(
+    user_id: str,
+    q: str = Query(default=""),
+    status_value: str = Query(default="", alias="status"),
+    model: str = Query(default=""),
+    from_value: str | None = Query(default=None, alias="from"),
+    to_value: str | None = Query(default=None, alias="to"),
+    batch_name: str = Query(default=""),
+    has_images: bool | None = Query(default=None),
+    failed_only: bool = Query(default=False),
+    sort: str = Query(default="created_desc"),
+    cursor: str | None = Query(default=None),
+    limit: int = Query(default=24, ge=1, le=120),
+    _: dict[str, Any] = Depends(get_admin_user),
+) -> dict[str, Any]:
+    user = user_store.get_user_by_id(user_id)
+    if not user:
+        raise api_error(ErrorCode.USER_NOT_FOUND, "User not found", http_status=404)
+
+    query = str(q or "").strip().lower()
+    status_filter = str(status_value or "").strip().upper()
+    model_filter = str(model or "").strip()
+    batch_filter = str(batch_name or "").strip().lower()
+    from_dt = _parse_admin_time_bound(from_value)
+    to_dt = _parse_admin_time_bound(to_value, end_of_day=True)
+
+    summaries: list[dict[str, Any]] = []
+    for meta in storage.iter_job_meta():
+        owner = meta.get("owner") if isinstance(meta.get("owner"), dict) else {}
+        if str(owner.get("user_id") or "") != str(user_id):
+            continue
+        summary = _admin_job_summary(meta)
+        created_dt = _parse_iso(summary.get("created_at")) or _parse_iso(summary.get("updated_at"))
+        if from_dt and (created_dt is None or created_dt < from_dt):
+            continue
+        if to_dt and (created_dt is None or created_dt > to_dt):
+            continue
+        if status_filter and str(summary.get("status") or "").upper() != status_filter:
+            continue
+        if failed_only and str(summary.get("status") or "").upper() not in {"FAILED", "CANCELLED"}:
+            continue
+        if model_filter and str(summary.get("model") or "") != model_filter:
+            continue
+        if has_images is not None:
+            image_count = int(summary.get("image_count") or 0)
+            if has_images and image_count <= 0:
+                continue
+            if has_images is False and image_count > 0:
+                continue
+        if batch_filter and batch_filter not in str(summary.get("batch_name") or "").lower():
+            continue
+        if query:
+            haystack = " ".join(
+                [
+                    str(summary.get("job_id") or ""),
+                    str(summary.get("prompt_preview") or ""),
+                    str(summary.get("model") or ""),
+                    str(summary.get("batch_name") or ""),
+                    str(summary.get("section_title") or ""),
+                    str((summary.get("error") or {}).get("message") or ""),
+                    str((summary.get("error") or {}).get("code") or ""),
+                ]
+            ).lower()
+            if query not in haystack:
+                continue
+        summaries.append(summary)
+
+    summaries.sort(key=lambda item: _admin_job_sort_value(item, sort))
+    stats = _admin_filtered_job_stats(summaries)
+    offset = max(0, int(cursor or "0")) if str(cursor or "").strip().isdigit() else 0
+    page_items = summaries[offset : offset + limit]
+    next_cursor = str(offset + limit) if offset + limit < len(summaries) else None
+    return {
+        "user": {
+            "user_id": user["user_id"],
+            "username": user["username"],
+            "role": user["role"],
+            "enabled": user["enabled"],
+        },
+        "items": page_items,
+        "next_cursor": next_cursor,
+        "stats": stats,
+        "requested_limit": limit,
+    }
 
 
 @app.post(f"{settings.api_prefix}/admin/users", status_code=status.HTTP_201_CREATED)

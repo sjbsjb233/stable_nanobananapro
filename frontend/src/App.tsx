@@ -406,6 +406,16 @@ type UserPolicy = {
   daily_image_access_hard_limit?: number | null;
 };
 
+type UserPolicyOverrides = {
+  daily_image_limit?: number | null;
+  concurrent_jobs_limit?: number | null;
+  turnstile_job_count_threshold?: number | null;
+  turnstile_daily_usage_threshold?: number | null;
+  daily_image_access_limit?: number | null;
+  image_access_turnstile_bonus_quota?: number | null;
+  daily_image_access_hard_limit?: number | null;
+};
+
 type SessionUsage = {
   date: string;
   jobs_created_today: number;
@@ -420,6 +430,8 @@ type SessionUsage = {
   remaining_images_today?: number | null;
   image_accesses_today?: number;
   image_access_bonus_quota_today?: number;
+  image_access_limit_today?: number | null;
+  image_access_hard_limit_today?: number | null;
 };
 
 type SessionUser = {
@@ -552,8 +564,60 @@ type AdminUserItem = {
   updated_at: string;
   last_login_at?: string | null;
   policy: UserPolicy;
+  policy_overrides?: UserPolicyOverrides;
   usage: SessionUsage;
   total_jobs: number;
+};
+
+type AdminUserJobSummary = {
+  job_id: string;
+  created_at: string;
+  updated_at?: string | null;
+  status: JobStatus;
+  model?: ModelId;
+  prompt_preview?: string;
+  batch_id?: string | null;
+  batch_name?: string | null;
+  batch_note?: string | null;
+  batch_size?: number | null;
+  batch_index?: number | null;
+  section_index?: number | null;
+  section_title?: string | null;
+  timing?: JobMeta["timing"];
+  error?: {
+    code?: string | null;
+    message?: string | null;
+  } | null;
+  first_image_id?: string | null;
+  image_count?: number;
+  owner?: {
+    user_id?: string | null;
+    username?: string | null;
+    role?: UserRole | null;
+  };
+};
+
+type AdminUserJobsStats = {
+  total: number;
+  active: number;
+  running: number;
+  queued: number;
+  succeeded: number;
+  failed: number;
+  cancelled: number;
+};
+
+type AdminUserJobsResponse = {
+  user: {
+    user_id: string;
+    username: string;
+    role: UserRole;
+    enabled: boolean;
+  };
+  items: AdminUserJobSummary[];
+  next_cursor?: string | null;
+  stats: AdminUserJobsStats;
+  requested_limit: number;
 };
 
 declare global {
@@ -708,6 +772,7 @@ function providerSelectOptions(providers: ProviderSnapshot[], modelId: string) {
 }
 
 const EMPTY_PROVIDER_LIST: ProviderSnapshot[] = [];
+const EMPTY_REFERENCE_LIST: Array<{ filename?: string | null }> = [];
 
 function shortId(id: string, keep = 8) {
   if (!id) return "";
@@ -3456,6 +3521,32 @@ class ApiClient {
     return this.request<{ users: AdminUserItem[] }>("/admin/users", { method: "GET", signal });
   }
 
+  adminUserJobs(
+    userId: string,
+    params?: {
+      q?: string;
+      status?: string;
+      model?: string;
+      from?: string;
+      to?: string;
+      batch_name?: string;
+      has_images?: boolean;
+      failed_only?: boolean;
+      sort?: string;
+      cursor?: string | null;
+      limit?: number;
+    },
+    signal?: AbortSignal
+  ) {
+    const query = new URLSearchParams();
+    Object.entries(params || {}).forEach(([key, value]) => {
+      if (value === undefined || value === null || value === "") return;
+      query.set(key, typeof value === "boolean" ? String(value) : String(value));
+    });
+    const suffix = query.toString() ? `?${query.toString()}` : "";
+    return this.request<AdminUserJobsResponse>(`/admin/users/${encodeURIComponent(userId)}/jobs${suffix}`, { method: "GET", signal });
+  }
+
   adminCreateUser(payload: {
     username: string;
     password: string;
@@ -5462,7 +5553,525 @@ function ImageThumb({ file, onRemove }: { file: File; onRemove: () => void }) {
   );
 }
 
-function AdminPage() {
+function AdminUserRiskChip({ label }: { label: string }) {
+  const tone =
+    label === "disabled"
+      ? "bg-zinc-200 text-zinc-700 dark:bg-zinc-800 dark:text-zinc-200"
+      : label === "over quota" || label === "image access cap"
+        ? "bg-rose-100 text-rose-700 dark:bg-rose-500/20 dark:text-rose-200"
+        : label === "running jobs" || label === "high usage"
+          ? "bg-amber-100 text-amber-700 dark:bg-amber-500/20 dark:text-amber-200"
+          : label === "high failures"
+            ? "bg-orange-100 text-orange-700 dark:bg-orange-500/20 dark:text-orange-200"
+            : label === "admin"
+              ? "bg-sky-100 text-sky-700 dark:bg-sky-500/20 dark:text-sky-200"
+              : "bg-zinc-100 text-zinc-600 dark:bg-zinc-900/60 dark:text-zinc-300";
+  return <span className={cn("rounded-full px-2 py-0.5 text-[10px] font-semibold", tone)}>{label}</span>;
+}
+
+function AdminJsonDisclosure({
+  title,
+  value,
+  defaultOpen = false,
+}: {
+  title: string;
+  value: React.ReactNode;
+  defaultOpen?: boolean;
+}) {
+  return (
+    <details
+      open={defaultOpen}
+      className="overflow-hidden rounded-2xl border border-zinc-200 bg-white/70 dark:border-white/10 dark:bg-zinc-950/30"
+    >
+      <summary className="cursor-pointer list-none px-4 py-3 text-sm font-semibold text-zinc-900 marker:content-none dark:text-zinc-50">
+        {title}
+      </summary>
+      <div className="border-t border-zinc-200/80 px-4 py-3 dark:border-white/10">{value}</div>
+    </details>
+  );
+}
+
+function AdminTaskCard({
+  item,
+  preview,
+  density,
+  onOpen,
+}: {
+  item: AdminUserJobSummary;
+  preview?: HistoryPreviewEntry;
+  density: AdminTaskDensity;
+  onOpen: () => void;
+}) {
+  const rec = adminJobSummaryToRecord(item);
+  const reason = summarizeQueueOrFailure(null, rec);
+  const riskText = item.error?.message || reason || (item.section_title ? `Section · ${item.section_title}` : `job_id · ${shortId(item.job_id, 8)}`);
+  const cardClass =
+    density === "list"
+      ? "grid grid-cols-[180px_minmax(0,1fr)] items-stretch gap-0"
+      : "block";
+  return (
+    <button
+      type="button"
+      onClick={onOpen}
+      data-testid="admin-task-card"
+      className={cn(
+        "group overflow-hidden rounded-[28px] border border-zinc-200/90 bg-white text-left shadow-sm transition hover:-translate-y-0.5 hover:shadow-xl dark:border-white/10 dark:bg-zinc-950/60",
+        cardClass
+      )}
+    >
+      <div className="relative">
+        <HistoryPreviewTile rec={rec} preview={preview} className={density === "list" ? "aspect-[5/4] h-full" : "aspect-[4/5]"} />
+        <div className="pointer-events-none absolute inset-x-0 top-0 flex items-start justify-between gap-2 p-3">
+          {item.batch_name ? (
+            <span className="max-w-[72%] truncate rounded-full bg-white/90 px-2.5 py-1 text-[10px] font-semibold text-emerald-700 shadow-sm backdrop-blur dark:bg-zinc-950/80 dark:text-emerald-200">
+              {item.batch_name}
+            </span>
+          ) : <span />}
+          <Badge status={item.status} />
+        </div>
+      </div>
+      <div className="space-y-2.5 px-3.5 py-3">
+        <div className="flex items-center justify-between gap-3 text-[11px] text-zinc-500 dark:text-zinc-400">
+          <span className="truncate">{formatLocal(item.created_at)}</span>
+          <span className="truncate font-mono">{shortId(item.job_id, 6)}</span>
+        </div>
+        <div className="line-clamp-2 text-sm font-semibold leading-5 text-zinc-900 dark:text-zinc-50">
+          {item.prompt_preview || shortId(item.job_id)}
+        </div>
+        <div className="line-clamp-2 min-h-[2rem] text-[11px] leading-5 text-zinc-500 dark:text-zinc-400">
+          {riskText}
+        </div>
+        <div className="flex flex-wrap gap-1 text-[10px] text-zinc-500 dark:text-zinc-400">
+          {item.model ? <span className="rounded-full border border-zinc-200 px-2 py-0.5 dark:border-white/10">{item.model}</span> : null}
+          <span className="rounded-full border border-zinc-200 px-2 py-0.5 dark:border-white/10">{item.image_count || 0} imgs</span>
+          {typeof item.timing?.run_duration_ms === "number" ? (
+            <span className="rounded-full border border-zinc-200 px-2 py-0.5 dark:border-white/10">{formatDurationMs(item.timing.run_duration_ms)}</span>
+          ) : null}
+        </div>
+      </div>
+    </button>
+  );
+}
+
+function AdminTaskDetailDrawer({
+  item,
+  owner,
+  onClose,
+  onRemoved,
+  onRefreshList,
+}: {
+  item: AdminUserJobSummary | null;
+  owner: AdminUserItem | null;
+  onClose: () => void;
+  onRemoved: (jobId: string) => void;
+  onRefreshList: () => Promise<void> | void;
+}) {
+  const client = useApiClient();
+  const settings = useSettingsStore((s) => s.settings);
+  const { push } = useToast();
+  const rec = useMemo(() => (item ? adminJobSummaryToRecord(item) : null), [item]);
+  const { meta, loading, error, refresh } = useJobLive(rec?.job_id || null, undefined);
+
+  const [reqSnap, setReqSnap] = useState<any | null>(null);
+  const [respSnap, setRespSnap] = useState<any | null>(null);
+  const [debugLoading, setDebugLoading] = useState(false);
+  const [previewUrls, setPreviewUrls] = useState<Record<string, string>>({});
+  const [fullUrls, setFullUrls] = useState<Record<string, string>>({});
+  const [previewBlobs, setPreviewBlobs] = useState<Record<string, Blob>>({});
+  const [fullBlobs, setFullBlobs] = useState<Record<string, Blob>>({});
+  const [selectedImageId, setSelectedImageId] = useState<string | null>(null);
+  const [refUrls, setRefUrls] = useState<Record<string, string>>({});
+  const [actionLoading, setActionLoading] = useState<"cancel" | "retry" | "delete" | null>(null);
+  const previewRevokeRef = useRef<string[]>([]);
+  const fullRevokeRef = useRef<string[]>([]);
+  const refRevokeRef = useRef<string[]>([]);
+  const cacheScope = `admin:${owner?.user_id || item?.owner?.user_id || "__admin__"}`;
+  const status = pickStatus(meta || undefined, rec || undefined);
+  const imageIds = useMemo(() => extractImageIdsFromResult(meta?.result), [meta?.result]);
+  const requestPrompt = reqSnap?.request?.prompt || rec?.prompt_preview || "";
+  const requestRefs = useMemo(
+    () => (Array.isArray(reqSnap?.request?.reference_images) ? reqSnap.request.reference_images : EMPTY_REFERENCE_LIST),
+    [reqSnap?.request?.reference_images]
+  );
+  const requestRefsKey = useMemo(
+    () => requestRefs.map((entry: any) => String(entry?.filename || "")).filter(Boolean).join("|"),
+    [requestRefs]
+  );
+  const requestPreview = item?.prompt_preview || requestPrompt || "-";
+  const confirmTail = item?.job_id ? item.job_id.slice(-6) : "";
+
+  useEffect(() => {
+    if (!item) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [item, onClose]);
+
+  useEffect(() => {
+    setReqSnap(null);
+    setRespSnap(null);
+    setPreviewUrls({});
+    setFullUrls({});
+    setPreviewBlobs({});
+    setFullBlobs({});
+    setSelectedImageId(null);
+    setRefUrls({});
+  }, [item?.job_id]);
+
+  useEffect(() => {
+    return () => {
+      previewRevokeRef.current.forEach((url) => URL.revokeObjectURL(url));
+      fullRevokeRef.current.forEach((url) => URL.revokeObjectURL(url));
+      refRevokeRef.current.forEach((url) => URL.revokeObjectURL(url));
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!item) return;
+    let stopped = false;
+    setDebugLoading(true);
+    Promise.allSettled([client.getJobRequest(item.job_id), client.getJobResponse(item.job_id)])
+      .then(([requestResult, responseResult]) => {
+        if (stopped) return;
+        setReqSnap(requestResult.status === "fulfilled" ? requestResult.value : { __error: requestResult.reason });
+        setRespSnap(responseResult.status === "fulfilled" ? responseResult.value : { __error: responseResult.reason });
+      })
+      .finally(() => {
+        if (!stopped) setDebugLoading(false);
+      });
+    return () => {
+      stopped = true;
+    };
+  }, [client, item?.job_id]);
+
+  useEffect(() => {
+    if (!imageIds.length) {
+      setSelectedImageId(null);
+      return;
+    }
+    if (!selectedImageId || !imageIds.includes(selectedImageId)) {
+      setSelectedImageId(imageIds[0]);
+    }
+  }, [imageIds.join("|"), selectedImageId]);
+
+  useEffect(() => {
+    refRevokeRef.current.forEach((url) => URL.revokeObjectURL(url));
+    refRevokeRef.current = [];
+    setRefUrls({});
+    if (!item || !requestRefs.length) return;
+    const controller = new AbortController();
+    requestRefs.forEach((entry: any) => {
+      const filename = String(entry?.filename || "");
+      if (!filename) return;
+      client
+        .getReferenceBlob(item.job_id, filename, undefined, controller.signal)
+        .then((blob) => {
+          const url = URL.createObjectURL(blob);
+          refRevokeRef.current.push(url);
+          setRefUrls((current) => ({ ...current, [filename]: url }));
+        })
+        .catch(() => null);
+    });
+    return () => controller.abort();
+  }, [client, item?.job_id, requestRefsKey]);
+
+  const ensureImage = async (imageId: string, variant: ImageVariant) => {
+    if (!rec) return null;
+    const currentMap = variant === "preview" ? previewUrls : fullUrls;
+    const currentBlobMap = variant === "preview" ? previewBlobs : fullBlobs;
+    const updateUrl = variant === "preview" ? setPreviewUrls : setFullUrls;
+    const updateBlob = variant === "preview" ? setPreviewBlobs : setFullBlobs;
+    const revokeRef = variant === "preview" ? previewRevokeRef : fullRevokeRef;
+    if (currentMap[imageId]) return currentBlobMap[imageId] || null;
+    try {
+      const { blob } = await readCachedImageOrFetch({
+        scope: cacheScope,
+        baseUrl: settings.baseUrl,
+        jobId: rec.job_id,
+        imageId,
+        variant,
+        config: settings.cache,
+        fetcher: () =>
+          variant === "preview"
+            ? client.getPreviewBlob(rec.job_id, imageId)
+            : client.getImageBlob(rec.job_id, imageId),
+      });
+      updateBlob((current) => ({ ...current, [imageId]: blob }));
+      const url = URL.createObjectURL(blob);
+      revokeRef.current.push(url);
+      updateUrl((current) => ({ ...current, [imageId]: url }));
+      return blob;
+    } catch (e: any) {
+      push({ kind: "error", title: `${variant === "preview" ? "预览" : "原图"}加载失败`, message: e?.error?.message || "" });
+      return null;
+    }
+  };
+
+  useEffect(() => {
+    imageIds.slice(0, 12).forEach((imageId) => {
+      ensureImage(imageId, "preview");
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [imageIds.join("|")]);
+
+  useEffect(() => {
+    if (!selectedImageId) return;
+    ensureImage(selectedImageId, "original");
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedImageId]);
+
+  if (!item || !rec) return null;
+
+  const handleCancel = async () => {
+    setActionLoading("cancel");
+    try {
+      await client.cancelJob(item.job_id);
+      push({ kind: "success", title: "任务已取消" });
+      await refresh();
+      await onRefreshList();
+    } catch (e: any) {
+      push({ kind: "error", title: "取消失败", message: e?.error?.message || "" });
+    } finally {
+      setActionLoading(null);
+    }
+  };
+
+  const handleRetry = async () => {
+    setActionLoading("retry");
+    try {
+      const payload = await client.retryJob(item.job_id);
+      push({ kind: "success", title: "已创建 retry 任务", message: shortId(payload?.new_job_id || "") });
+      await onRefreshList();
+    } catch (e: any) {
+      push({ kind: "error", title: "重试失败", message: e?.error?.message || "" });
+    } finally {
+      setActionLoading(null);
+    }
+  };
+
+  const handleDelete = async () => {
+    if (!confirm("删除这条任务会同时删除后端 job 数据、输出图片和预览图，是否继续？")) return;
+    const typed = prompt(`请输入该任务 job_id 的后 6 位以确认删除：${confirmTail}`);
+    if ((typed || "").trim() !== confirmTail) {
+      push({ kind: "info", title: "删除已取消", message: "确认码不匹配" });
+      return;
+    }
+    setActionLoading("delete");
+    try {
+      await client.deleteJob(item.job_id);
+      push({ kind: "success", title: "任务已删除" });
+      onRemoved(item.job_id);
+      onClose();
+      await onRefreshList();
+    } catch (e: any) {
+      push({ kind: "error", title: "删除失败", message: e?.error?.message || "" });
+    } finally {
+      setActionLoading(null);
+    }
+  };
+
+  return (
+    <AnimatePresence>
+      <motion.div
+        className="fixed inset-0 z-50"
+        initial={{ opacity: 0 }}
+        animate={{ opacity: 1 }}
+        exit={{ opacity: 0 }}
+      >
+        <button
+          type="button"
+          className="absolute inset-0 bg-black/55 backdrop-blur-sm"
+          onClick={onClose}
+          data-testid="admin-task-detail-backdrop"
+          aria-label="Close admin task detail"
+        />
+        <div className="pointer-events-none relative z-10 flex h-full justify-end">
+          <motion.div
+            initial={{ x: 32, opacity: 0 }}
+            animate={{ x: 0, opacity: 1 }}
+            exit={{ x: 32, opacity: 0 }}
+            transition={{ duration: 0.2 }}
+            className="pointer-events-auto h-full w-full max-w-[980px] overflow-y-auto border-l border-white/15 bg-[#f7f5ef] p-5 shadow-2xl dark:bg-zinc-950"
+            role="dialog"
+            aria-modal="true"
+            aria-label="Admin task detail"
+          >
+            <div className="mb-4 flex items-start justify-between gap-4 border-b border-zinc-200/80 pb-4 dark:border-white/10">
+              <div className="min-w-0">
+                <div className="text-xs font-semibold uppercase tracking-[0.2em] text-zinc-500 dark:text-zinc-400">Admin Task Detail</div>
+                <div className="mt-1 truncate text-lg font-bold text-zinc-900 dark:text-zinc-50">{item.prompt_preview || shortId(item.job_id)}</div>
+                <div className="mt-1 flex flex-wrap items-center gap-2 text-xs text-zinc-500 dark:text-zinc-400">
+                  <span>{formatLocal(item.created_at)}</span>
+                  <span>·</span>
+                  <span>{shortId(item.job_id)}</span>
+                  <span>·</span>
+                  <span>{owner?.username || item.owner?.username || "-"}</span>
+                </div>
+              </div>
+              <div className="flex items-center gap-2">
+                <Badge status={status} />
+                <Button variant="ghost" onClick={onClose}>关闭</Button>
+              </div>
+            </div>
+
+            <div className="space-y-4">
+              <div className="grid gap-3 md:grid-cols-4">
+                <Card hover={false} className="p-3"><KeyValue k="model" v={item.model || "-"} /></Card>
+                <Card hover={false} className="p-3"><KeyValue k="images" v={item.image_count ?? 0} /></Card>
+                <Card hover={false} className="p-3"><KeyValue k="run_duration" v={formatDurationMs(item.timing?.run_duration_ms)} /></Card>
+                <Card hover={false} className="p-3"><KeyValue k="queue_wait" v={formatDurationMs(item.timing?.queue_wait_ms)} /></Card>
+              </div>
+
+              <Card hover={false} className="overflow-hidden p-0">
+                <div className="flex items-center justify-between border-b border-zinc-200/80 px-4 py-3 dark:border-white/10">
+                  <div>
+                    <div className="text-sm font-bold text-zinc-900 dark:text-zinc-50">结果预览</div>
+                    <div className="text-xs text-zinc-600 dark:text-zinc-300">管理员可直接审查该任务的输出图。</div>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    {status === "RUNNING" ? (
+                      <Button variant="secondary" onClick={handleCancel} disabled={actionLoading !== null}>
+                        {actionLoading === "cancel" ? "取消中…" : "取消任务"}
+                      </Button>
+                    ) : null}
+                    {status !== "RUNNING" ? (
+                      <Button variant="secondary" onClick={handleRetry} disabled={actionLoading !== null}>
+                        {actionLoading === "retry" ? "重试中…" : "重试任务"}
+                      </Button>
+                    ) : null}
+                    <Button variant="danger" onClick={handleDelete} disabled={actionLoading !== null}>
+                      {actionLoading === "delete" ? "删除中…" : "删除任务"}
+                    </Button>
+                  </div>
+                </div>
+                {imageIds.length ? (
+                  <div className="space-y-4 p-4">
+                    <div className="overflow-hidden rounded-[24px] border border-zinc-200 bg-zinc-50 dark:border-white/10 dark:bg-zinc-950/30">
+                      <div className="relative h-[280px] w-full bg-[linear-gradient(145deg,rgba(250,250,249,0.95),rgba(228,228,231,0.6))] sm:h-[360px] lg:h-[480px] dark:bg-[linear-gradient(145deg,rgba(24,24,27,0.95),rgba(39,39,42,0.72))]">
+                        {selectedImageId && (fullUrls[selectedImageId] || previewUrls[selectedImageId]) ? (
+                          <img
+                            src={fullUrls[selectedImageId] || previewUrls[selectedImageId]}
+                            alt={selectedImageId}
+                            className="h-full w-full object-contain p-4"
+                          />
+                        ) : (
+                          <div className="flex h-full items-center justify-center">
+                            <LoadingSpinner label={loading ? "Loading task" : "Loading image"} tone="brand" />
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                    <div className="flex gap-2 overflow-x-auto pb-1">
+                      {imageIds.map((imageId) => (
+                        <button
+                          key={imageId}
+                          type="button"
+                          className={cn(
+                            "relative overflow-hidden rounded-2xl border transition",
+                            imageId === selectedImageId
+                              ? "border-zinc-900 shadow-sm dark:border-white"
+                              : "border-zinc-200 hover:-translate-y-0.5 hover:shadow-sm dark:border-white/10"
+                          )}
+                          onClick={() => {
+                            setSelectedImageId(imageId);
+                            ensureImage(imageId, "preview");
+                          }}
+                        >
+                          {previewUrls[imageId] ? (
+                            <img src={previewUrls[imageId]} alt={imageId} className="h-20 w-28 object-cover" />
+                          ) : (
+                            <div className="flex h-20 w-28 items-center justify-center bg-zinc-100 dark:bg-zinc-900">
+                              <LoadingSpinner className="gap-1.5" />
+                            </div>
+                          )}
+                          <div className="absolute bottom-1 left-1 rounded-full bg-black/50 px-2 py-0.5 text-[10px] font-bold text-white">
+                            {shortId(imageId, 6)}
+                          </div>
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                ) : (
+                  <div className="px-4 py-5 text-sm text-zinc-500 dark:text-zinc-400">
+                    {status === "SUCCEEDED" ? "该任务未返回图片列表。" : summarizeQueueOrFailure(meta, rec) || "当前暂无图片输出"}
+                  </div>
+                )}
+              </Card>
+
+              <AdminJsonDisclosure title="Prompt Preview" value={<div className="whitespace-pre-wrap text-sm text-zinc-700 dark:text-zinc-200">{requestPreview}</div>} />
+              <AdminJsonDisclosure title="完整 Prompt" value={<div className="whitespace-pre-wrap text-sm text-zinc-700 dark:text-zinc-200">{requestPrompt || "-"}</div>} />
+              <AdminJsonDisclosure
+                title="Request JSON"
+                value={
+                  debugLoading ? (
+                    <LoadingSpinner label="Loading request" />
+                  ) : (
+                    <pre className="max-h-72 overflow-auto rounded-xl bg-black/90 p-3 text-[11px] text-white">{JSON.stringify(reqSnap, null, 2)}</pre>
+                  )
+                }
+              />
+              <AdminJsonDisclosure
+                title="Response JSON"
+                value={
+                  debugLoading ? (
+                    <LoadingSpinner label="Loading response" />
+                  ) : (
+                    <pre className="max-h-72 overflow-auto rounded-xl bg-black/90 p-3 text-[11px] text-white">{JSON.stringify(respSnap, null, 2)}</pre>
+                  )
+                }
+              />
+              <AdminJsonDisclosure
+                title="Error / Debug"
+                defaultOpen={status === "FAILED" || status === "CANCELLED"}
+                value={
+                  <div className="space-y-3">
+                    <div className="grid grid-cols-2 gap-2 text-xs">
+                      <KeyValue k="code" v={meta?.error?.code || item.error?.code || "-"} />
+                      <KeyValue k="type" v={meta?.error?.type || "-"} />
+                      <KeyValue k="debug_id" v={meta?.error?.debug_id || "-"} />
+                      <KeyValue k="loading" v={loading ? "true" : "false"} />
+                    </div>
+                    <div className="whitespace-pre-wrap text-sm text-zinc-700 dark:text-zinc-200">{meta?.error?.message || item.error?.message || error || "-"}</div>
+                    {meta?.error?.details ? (
+                      <pre className="max-h-64 overflow-auto rounded-xl bg-black/90 p-3 text-[11px] text-white">{JSON.stringify(meta.error.details, null, 2)}</pre>
+                    ) : null}
+                  </div>
+                }
+              />
+              <AdminJsonDisclosure
+                title="引用图"
+                value={
+                  requestRefs.length ? (
+                    <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
+                      {requestRefs.map((entry: any, idx: number) => {
+                        const filename = String(entry?.filename || "");
+                        return (
+                          <div key={filename || idx} className="overflow-hidden rounded-2xl border border-zinc-200 bg-white/60 dark:border-white/10 dark:bg-zinc-950/30">
+                            <div className="relative h-28 w-full bg-zinc-100 dark:bg-zinc-900">
+                              {refUrls[filename] ? <img src={refUrls[filename]} alt={filename} className="h-full w-full object-cover" /> : <Skeleton className="h-full w-full rounded-none" />}
+                              <div className="absolute left-2 top-2 rounded-full bg-black/60 px-2 py-0.5 text-[10px] font-bold text-white">#{idx + 1}</div>
+                            </div>
+                            <div className="truncate px-3 py-2 text-[11px] text-zinc-600 dark:text-zinc-300">{filename || `reference_${idx}`}</div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  ) : (
+                    <div className="text-sm text-zinc-500 dark:text-zinc-400">没有引用图</div>
+                  )
+                }
+              />
+            </div>
+          </motion.div>
+        </div>
+      </motion.div>
+    </AnimatePresence>
+  );
+}
+
+function AdminPageLegacy() {
   const client = useApiClient();
   const { push } = useToast();
   const [loading, setLoading] = useState(true);
@@ -6117,6 +6726,852 @@ function AdminPage() {
           </Card>
         </div>
       </div>
+    </PageContainer>
+  );
+}
+
+function AdminPage() {
+  const client = useApiClient();
+  const catalog = useModelCatalog();
+  const { push } = useToast();
+  const [loading, setLoading] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
+  const [overview, setOverview] = useState<AdminOverviewResponse | null>(null);
+  const [users, setUsers] = useState<AdminUserItem[]>([]);
+  const [selectedUserId, setSelectedUserId] = useState<string | null>(null);
+  const [detailTab, setDetailTab] = useState<"overview" | "tasks" | "policy">("overview");
+  const [userSearch, setUserSearch] = useState("");
+  const [userRoleFilter, setUserRoleFilter] = useState<"ALL" | UserRole>("ALL");
+  const [userStateFilter, setUserStateFilter] = useState<"ALL" | "ENABLED" | "DISABLED" | "RUNNING" | "HIGH_USAGE" | "RISK_ONLY">("ALL");
+  const [userSort, setUserSort] = useState<"RISK_FIRST" | "RECENT_ACTIVE" | "USERNAME" | "CREATED_DESC">("RISK_FIRST");
+  const [providerNotes, setProviderNotes] = useState<Record<string, string>>({});
+  const [providerEnabledDrafts, setProviderEnabledDrafts] = useState<Record<string, boolean>>({});
+  const [providerSetBalanceDrafts, setProviderSetBalanceDrafts] = useState<Record<string, string>>({});
+  const [providerAddBalanceDrafts, setProviderAddBalanceDrafts] = useState<Record<string, string>>({});
+  const [savingProviderId, setSavingProviderId] = useState<string | null>(null);
+  const [savingProviderBalanceId, setSavingProviderBalanceId] = useState<string | null>(null);
+
+  const [policyDraft, setPolicyDraft] = useState<SystemPolicy | null>(null);
+  const [savingPolicy, setSavingPolicy] = useState(false);
+
+  const [editRole, setEditRole] = useState<UserRole>("USER");
+  const [editEnabled, setEditEnabled] = useState(true);
+  const [editPassword, setEditPassword] = useState("");
+  const [editDailyLimit, setEditDailyLimit] = useState("");
+  const [editConcurrentLimit, setEditConcurrentLimit] = useState("");
+  const [editTurnstileJobCount, setEditTurnstileJobCount] = useState("");
+  const [editTurnstileDailyUsage, setEditTurnstileDailyUsage] = useState("");
+  const [editImageAccessLimit, setEditImageAccessLimit] = useState("");
+  const [editImageAccessBonusQuota, setEditImageAccessBonusQuota] = useState("");
+  const [editImageAccessHardLimit, setEditImageAccessHardLimit] = useState("");
+  const [savingUser, setSavingUser] = useState(false);
+  const [resettingQuota, setResettingQuota] = useState(false);
+
+  const [newUsername, setNewUsername] = useState("");
+  const [newPassword, setNewPassword] = useState("");
+  const [newRole, setNewRole] = useState<UserRole>("USER");
+  const [newEnabled, setNewEnabled] = useState(true);
+  const [newDailyLimit, setNewDailyLimit] = useState("");
+  const [newConcurrentLimit, setNewConcurrentLimit] = useState("");
+  const [newTurnstileJobCount, setNewTurnstileJobCount] = useState("");
+  const [newTurnstileDailyUsage, setNewTurnstileDailyUsage] = useState("");
+  const [newImageAccessLimit, setNewImageAccessLimit] = useState("");
+  const [newImageAccessBonusQuota, setNewImageAccessBonusQuota] = useState("");
+  const [newImageAccessHardLimit, setNewImageAccessHardLimit] = useState("");
+  const [creatingUser, setCreatingUser] = useState(false);
+
+  const [taskSearch, setTaskSearch] = useState("");
+  const [taskStatusFilter, setTaskStatusFilter] = useState<JobStatus | "ALL">("ALL");
+  const [taskModelFilter, setTaskModelFilter] = useState<ModelId | "ALL">("ALL");
+  const [taskFrom, setTaskFrom] = useState("");
+  const [taskTo, setTaskTo] = useState("");
+  const [taskBatchName, setTaskBatchName] = useState("");
+  const [taskFailedOnly, setTaskFailedOnly] = useState(false);
+  const [taskHasImages, setTaskHasImages] = useState<"ALL" | "YES" | "NO">("ALL");
+  const [taskSort, setTaskSort] = useState<AdminTaskSortKey>("created_desc");
+  const [taskDensity, setTaskDensity] = useState<AdminTaskDensity>("gallery");
+  const [taskItems, setTaskItems] = useState<AdminUserJobSummary[]>([]);
+  const [taskStats, setTaskStats] = useState<AdminUserJobsStats | null>(null);
+  const [taskLoading, setTaskLoading] = useState(false);
+  const [taskLoadingMore, setTaskLoadingMore] = useState(false);
+  const [taskNextCursor, setTaskNextCursor] = useState<string | null>(null);
+  const [selectedTask, setSelectedTask] = useState<AdminUserJobSummary | null>(null);
+  const taskRequestSeqRef = useRef(0);
+
+  const debouncedUserSearch = useDebounced(userSearch, 150);
+  const debouncedTaskSearch = useDebounced(taskSearch, 180);
+
+  const parseOptionalNumber = (value: string) => {
+    const raw = value.trim();
+    if (!raw) return null;
+    const parsed = Number(raw);
+    if (!Number.isFinite(parsed)) return null;
+    return Math.max(0, Math.round(parsed));
+  };
+
+  const parseOptionalMoney = (value: string) => {
+    const raw = value.trim();
+    if (!raw) return null;
+    const parsed = Number(raw);
+    if (!Number.isFinite(parsed)) return null;
+    return Math.max(0, Number(parsed.toFixed(4)));
+  };
+
+  const clearOverrideDrafts = () => {
+    setEditDailyLimit("");
+    setEditConcurrentLimit("");
+    setEditTurnstileJobCount("");
+    setEditTurnstileDailyUsage("");
+    setEditImageAccessLimit("");
+    setEditImageAccessBonusQuota("");
+    setEditImageAccessHardLimit("");
+  };
+
+  const applyRiskPreset = (mode: "STRICT" | "RELAXED") => {
+    if (mode === "STRICT") {
+      setEditDailyLimit("10");
+      setEditConcurrentLimit("1");
+      setEditTurnstileJobCount("1");
+      setEditTurnstileDailyUsage("8");
+      setEditImageAccessLimit("12");
+      setEditImageAccessBonusQuota("0");
+      setEditImageAccessHardLimit("12");
+      return;
+    }
+    clearOverrideDrafts();
+    setEditConcurrentLimit(editRole === "ADMIN" ? "" : "6");
+    setEditTurnstileJobCount("999");
+    setEditTurnstileDailyUsage("999");
+  };
+
+  const generateTempPassword = async () => {
+    const password = `Reset-${Math.random().toString(36).slice(2, 8)}-A9`;
+    setEditPassword(password);
+    try {
+      await navigator.clipboard.writeText(password);
+      push({ kind: "success", title: "已生成临时密码", message: "新密码已复制到剪贴板" });
+    } catch {
+      push({ kind: "success", title: "已生成临时密码" });
+    }
+  };
+
+  const loadAdminData = async ({ silent = false }: { silent?: boolean } = {}) => {
+    if (!silent) setLoading(true);
+    setRefreshing(true);
+    try {
+      const [overviewPayload, usersPayload] = await Promise.all([client.adminOverview(), client.adminUsers()]);
+      setOverview(overviewPayload);
+      setPolicyDraft(overviewPayload.policy);
+      const providerItems = overviewPayload.providers?.providers || [];
+      setProviderNotes(Object.fromEntries(providerItems.map((item) => [item.provider_id, item.note || ""])));
+      setProviderEnabledDrafts(Object.fromEntries(providerItems.map((item) => [item.provider_id, Boolean(item.enabled)])));
+      setProviderSetBalanceDrafts(
+        Object.fromEntries(providerItems.map((item) => [item.provider_id, item.remaining_balance_cny == null ? "" : String(item.remaining_balance_cny)]))
+      );
+      setProviderAddBalanceDrafts((prev) => Object.fromEntries(providerItems.map((item) => [item.provider_id, prev[item.provider_id] || ""])));
+      setUsers(usersPayload.users || []);
+      setSelectedUserId((current) => current || usersPayload.users?.[0]?.user_id || null);
+    } catch (e: any) {
+      push({ kind: "error", title: "Admin 数据加载失败", message: e?.error?.message || "请检查后端状态" });
+    } finally {
+      setLoading(false);
+      setRefreshing(false);
+    }
+  };
+
+  useEffect(() => {
+    loadAdminData();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const filteredUsers = useMemo(() => {
+    const query = debouncedUserSearch.trim().toLowerCase();
+    const next = [...users].filter((user) => {
+      if (query && !`${user.username} ${user.user_id}`.toLowerCase().includes(query)) return false;
+      if (userRoleFilter !== "ALL" && user.role !== userRoleFilter) return false;
+      if (userStateFilter === "ENABLED" && !user.enabled) return false;
+      if (userStateFilter === "DISABLED" && user.enabled) return false;
+      if (userStateFilter === "RUNNING" && (user.usage.running_jobs || 0) <= 0) return false;
+      if (userStateFilter === "HIGH_USAGE") {
+        const dailyLimit = user.policy.daily_image_limit;
+        if (!(dailyLimit != null && dailyLimit > 0 && (user.usage.quota_consumed_today || 0) / dailyLimit >= 0.8)) return false;
+      }
+      if (userStateFilter === "RISK_ONLY" && adminUserRiskTags(user).length === 0) return false;
+      return true;
+    });
+    next.sort((a, b) => {
+      if (userSort === "USERNAME") return a.username.localeCompare(b.username);
+      if (userSort === "CREATED_DESC") return (new Date(b.created_at).getTime() || 0) - (new Date(a.created_at).getTime() || 0);
+      if (userSort === "RECENT_ACTIVE") return (new Date(b.last_login_at || b.updated_at).getTime() || 0) - (new Date(a.last_login_at || a.updated_at).getTime() || 0);
+      const riskDiff = adminUserRiskScore(b) - adminUserRiskScore(a);
+      if (riskDiff) return riskDiff;
+      return (new Date(b.last_login_at || b.updated_at).getTime() || 0) - (new Date(a.last_login_at || a.updated_at).getTime() || 0);
+    });
+    return next;
+  }, [debouncedUserSearch, userRoleFilter, userSort, userStateFilter, users]);
+
+  useEffect(() => {
+    if (selectedUserId && filteredUsers.some((item) => item.user_id === selectedUserId)) return;
+    setSelectedUserId(filteredUsers[0]?.user_id || users[0]?.user_id || null);
+  }, [filteredUsers, selectedUserId, users]);
+
+  const selectedUser = useMemo(() => users.find((item) => item.user_id === selectedUserId) || null, [selectedUserId, users]);
+
+  useEffect(() => {
+    if (!selectedUser) return;
+    setEditRole(selectedUser.role);
+    setEditEnabled(selectedUser.enabled);
+    setEditPassword("");
+    setEditDailyLimit(selectedUser.policy_overrides?.daily_image_limit == null ? "" : String(selectedUser.policy_overrides.daily_image_limit));
+    setEditConcurrentLimit(selectedUser.policy_overrides?.concurrent_jobs_limit == null ? "" : String(selectedUser.policy_overrides.concurrent_jobs_limit));
+    setEditTurnstileJobCount(selectedUser.policy_overrides?.turnstile_job_count_threshold == null ? "" : String(selectedUser.policy_overrides.turnstile_job_count_threshold));
+    setEditTurnstileDailyUsage(selectedUser.policy_overrides?.turnstile_daily_usage_threshold == null ? "" : String(selectedUser.policy_overrides.turnstile_daily_usage_threshold));
+    setEditImageAccessLimit(selectedUser.policy_overrides?.daily_image_access_limit == null ? "" : String(selectedUser.policy_overrides.daily_image_access_limit));
+    setEditImageAccessBonusQuota(selectedUser.policy_overrides?.image_access_turnstile_bonus_quota == null ? "" : String(selectedUser.policy_overrides.image_access_turnstile_bonus_quota));
+    setEditImageAccessHardLimit(selectedUser.policy_overrides?.daily_image_access_hard_limit == null ? "" : String(selectedUser.policy_overrides.daily_image_access_hard_limit));
+  }, [selectedUser]);
+
+  const savePolicy = async () => {
+    if (!policyDraft) return;
+    setSavingPolicy(true);
+    try {
+      const updated = await client.adminUpdatePolicy(policyDraft);
+      setPolicyDraft(updated.policy);
+      await loadAdminData({ silent: true });
+      push({ kind: "success", title: "系统策略已更新" });
+    } catch (e: any) {
+      push({ kind: "error", title: "策略更新失败", message: getApiErrorMessage(e, "请检查输入") });
+    } finally {
+      setSavingPolicy(false);
+    }
+  };
+
+  const saveSelectedUser = async () => {
+    if (!selectedUser) return;
+    setSavingUser(true);
+    try {
+      const updated = await client.adminUpdateUser(selectedUser.user_id, {
+        role: editRole,
+        enabled: editEnabled,
+        password: editPassword.trim() || undefined,
+        policy_overrides: {
+          daily_image_limit: parseOptionalNumber(editDailyLimit),
+          concurrent_jobs_limit: parseOptionalNumber(editConcurrentLimit),
+          turnstile_job_count_threshold: parseOptionalNumber(editTurnstileJobCount),
+          turnstile_daily_usage_threshold: parseOptionalNumber(editTurnstileDailyUsage),
+          daily_image_access_limit: parseOptionalNumber(editImageAccessLimit),
+          image_access_turnstile_bonus_quota: parseOptionalNumber(editImageAccessBonusQuota),
+          daily_image_access_hard_limit: parseOptionalNumber(editImageAccessHardLimit),
+        },
+      });
+      setUsers((current) => current.map((item) => (item.user_id === updated.user_id ? updated : item)));
+      setEditPassword("");
+      push({ kind: "success", title: `已更新 ${updated.username}` });
+      await loadAdminData({ silent: true });
+    } catch (e: any) {
+      push({ kind: "error", title: "用户更新失败", message: getApiErrorMessage(e, "请检查输入") });
+    } finally {
+      setSavingUser(false);
+    }
+  };
+
+  const resetSelectedQuota = async () => {
+    if (!selectedUser) return;
+    setResettingQuota(true);
+    try {
+      const updated = await client.adminResetQuota(selectedUser.user_id);
+      setUsers((current) => current.map((item) => (item.user_id === updated.user_id ? updated : item)));
+      push({ kind: "success", title: `已重置 ${updated.username} 今日额度` });
+      await loadAdminData({ silent: true });
+    } catch (e: any) {
+      push({ kind: "error", title: "额度重置失败", message: e?.error?.message || "请稍后重试" });
+    } finally {
+      setResettingQuota(false);
+    }
+  };
+
+  const createUser = async () => {
+    const username = newUsername.trim().toLowerCase();
+    const password = newPassword.trim();
+    if (!username || !password) {
+      push({ kind: "error", title: "请填写新账号用户名与密码" });
+      return;
+    }
+    if (!ADMIN_USERNAME_PATTERN.test(username)) {
+      push({ kind: "error", title: "创建用户失败", message: "用户名必须为 3-32 位，只能包含字母、数字、下划线、点和短横线" });
+      return;
+    }
+    if (password.length < 8 || password.length > 128) {
+      push({ kind: "error", title: "创建用户失败", message: "密码长度必须为 8-128 位" });
+      return;
+    }
+    setCreatingUser(true);
+    try {
+      await client.adminCreateUser({
+        username,
+        password,
+        role: newRole,
+        enabled: newEnabled,
+        policy_overrides: {
+          daily_image_limit: parseOptionalNumber(newDailyLimit),
+          concurrent_jobs_limit: parseOptionalNumber(newConcurrentLimit),
+          turnstile_job_count_threshold: parseOptionalNumber(newTurnstileJobCount),
+          turnstile_daily_usage_threshold: parseOptionalNumber(newTurnstileDailyUsage),
+          daily_image_access_limit: parseOptionalNumber(newImageAccessLimit),
+          image_access_turnstile_bonus_quota: parseOptionalNumber(newImageAccessBonusQuota),
+          daily_image_access_hard_limit: parseOptionalNumber(newImageAccessHardLimit),
+        },
+      });
+      setNewUsername("");
+      setNewPassword("");
+      setNewRole("USER");
+      setNewEnabled(true);
+      setNewDailyLimit("");
+      setNewConcurrentLimit("");
+      setNewTurnstileJobCount("");
+      setNewTurnstileDailyUsage("");
+      setNewImageAccessLimit("");
+      setNewImageAccessBonusQuota("");
+      setNewImageAccessHardLimit("");
+      await loadAdminData({ silent: true });
+      push({ kind: "success", title: "新用户已创建" });
+    } catch (e: any) {
+      push({ kind: "error", title: "创建用户失败", message: getApiErrorMessage(e, "请检查输入") });
+    } finally {
+      setCreatingUser(false);
+    }
+  };
+
+  const saveProvider = async (providerId: string) => {
+    setSavingProviderId(providerId);
+    try {
+      await client.adminUpdateProvider(providerId, {
+        enabled: providerEnabledDrafts[providerId],
+        note: providerNotes[providerId] || "",
+      });
+      await loadAdminData({ silent: true });
+      push({ kind: "success", title: `已更新 ${providerId}` });
+    } catch (e: any) {
+      push({ kind: "error", title: "Provider 更新失败", message: getApiErrorMessage(e, "请稍后重试") });
+    } finally {
+      setSavingProviderId(null);
+    }
+  };
+
+  const setProviderBalance = async (providerId: string) => {
+    setSavingProviderBalanceId(`set:${providerId}`);
+    try {
+      await client.adminSetProviderBalance(providerId, parseOptionalMoney(providerSetBalanceDrafts[providerId] || ""));
+      await loadAdminData({ silent: true });
+      push({ kind: "success", title: `已设置 ${providerId} 余额` });
+    } catch (e: any) {
+      push({ kind: "error", title: "余额设置失败", message: getApiErrorMessage(e, "请检查金额") });
+    } finally {
+      setSavingProviderBalanceId(null);
+    }
+  };
+
+  const addProviderBalance = async (providerId: string) => {
+    const delta = parseOptionalMoney(providerAddBalanceDrafts[providerId] || "");
+    if (delta == null || delta <= 0) {
+      push({ kind: "error", title: "请输入大于 0 的充值金额" });
+      return;
+    }
+    setSavingProviderBalanceId(`add:${providerId}`);
+    try {
+      await client.adminAddProviderBalance(providerId, delta);
+      setProviderAddBalanceDrafts((prev) => ({ ...prev, [providerId]: "" }));
+      await loadAdminData({ silent: true });
+      push({ kind: "success", title: `已为 ${providerId} 增加余额` });
+    } catch (e: any) {
+      push({ kind: "error", title: "余额增加失败", message: getApiErrorMessage(e, "请检查金额") });
+    } finally {
+      setSavingProviderBalanceId(null);
+    }
+  };
+
+  const loadSelectedUserTasks = async ({ cursor = null, append = false }: { cursor?: string | null; append?: boolean } = {}) => {
+    if (!selectedUser) {
+      setTaskItems([]);
+      setTaskStats(null);
+      setTaskNextCursor(null);
+      return;
+    }
+    const requestSeq = ++taskRequestSeqRef.current;
+    if (append) setTaskLoadingMore(true);
+    else setTaskLoading(true);
+    try {
+      const payload = await client.adminUserJobs(selectedUser.user_id, {
+        q: debouncedTaskSearch || undefined,
+        status: taskStatusFilter === "ALL" ? undefined : taskStatusFilter,
+        model: taskModelFilter === "ALL" ? undefined : taskModelFilter,
+        from: taskFrom || undefined,
+        to: taskTo || undefined,
+        batch_name: taskBatchName || undefined,
+        has_images: taskHasImages === "ALL" ? undefined : taskHasImages === "YES",
+        failed_only: taskFailedOnly || undefined,
+        sort: taskSort,
+        cursor,
+        limit: 24,
+      });
+      if (requestSeq !== taskRequestSeqRef.current) return;
+      setTaskStats(payload.stats);
+      setTaskNextCursor(payload.next_cursor || null);
+      setTaskItems((current) =>
+        append
+          ? [...current, ...payload.items.filter((item) => !current.some((existing) => existing.job_id === item.job_id))]
+          : payload.items
+      );
+    } catch (e: any) {
+      if (requestSeq !== taskRequestSeqRef.current) return;
+      push({ kind: "error", title: "任务列表加载失败", message: getApiErrorMessage(e, "请稍后重试") });
+      if (!append) {
+        setTaskItems([]);
+        setTaskStats(null);
+        setTaskNextCursor(null);
+      }
+    } finally {
+      if (requestSeq === taskRequestSeqRef.current) {
+        setTaskLoading(false);
+        setTaskLoadingMore(false);
+      }
+    }
+  };
+
+  useEffect(() => {
+    setTaskItems([]);
+    setTaskStats(null);
+    setTaskNextCursor(null);
+    setSelectedTask(null);
+    if (!selectedUser) return;
+    loadSelectedUserTasks();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedUser?.user_id, debouncedTaskSearch, taskStatusFilter, taskModelFilter, taskFrom, taskTo, taskBatchName, taskFailedOnly, taskHasImages, taskSort]);
+
+  useEffect(() => {
+    if (!selectedTask) return;
+    const updated = taskItems.find((item) => item.job_id === selectedTask.job_id) || null;
+    if (updated) setSelectedTask(updated);
+  }, [selectedTask, taskItems]);
+
+  const selectedUserTags = selectedUser ? adminUserRiskTags(selectedUser) : [];
+  const taskPreviewMap = useAdminTaskPreviewMap(taskItems, selectedUser?.user_id || "");
+  const effectivePolicyRows = selectedUser
+    ? [
+        { key: "daily_image_limit" as const, label: "每日额度", value: selectedUser.policy.daily_image_limit ?? "无限制" },
+        { key: "concurrent_jobs_limit" as const, label: "并发上限", value: selectedUser.policy.concurrent_jobs_limit },
+        { key: "turnstile_job_count_threshold" as const, label: "job_count 验证阈值", value: selectedUser.policy.turnstile_job_count_threshold ?? "禁用" },
+        { key: "turnstile_daily_usage_threshold" as const, label: "日生成量验证阈值", value: selectedUser.policy.turnstile_daily_usage_threshold ?? "禁用" },
+        { key: "daily_image_access_limit" as const, label: "图片访问基础额度", value: selectedUser.policy.daily_image_access_limit ?? "默认/无限制" },
+        { key: "image_access_turnstile_bonus_quota" as const, label: "图片访问验证加额", value: selectedUser.policy.image_access_turnstile_bonus_quota ?? "默认" },
+        { key: "daily_image_access_hard_limit" as const, label: "图片访问硬上限", value: selectedUser.policy.daily_image_access_hard_limit ?? "默认/无限制" },
+      ]
+    : [];
+
+  return (
+    <PageContainer className="max-w-[1900px] px-5 2xl:px-8">
+      <PageTitle
+        title="Admin"
+        subtitle="双栏用户工作台：左边筛人，右边做审查、风控和任务级强操作。"
+        right={<Button variant="secondary" onClick={() => loadAdminData({ silent: true })} disabled={refreshing}>{refreshing ? "刷新中…" : "刷新"}</Button>}
+      />
+
+      <Card hover={false} className="rounded-[28px] px-4 py-3">
+        <div className="flex flex-wrap items-center gap-2 text-xs text-zinc-600 dark:text-zinc-300">
+          <span className="rounded-full border border-zinc-200 bg-white px-3 py-1 dark:border-white/10 dark:bg-zinc-950/40">Users {overview?.system.users_total ?? "-"}</span>
+          <span className="rounded-full border border-zinc-200 bg-white px-3 py-1 dark:border-white/10 dark:bg-zinc-950/40">Enabled {overview?.system.users_enabled ?? "-"}</span>
+          <span className="rounded-full border border-zinc-200 bg-white px-3 py-1 dark:border-white/10 dark:bg-zinc-950/40">Active Jobs {overview?.system.active_jobs ?? "-"}</span>
+          <span className="rounded-full border border-zinc-200 bg-white px-3 py-1 dark:border-white/10 dark:bg-zinc-950/40">Queued {overview?.system.queued_jobs ?? "-"}</span>
+          <span className="rounded-full border border-zinc-200 bg-white px-3 py-1 dark:border-white/10 dark:bg-zinc-950/40">Running {overview?.system.running_jobs ?? "-"}</span>
+          <span className="rounded-full border border-zinc-200 bg-white px-3 py-1 dark:border-white/10 dark:bg-zinc-950/40">Succeeded Today {overview?.system.succeeded_today ?? "-"}</span>
+          <span className="rounded-full border border-zinc-200 bg-white px-3 py-1 dark:border-white/10 dark:bg-zinc-950/40">Failed Today {overview?.system.failed_today ?? "-"}</span>
+          <span className="rounded-full border border-zinc-200 bg-white px-3 py-1 dark:border-white/10 dark:bg-zinc-950/40">Provider Healthy {overview?.providers.providers_healthy ?? "-"}</span>
+        </div>
+      </Card>
+
+      <div className="mt-4 grid grid-cols-1 gap-4 xl:grid-cols-[340px_minmax(0,1fr)]">
+        <Card className="h-fit xl:sticky xl:top-24" hover={false}>
+          <div className="text-xs font-semibold uppercase tracking-[0.18em] text-zinc-500 dark:text-zinc-400">Users</div>
+          <div className="mt-2 text-lg font-bold text-zinc-900 dark:text-zinc-50">用户工作台</div>
+          <div className="mt-4 space-y-3">
+            <Field label="Search"><Input testId="admin-user-search" value={userSearch} onChange={setUserSearch} placeholder="username / user_id" /></Field>
+            <Field label="Role">
+              <Select testId="admin-user-role-filter" value={userRoleFilter} onChange={(value) => setUserRoleFilter(value as "ALL" | UserRole)} options={[{ value: "ALL", label: "All Roles" }, { value: "ADMIN", label: "ADMIN" }, { value: "USER", label: "USER" }]} />
+            </Field>
+            <Field label="State">
+              <Select testId="admin-user-state-filter" value={userStateFilter} onChange={(value) => setUserStateFilter(value as typeof userStateFilter)} options={[{ value: "ALL", label: "All Users" }, { value: "ENABLED", label: "Enabled" }, { value: "DISABLED", label: "Disabled" }, { value: "RUNNING", label: "Running Jobs" }, { value: "HIGH_USAGE", label: "High Usage" }, { value: "RISK_ONLY", label: "Risk Only" }]} />
+            </Field>
+            <Field label="Sort">
+              <Select testId="admin-user-sort" value={userSort} onChange={(value) => setUserSort(value as typeof userSort)} options={[{ value: "RISK_FIRST", label: "Risk First" }, { value: "RECENT_ACTIVE", label: "Recent Active" }, { value: "USERNAME", label: "Username" }, { value: "CREATED_DESC", label: "Newest First" }]} />
+            </Field>
+          </div>
+
+          <div className="mt-4 space-y-2">
+            {filteredUsers.length ? filteredUsers.map((user) => {
+              const active = user.user_id === selectedUserId;
+              const tags = adminUserRiskTags(user);
+              return (
+                <button key={user.user_id} type="button" onClick={() => setSelectedUserId(user.user_id)} data-testid={`admin-user-card-${user.user_id}`} className={cn("w-full rounded-2xl border p-3 text-left transition", active ? "border-zinc-900 bg-zinc-900 text-white dark:border-white dark:bg-white dark:text-zinc-900" : "border-zinc-200 bg-white/70 hover:border-zinc-400 dark:border-white/10 dark:bg-zinc-950/30")}>
+                  <div className="flex items-start justify-between gap-3">
+                    <div className="min-w-0">
+                      <div className="truncate text-sm font-bold">{user.username}</div>
+                      <div className={cn("mt-1 text-[11px]", active ? "text-white/80 dark:text-zinc-700" : "text-zinc-500 dark:text-zinc-400")}>
+                        {user.role} · {user.enabled ? "enabled" : "disabled"} · last login {formatLocal(user.last_login_at)}
+                      </div>
+                    </div>
+                    <div className={cn("text-right text-[11px]", active ? "text-white/80 dark:text-zinc-700" : "text-zinc-500 dark:text-zinc-400")}>
+                      <div>{user.total_jobs} jobs</div>
+                      <div>{user.usage.active_jobs} active</div>
+                    </div>
+                  </div>
+                  <div className={cn("mt-2 grid grid-cols-2 gap-2 text-[11px]", active ? "text-white/85 dark:text-zinc-700" : "text-zinc-600 dark:text-zinc-300")}>
+                    <div>today created {user.usage.jobs_created_today}</div>
+                    <div>today images {user.usage.images_generated_today}</div>
+                    <div>quota {user.usage.quota_consumed_today}/{user.policy.daily_image_limit ?? "∞"}</div>
+                    <div>run/q {user.usage.running_jobs || 0}/{user.usage.queued_jobs || 0}</div>
+                  </div>
+                  <div className="mt-2 flex flex-wrap gap-1">
+                    {tags.length ? tags.map((tag) => <AdminUserRiskChip key={tag} label={tag} />) : <span className="text-[10px] text-zinc-400">no flags</span>}
+                  </div>
+                </button>
+              );
+            }) : <EmptyHint text="没有匹配的用户" />}
+          </div>
+        </Card>
+
+        <div className="space-y-4">
+          {!selectedUser ? (
+            <Card hover={false}><EmptyHint text="请先选择一个用户" /></Card>
+          ) : (
+            <>
+              <Card hover={false}>
+                <div className="flex flex-wrap items-start justify-between gap-3">
+                  <div>
+                    <div className="text-xs font-semibold uppercase tracking-[0.18em] text-zinc-500 dark:text-zinc-400">Selected User</div>
+                    <div className="mt-1 text-2xl font-bold text-zinc-900 dark:text-zinc-50">{selectedUser.username}</div>
+                    <div className="mt-2 flex flex-wrap gap-1">
+                      {selectedUserTags.length ? selectedUserTags.map((tag) => <AdminUserRiskChip key={tag} label={tag} />) : <AdminUserRiskChip label="healthy" />}
+                    </div>
+                  </div>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <Button variant={detailTab === "overview" ? "primary" : "ghost"} onClick={() => setDetailTab("overview")}>概览</Button>
+                    <Button variant={detailTab === "tasks" ? "primary" : "ghost"} onClick={() => setDetailTab("tasks")}>任务</Button>
+                    <Button variant={detailTab === "policy" ? "primary" : "ghost"} onClick={() => setDetailTab("policy")}>风控与额度</Button>
+                  </div>
+                </div>
+              </Card>
+
+              {detailTab === "overview" ? (
+                <div className="grid grid-cols-1 gap-4 xl:grid-cols-[1.1fr_0.9fr]">
+                  <Card hover={false}>
+                    <div className="flex items-center justify-between gap-3">
+                      <div>
+                        <div className="text-sm font-bold text-zinc-900 dark:text-zinc-50">概览</div>
+                        <div className="text-xs text-zinc-600 dark:text-zinc-300">身份、使用情况、快速动作与生效策略来源。</div>
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <Button variant="secondary" onClick={resetSelectedQuota} disabled={resettingQuota}>{resettingQuota ? "重置中…" : "重置今日额度"}</Button>
+                        <Button variant="primary" onClick={saveSelectedUser} disabled={savingUser}>{savingUser ? "保存中…" : "保存用户"}</Button>
+                      </div>
+                    </div>
+
+                    <div className="mt-4 grid gap-3 md:grid-cols-3">
+                      <Card hover={false} className="p-3"><KeyValue k="role" v={editRole} /></Card>
+                      <Card hover={false} className="p-3"><KeyValue k="enabled" v={editEnabled ? "true" : "false"} /></Card>
+                      <Card hover={false} className="p-3"><KeyValue k="last_login" v={formatLocal(selectedUser.last_login_at)} /></Card>
+                      <Card hover={false} className="p-3"><KeyValue k="created" v={formatLocal(selectedUser.created_at)} /></Card>
+                      <Card hover={false} className="p-3"><KeyValue k="total_jobs" v={selectedUser.total_jobs} /></Card>
+                      <Card hover={false} className="p-3"><KeyValue k="remaining_images" v={selectedUser.usage.remaining_images_today ?? "∞"} /></Card>
+                    </div>
+
+                    <div className="mt-4 rounded-2xl border border-zinc-200 bg-zinc-50/80 p-3 dark:border-white/10 dark:bg-zinc-950/30">
+                      <div className="text-sm font-semibold text-zinc-900 dark:text-zinc-50">快速动作</div>
+                      <div className="mt-3 flex flex-wrap gap-2">
+                        <Button variant="ghost" onClick={() => setEditEnabled((current) => !current)}>{editEnabled ? "设为禁用" : "设为启用"}</Button>
+                        <Button variant="ghost" onClick={() => setEditRole((current) => (current === "ADMIN" ? "USER" : "ADMIN"))}>切换角色到 {editRole === "ADMIN" ? "USER" : "ADMIN"}</Button>
+                        <Button variant="ghost" onClick={generateTempPassword}>生成临时密码</Button>
+                        <Button variant="ghost" onClick={() => setDetailTab("policy")}>进入风控编辑</Button>
+                      </div>
+                      {editPassword ? (
+                        <div className="mt-3 rounded-xl border border-sky-200 bg-sky-50 px-3 py-2 text-xs text-sky-800 dark:border-sky-800/50 dark:bg-sky-950/30 dark:text-sky-200">
+                          当前待保存的新密码：<span className="font-bold">{editPassword}</span>
+                        </div>
+                      ) : null}
+                    </div>
+                  </Card>
+
+                  <Card hover={false}>
+                    <div className="text-sm font-bold text-zinc-900 dark:text-zinc-50">当前生效策略</div>
+                    <div className="mt-3 space-y-2">
+                      {effectivePolicyRows.map((row) => {
+                        const overridden = adminUserOverrideValue(selectedUser, row.key) != null;
+                        return (
+                          <div key={row.key} className="flex items-center justify-between rounded-2xl border border-zinc-200 bg-white/70 px-3 py-2 text-sm dark:border-white/10 dark:bg-zinc-950/30">
+                            <div>
+                              <div className="font-semibold text-zinc-900 dark:text-zinc-50">{row.label}</div>
+                              <div className="text-[11px] text-zinc-500 dark:text-zinc-400">来源：{overridden ? "user override" : selectedUser.role === "ADMIN" && row.key === "concurrent_jobs_limit" ? "admin default" : "system default"}</div>
+                            </div>
+                            <div className="text-right">
+                              <div className="font-bold text-zinc-900 dark:text-zinc-50">{String(row.value)}</div>
+                              {overridden ? <div className="text-[11px] text-amber-600 dark:text-amber-200">override</div> : null}
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </Card>
+                </div>
+              ) : null}
+
+              {detailTab === "tasks" ? (
+                <div className="space-y-4">
+                  <Card hover={false}>
+                    <div className="flex flex-wrap items-center justify-between gap-3">
+                      <div>
+                        <div className="text-sm font-bold text-zinc-900 dark:text-zinc-50">用户任务</div>
+                        <div className="text-xs text-zinc-600 dark:text-zinc-300">服务端分页任务画廊，不复用本地 History 数据。</div>
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <Button variant={taskDensity === "gallery" ? "secondary" : "ghost"} onClick={() => setTaskDensity("gallery")}>画廊</Button>
+                        <Button variant={taskDensity === "list" ? "secondary" : "ghost"} onClick={() => setTaskDensity("list")}>列表</Button>
+                        <Button variant="secondary" onClick={() => loadSelectedUserTasks()} disabled={taskLoading || taskLoadingMore}>刷新任务</Button>
+                      </div>
+                    </div>
+
+                    <div className="mt-4 grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-4">
+                      <Field label="Search"><Input testId="admin-task-search" value={taskSearch} onChange={setTaskSearch} placeholder="job id / prompt / model / error" /></Field>
+                      <Field label="Status">
+                        <Select testId="admin-task-status-filter" value={taskStatusFilter} onChange={(value) => setTaskStatusFilter(value as JobStatus | "ALL")} options={[{ value: "ALL", label: "All Statuses" }, { value: "QUEUED", label: "Queued" }, { value: "RUNNING", label: "Running" }, { value: "SUCCEEDED", label: "Succeeded" }, { value: "FAILED", label: "Failed" }, { value: "CANCELLED", label: "Cancelled" }]} />
+                      </Field>
+                      <Field label="Model">
+                        <Select testId="admin-task-model-filter" value={String(taskModelFilter)} onChange={(value) => setTaskModelFilter(value as ModelId | "ALL")} options={[{ value: "ALL", label: "All Models" }, ...catalog.models.map((model) => ({ value: model.model_id, label: model.label }))]} />
+                      </Field>
+                      <Field label="Sort">
+                        <Select testId="admin-task-sort" value={taskSort} onChange={(value) => setTaskSort(value as AdminTaskSortKey)} options={[{ value: "created_desc", label: "Created Desc" }, { value: "created_asc", label: "Created Asc" }, { value: "updated_desc", label: "Updated Desc" }, { value: "updated_asc", label: "Updated Asc" }, { value: "duration_desc", label: "Duration Desc" }]} />
+                      </Field>
+                      <Field label="From"><Input testId="admin-task-from" value={taskFrom} onChange={setTaskFrom} type="date" /></Field>
+                      <Field label="To"><Input testId="admin-task-to" value={taskTo} onChange={setTaskTo} type="date" /></Field>
+                      <Field label="Batch Name"><Input testId="admin-task-batch-name" value={taskBatchName} onChange={setTaskBatchName} placeholder="可留空" /></Field>
+                      <Field label="Images">
+                        <Select testId="admin-task-images-filter" value={taskHasImages} onChange={(value) => setTaskHasImages(value as typeof taskHasImages)} options={[{ value: "ALL", label: "All" }, { value: "YES", label: "Has Images" }, { value: "NO", label: "No Images" }]} />
+                      </Field>
+                    </div>
+
+                    <div className="mt-3 flex flex-wrap items-center gap-3">
+                      <div className="flex items-center justify-between rounded-2xl border border-zinc-200 bg-zinc-50/80 px-3 py-2 dark:border-white/10 dark:bg-zinc-950/30">
+                        <div>
+                          <div className="text-sm font-semibold text-zinc-900 dark:text-zinc-50">Only Failed</div>
+                          <div className="text-[11px] text-zinc-500 dark:text-zinc-400">Failed + cancelled</div>
+                        </div>
+                        <Switch testId="admin-task-failed-only" value={taskFailedOnly} onChange={setTaskFailedOnly} />
+                      </div>
+                      <div className="flex flex-wrap gap-2 text-xs text-zinc-600 dark:text-zinc-300">
+                        <span className="rounded-full border border-zinc-200 bg-white px-3 py-1 dark:border-white/10 dark:bg-zinc-950/40">Total {taskStats?.total ?? 0}</span>
+                        <span className="rounded-full border border-zinc-200 bg-white px-3 py-1 dark:border-white/10 dark:bg-zinc-950/40">Active {taskStats?.active ?? 0}</span>
+                        <span className="rounded-full border border-zinc-200 bg-white px-3 py-1 dark:border-white/10 dark:bg-zinc-950/40">Running {taskStats?.running ?? 0}</span>
+                        <span className="rounded-full border border-zinc-200 bg-white px-3 py-1 dark:border-white/10 dark:bg-zinc-950/40">Queued {taskStats?.queued ?? 0}</span>
+                        <span className="rounded-full border border-zinc-200 bg-white px-3 py-1 dark:border-white/10 dark:bg-zinc-950/40">Succeeded {taskStats?.succeeded ?? 0}</span>
+                        <span className="rounded-full border border-zinc-200 bg-white px-3 py-1 dark:border-white/10 dark:bg-zinc-950/40">Failed {taskStats?.failed ?? 0}</span>
+                      </div>
+                    </div>
+                  </Card>
+
+                  {taskLoading ? (
+                    <Card hover={false}><Skeleton className="h-48 w-full" /></Card>
+                  ) : taskItems.length ? (
+                    <>
+                      <div className={cn("grid gap-5", taskDensity === "list" ? "grid-cols-1" : "grid-cols-1 sm:grid-cols-2 xl:grid-cols-2 2xl:grid-cols-3")}>
+                        {taskItems.map((item) => (
+                          <AdminTaskCard key={item.job_id} item={item} preview={taskPreviewMap[item.job_id]} density={taskDensity} onOpen={() => setSelectedTask(item)} />
+                        ))}
+                      </div>
+                      {taskNextCursor ? (
+                        <div className="flex justify-center">
+                          <Button variant="secondary" onClick={() => loadSelectedUserTasks({ cursor: taskNextCursor, append: true })} disabled={taskLoadingMore}>{taskLoadingMore ? "加载中…" : "加载更多"}</Button>
+                        </div>
+                      ) : null}
+                    </>
+                  ) : (
+                    <Card hover={false}><EmptyHint text="当前筛选条件下没有任务" /></Card>
+                  )}
+                </div>
+              ) : null}
+
+              {detailTab === "policy" ? (
+                <div className="grid grid-cols-1 gap-4 xl:grid-cols-[1.05fr_0.95fr]">
+                  <Card hover={false}>
+                    <div className="flex items-center justify-between gap-3">
+                      <div>
+                        <div className="text-sm font-bold text-zinc-900 dark:text-zinc-50">风控与额度</div>
+                        <div className="text-xs text-zinc-600 dark:text-zinc-300">这些字段只编辑 override；留空表示恢复跟随默认。</div>
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <Button variant="ghost" onClick={clearOverrideDrafts}>清空全部 override</Button>
+                        <Button variant="ghost" onClick={() => applyRiskPreset("STRICT")}>设为高风险模式</Button>
+                        <Button variant="ghost" onClick={() => applyRiskPreset("RELAXED")}>设为宽松模式</Button>
+                        <Button variant="primary" onClick={saveSelectedUser} disabled={savingUser}>{savingUser ? "保存中…" : "保存用户"}</Button>
+                      </div>
+                    </div>
+
+                    <div className="mt-4 grid grid-cols-1 gap-4 md:grid-cols-2">
+                      <div className="space-y-3">
+                        <div className="text-xs font-semibold uppercase tracking-[0.18em] text-zinc-500 dark:text-zinc-400">身份与控制</div>
+                        <Field label="username"><div className="rounded-xl border border-zinc-200 bg-zinc-50 px-3 py-2 text-sm text-zinc-700 dark:border-white/10 dark:bg-zinc-950/30 dark:text-zinc-200">{selectedUser.username}</div></Field>
+                        <Field label="role"><Select value={editRole} onChange={(value) => setEditRole(value as UserRole)} options={[{ value: "ADMIN", label: "ADMIN" }, { value: "USER", label: "USER" }]} /></Field>
+                        <Field label="enabled"><div className="flex h-[42px] items-center"><Switch value={editEnabled} onChange={setEditEnabled} /></div></Field>
+                        <Field label="new password"><Input value={editPassword} onChange={setEditPassword} type="password" placeholder="留空则不改密码" /></Field>
+                      </div>
+                      <div className="space-y-3">
+                        <div className="text-xs font-semibold uppercase tracking-[0.18em] text-zinc-500 dark:text-zinc-400">生成额度与并发</div>
+                        <Field label="daily_image_limit"><Input testId="admin-policy-daily-limit" value={editDailyLimit} onChange={setEditDailyLimit} placeholder="留空跟随默认" /></Field>
+                        <Field label="concurrent_jobs_limit"><Input testId="admin-policy-concurrent-limit" value={editConcurrentLimit} onChange={setEditConcurrentLimit} placeholder="留空跟随默认" /></Field>
+                        <div className="text-xs font-semibold uppercase tracking-[0.18em] text-zinc-500 dark:text-zinc-400">Turnstile</div>
+                        <Field label="turnstile_job_count_threshold"><Input testId="admin-policy-turnstile-job-count" value={editTurnstileJobCount} onChange={setEditTurnstileJobCount} placeholder="留空禁用/跟随默认" /></Field>
+                        <Field label="turnstile_daily_usage_threshold"><Input testId="admin-policy-turnstile-daily-usage" value={editTurnstileDailyUsage} onChange={setEditTurnstileDailyUsage} placeholder="留空禁用/跟随默认" /></Field>
+                        <div className="text-xs font-semibold uppercase tracking-[0.18em] text-zinc-500 dark:text-zinc-400">图片访问</div>
+                        <Field label="daily_image_access_limit"><Input testId="admin-policy-image-access-limit" value={editImageAccessLimit} onChange={setEditImageAccessLimit} placeholder="留空跟随默认" /></Field>
+                        <Field label="image_access_turnstile_bonus_quota"><Input testId="admin-policy-image-access-bonus" value={editImageAccessBonusQuota} onChange={setEditImageAccessBonusQuota} placeholder="留空跟随默认" /></Field>
+                        <Field label="daily_image_access_hard_limit"><Input testId="admin-policy-image-access-hard-limit" value={editImageAccessHardLimit} onChange={setEditImageAccessHardLimit} placeholder="留空跟随默认" /></Field>
+                      </div>
+                    </div>
+                  </Card>
+
+                  <Card hover={false}>
+                    <div className="text-sm font-bold text-zinc-900 dark:text-zinc-50">来源解释</div>
+                    <div className="mt-3 space-y-2">
+                      {effectivePolicyRows.map((row) => {
+                        const overrideValue = adminUserOverrideValue(selectedUser, row.key);
+                        return (
+                          <div key={row.key} className="rounded-2xl border border-zinc-200 bg-white/70 px-3 py-3 dark:border-white/10 dark:bg-zinc-950/30">
+                            <div className="flex items-center justify-between gap-3">
+                              <div>
+                                <div className="font-semibold text-zinc-900 dark:text-zinc-50">{row.label}</div>
+                                <div className="text-[11px] text-zinc-500 dark:text-zinc-400">{overrideValue == null ? "当前跟随默认策略" : `当前来自 override：${overrideValue}`}</div>
+                              </div>
+                              <div className="text-right text-sm font-bold text-zinc-900 dark:text-zinc-50">{String(row.value)}</div>
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </Card>
+                </div>
+              ) : null}
+
+              <Card hover={false}>
+                <div className="flex items-center justify-between">
+                  <div className="text-sm font-bold text-zinc-900 dark:text-zinc-50">创建新用户</div>
+                  <Button variant="primary" onClick={createUser} disabled={creatingUser}>{creatingUser ? "创建中…" : "创建"}</Button>
+                </div>
+                <div className="mt-3 grid grid-cols-1 gap-3 md:grid-cols-2">
+                  <Field label="username"><Input value={newUsername} onChange={setNewUsername} placeholder="alice" /></Field>
+                  <Field label="password"><Input value={newPassword} onChange={setNewPassword} type="password" placeholder="至少 8 位" /></Field>
+                  <Field label="role"><Select value={newRole} onChange={(value) => setNewRole(value as UserRole)} options={[{ value: "USER", label: "USER" }, { value: "ADMIN", label: "ADMIN" }]} /></Field>
+                  <Field label="enabled"><div className="flex h-[42px] items-center"><Switch value={newEnabled} onChange={setNewEnabled} /></div></Field>
+                  <Field label="daily_image_limit"><Input value={newDailyLimit} onChange={setNewDailyLimit} placeholder="留空使用默认值" /></Field>
+                  <Field label="concurrent_jobs_limit"><Input value={newConcurrentLimit} onChange={setNewConcurrentLimit} placeholder="留空使用默认值" /></Field>
+                  <Field label="turnstile_job_count_threshold"><Input value={newTurnstileJobCount} onChange={setNewTurnstileJobCount} placeholder="留空使用默认值" /></Field>
+                  <Field label="turnstile_daily_usage_threshold"><Input value={newTurnstileDailyUsage} onChange={setNewTurnstileDailyUsage} placeholder="留空使用默认值" /></Field>
+                  <Field label="daily_image_access_limit"><Input value={newImageAccessLimit} onChange={setNewImageAccessLimit} placeholder="留空使用默认值" /></Field>
+                  <Field label="image_access_turnstile_bonus_quota"><Input value={newImageAccessBonusQuota} onChange={setNewImageAccessBonusQuota} placeholder="留空使用默认值" /></Field>
+                  <Field label="daily_image_access_hard_limit"><Input value={newImageAccessHardLimit} onChange={setNewImageAccessHardLimit} placeholder="留空使用默认值" /></Field>
+                </div>
+              </Card>
+            </>
+          )}
+        </div>
+      </div>
+
+      <div className="mt-4 grid grid-cols-1 gap-4 xl:grid-cols-[1fr_1.2fr]">
+        <Card hover={false}>
+          <div className="flex items-center justify-between">
+            <div className="text-sm font-bold text-zinc-900 dark:text-zinc-50">全局策略</div>
+            <Button variant="primary" onClick={savePolicy} disabled={!policyDraft || savingPolicy}>{savingPolicy ? "保存中…" : "保存策略"}</Button>
+          </div>
+          {policyDraft ? (
+            <div className="mt-3 grid grid-cols-1 gap-3 md:grid-cols-2">
+              <Field label="普通用户每日额度"><Input value={String(policyDraft.default_user_daily_image_limit)} onChange={(v) => setPolicyDraft({ ...policyDraft, default_user_daily_image_limit: Number(v || 0) })} /></Field>
+              <Field label="超额额外额度"><Input value={String(policyDraft.default_user_extra_daily_image_limit)} onChange={(v) => setPolicyDraft({ ...policyDraft, default_user_extra_daily_image_limit: Number(v || 0) })} /></Field>
+              <Field label="普通用户并发上限"><Input value={String(policyDraft.default_user_concurrent_jobs_limit)} onChange={(v) => setPolicyDraft({ ...policyDraft, default_user_concurrent_jobs_limit: Number(v || 0) })} /></Field>
+              <Field label="管理员并发上限"><Input value={String(policyDraft.default_admin_concurrent_jobs_limit)} onChange={(v) => setPolicyDraft({ ...policyDraft, default_admin_concurrent_jobs_limit: Number(v || 0) })} /></Field>
+              <Field label="job_count 触发阈值"><Input value={String(policyDraft.default_user_turnstile_job_count_threshold)} onChange={(v) => setPolicyDraft({ ...policyDraft, default_user_turnstile_job_count_threshold: Number(v || 0) })} /></Field>
+              <Field label="日生成量触发阈值"><Input value={String(policyDraft.default_user_turnstile_daily_usage_threshold)} onChange={(v) => setPolicyDraft({ ...policyDraft, default_user_turnstile_daily_usage_threshold: Number(v || 0) })} /></Field>
+              <Field label="图片访问基础额度"><Input value={String(policyDraft.default_user_daily_image_access_limit)} onChange={(v) => setPolicyDraft({ ...policyDraft, default_user_daily_image_access_limit: Number(v || 0) })} /></Field>
+              <Field label="图片访问验证加额"><Input value={String(policyDraft.default_user_image_access_turnstile_bonus_quota)} onChange={(v) => setPolicyDraft({ ...policyDraft, default_user_image_access_turnstile_bonus_quota: Number(v || 0) })} /></Field>
+              <Field label="图片访问硬上限"><Input value={String(policyDraft.default_user_daily_image_access_hard_limit)} onChange={(v) => setPolicyDraft({ ...policyDraft, default_user_daily_image_access_hard_limit: Number(v || 0) })} /></Field>
+            </div>
+          ) : <Skeleton className="mt-3 h-28 w-full" />}
+        </Card>
+
+        <Card hover={false}>
+          <div className="flex items-center justify-between gap-3">
+            <div>
+              <div className="text-sm font-bold text-zinc-900 dark:text-zinc-50">中转站状态</div>
+              <div className="text-xs text-zinc-600 dark:text-zinc-300">Provider 管理保留，但主视觉下移，避免和用户管理抢焦点。</div>
+            </div>
+            <div className="rounded-full border border-zinc-200 bg-zinc-50 px-3 py-1 text-xs font-semibold text-zinc-600 dark:border-white/10 dark:bg-zinc-950/40 dark:text-zinc-300">{overview?.providers.providers_total ?? 0} providers</div>
+          </div>
+          <div className="mt-3 space-y-3">
+            {(overview?.providers.providers || []).length ? (overview?.providers.providers || []).map((provider) => (
+              <div key={provider.provider_id} className="rounded-2xl border border-zinc-200 bg-white/60 p-4 dark:border-white/10 dark:bg-zinc-950/30">
+                <div className="flex flex-col gap-3 xl:flex-row xl:items-start xl:justify-between">
+                  <div className="min-w-0 flex-1">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <div className="text-sm font-bold text-zinc-900 dark:text-zinc-50">{provider.label}</div>
+                      <span className="rounded-full border border-zinc-200 px-2 py-0.5 text-[10px] font-semibold text-zinc-600 dark:border-white/10 dark:text-zinc-300">{provider.provider_id}</span>
+                      <span className="rounded-full border border-zinc-200 px-2 py-0.5 text-[10px] font-semibold text-zinc-600 dark:border-white/10 dark:text-zinc-300">{provider.adapter_type}</span>
+                      <span className={cn("rounded-full px-2 py-0.5 text-[10px] font-semibold", provider.cooldown_active ? "bg-amber-100 text-amber-700 dark:bg-amber-500/20 dark:text-amber-200" : provider.enabled ? "bg-emerald-100 text-emerald-700 dark:bg-emerald-500/20 dark:text-emerald-200" : "bg-zinc-200 text-zinc-700 dark:bg-zinc-800 dark:text-zinc-200")}>
+                        {provider.cooldown_active ? "cooldown" : provider.enabled ? "enabled" : "disabled"}
+                      </span>
+                    </div>
+                    <div className="mt-2 break-all text-xs text-zinc-500 dark:text-zinc-400">{provider.base_url}</div>
+                    <div className="mt-3 grid grid-cols-2 gap-2 text-xs md:grid-cols-4">
+                      <KeyValue k="cost" v={`${numberish(provider.cost_per_image_cny)} CNY`} />
+                      <KeyValue k="balance" v={provider.remaining_balance_cny == null ? "unknown" : `${numberish(provider.remaining_balance_cny)} CNY`} />
+                      <KeyValue k="quota" v={provider.quota_state} />
+                      <KeyValue k="active" v={`${provider.active_requests}/${provider.max_concurrency}`} />
+                      <KeyValue k="success" v={`${Math.round(provider.final_success_rate * 100)}%`} />
+                      <KeyValue k="fails" v={`${provider.fail_count} (${provider.consecutive_failures} 连续)`} />
+                      <KeyValue k="p50" v={provider.latency_p50_ms == null ? "-" : `${Math.round(provider.latency_p50_ms)} ms`} />
+                      <KeyValue k="p95" v={provider.latency_p95_ms == null ? "-" : `${Math.round(provider.latency_p95_ms)} ms`} />
+                    </div>
+                    <div className="mt-1 text-[11px] text-zinc-500 dark:text-zinc-400">last_circuit: {formatLocal(provider.last_circuit_open_time)} · until: {formatLocal(provider.last_circuit_open_until)} · reason: {provider.last_circuit_open_reason || "-"}</div>
+                    <div className="mt-1 text-[11px] text-zinc-500 dark:text-zinc-400">last_forced_activation: {formatLocal(provider.last_forced_activation_time)} · mode: {provider.last_forced_activation_mode || "-"} · count: {provider.forced_activation_count}</div>
+                  </div>
+
+                  <div className="grid min-w-0 gap-2 xl:w-[420px] xl:grid-cols-2">
+                    <Field label="enabled"><div className="flex h-[42px] items-center"><Switch value={providerEnabledDrafts[provider.provider_id] ?? provider.enabled} onChange={(value) => setProviderEnabledDrafts((prev) => ({ ...prev, [provider.provider_id]: value }))} /></div></Field>
+                    <Field label="note"><Input value={providerNotes[provider.provider_id] ?? provider.note ?? ""} onChange={(value) => setProviderNotes((prev) => ({ ...prev, [provider.provider_id]: value }))} placeholder="备注" /></Field>
+                    <Field label="set balance (CNY)">
+                      <div className="flex gap-2">
+                        <Input value={providerSetBalanceDrafts[provider.provider_id] ?? ""} onChange={(value) => setProviderSetBalanceDrafts((prev) => ({ ...prev, [provider.provider_id]: value }))} placeholder="可留空设为 unknown" />
+                        <Button variant="secondary" onClick={() => setProviderBalance(provider.provider_id)} disabled={savingProviderBalanceId === `set:${provider.provider_id}`}>{savingProviderBalanceId === `set:${provider.provider_id}` ? "设置中…" : "设置"}</Button>
+                      </div>
+                    </Field>
+                    <Field label="add balance (CNY)">
+                      <div className="flex gap-2">
+                        <Input value={providerAddBalanceDrafts[provider.provider_id] ?? ""} onChange={(value) => setProviderAddBalanceDrafts((prev) => ({ ...prev, [provider.provider_id]: value }))} placeholder="充值金额" />
+                        <Button variant="secondary" onClick={() => addProviderBalance(provider.provider_id)} disabled={savingProviderBalanceId === `add:${provider.provider_id}`}>{savingProviderBalanceId === `add:${provider.provider_id}` ? "增加中…" : "增加"}</Button>
+                      </div>
+                    </Field>
+                    <div className="xl:col-span-2 flex justify-end">
+                      <Button variant="primary" onClick={() => saveProvider(provider.provider_id)} disabled={savingProviderId === provider.provider_id}>{savingProviderId === provider.provider_id ? "保存中…" : "保存 Provider"}</Button>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            )) : <EmptyHint text="暂无 provider 配置" />}
+          </div>
+        </Card>
+      </div>
+
+      <AdminTaskDetailDrawer
+        item={selectedTask}
+        owner={selectedUser}
+        onClose={() => setSelectedTask(null)}
+        onRemoved={(jobId) => setTaskItems((current) => current.filter((item) => item.job_id !== jobId))}
+        onRefreshList={() => loadSelectedUserTasks()}
+      />
     </PageContainer>
   );
 }
@@ -9166,6 +10621,185 @@ function useHistoryPreviewMap(records: JobRecord[]) {
   return previewMap;
 }
 
+type AdminTaskSortKey = "created_desc" | "created_asc" | "updated_desc" | "updated_asc" | "duration_desc";
+type AdminTaskDensity = "gallery" | "list";
+
+function adminJobSummaryToRecord(item: AdminUserJobSummary): JobRecord {
+  return {
+    job_id: item.job_id,
+    created_at: item.created_at,
+    last_seen_at: item.updated_at || item.created_at,
+    status_cache: item.status,
+    model_cache: item.model,
+    prompt_preview: item.prompt_preview,
+    batch_id: item.batch_id || undefined,
+    batch_name: item.batch_name || undefined,
+    batch_note: item.batch_note || undefined,
+    batch_size: item.batch_size ?? undefined,
+    batch_index: item.batch_index ?? undefined,
+    section_index: item.section_index ?? undefined,
+    section_title: item.section_title || undefined,
+    queue_wait_ms: item.timing?.queue_wait_ms,
+    run_duration_ms: item.timing?.run_duration_ms,
+    run_started_at: item.timing?.started_at,
+    run_finished_at: item.timing?.finished_at,
+    first_image_id: item.first_image_id || undefined,
+    image_count_cache: item.image_count ?? undefined,
+    error_code_cache: item.error?.code || undefined,
+    error_message_cache: item.error?.message || undefined,
+  };
+}
+
+function adminUserOverrideValue(user: AdminUserItem | null, key: keyof UserPolicyOverrides) {
+  return user?.policy_overrides?.[key] ?? null;
+}
+
+function adminUserRiskTags(user: AdminUserItem) {
+  const tags: string[] = [];
+  const dailyLimit = user.policy.daily_image_limit;
+  const quotaConsumed = user.usage.quota_consumed_today || 0;
+  const imageAccessLimit = user.usage.image_access_limit_today;
+  if (!user.enabled) tags.push("disabled");
+  if (user.role === "ADMIN") tags.push("admin");
+  if (!user.last_login_at) tags.push("never login");
+  if ((user.usage.running_jobs || 0) > 0) tags.push("running jobs");
+  if ((user.usage.jobs_failed_today || 0) >= 3) tags.push("high failures");
+  if (dailyLimit != null && quotaConsumed >= dailyLimit) tags.push("over quota");
+  if (dailyLimit != null && dailyLimit > 0 && quotaConsumed / dailyLimit >= 0.8 && quotaConsumed < dailyLimit) tags.push("high usage");
+  if (imageAccessLimit != null && (user.usage.image_accesses_today || 0) >= imageAccessLimit) tags.push("image access cap");
+  return tags;
+}
+
+function adminUserRiskScore(user: AdminUserItem) {
+  const tags = new Set(adminUserRiskTags(user));
+  return [
+    tags.has("disabled") ? 40 : 0,
+    tags.has("over quota") ? 32 : 0,
+    tags.has("running jobs") ? 24 : 0,
+    tags.has("high failures") ? 20 : 0,
+    tags.has("high usage") ? 12 : 0,
+    tags.has("never login") ? 8 : 0,
+    user.role === "ADMIN" ? -5 : 0,
+  ].reduce((sum, n) => sum + n, 0);
+}
+
+function useAdminTaskPreviewMap(items: AdminUserJobSummary[], ownerKey: string) {
+  const client = useApiClient();
+  const settings = useSettingsStore((s) => s.settings);
+  const scope = `admin:${ownerKey || "__none__"}`;
+  const [previewMap, setPreviewMap] = useState<Record<string, HistoryPreviewEntry>>({});
+  const targets = useMemo(
+    () =>
+      items.map((item) => ({
+        job_id: item.job_id,
+        first_image_id: item.first_image_id || undefined,
+        status: item.status,
+      })),
+    [items]
+  );
+  const recordsKey = useMemo(
+    () => targets.map((item) => `${item.job_id}:${item.first_image_id || ""}:${item.status}`).join("|"),
+    [targets]
+  );
+
+  useEffect(() => {
+    let stopped = false;
+    const controller = new AbortController();
+    const successful = targets.filter((item) => item.status === "SUCCEEDED" && item.first_image_id);
+    setPreviewMap(() => {
+      const next: Record<string, HistoryPreviewEntry> = {};
+      targets.forEach((item) => {
+        if (item.status !== "SUCCEEDED" || !item.first_image_id) return;
+        const shared = sharedPreviewGet(scope, settings.baseUrl, item.job_id, item.first_image_id);
+        next[item.job_id] = shared?.url ? { src: shared.url, loading: false, failed: false } : { loading: true, failed: false };
+      });
+      return next;
+    });
+
+    if (!successful.length) return () => controller.abort();
+
+    (async () => {
+      const cachedResults = await Promise.all(
+        successful.map(async (item) => {
+          const imageId = item.first_image_id as string;
+          const shared = sharedPreviewGet(scope, settings.baseUrl, item.job_id, imageId);
+          const blob =
+            !shared?.url && settings.cache.enabled
+              ? await imageCacheGet(scope, settings.baseUrl, item.job_id, imageId, "preview")
+              : null;
+          return { item, imageId, sharedUrl: shared?.url, blob };
+        })
+      );
+      if (stopped) return;
+
+      const misses: Array<{ job_id: string; image_id: string }> = [];
+      const nextState: Record<string, HistoryPreviewEntry> = {};
+      cachedResults.forEach(({ item, imageId, sharedUrl, blob }) => {
+        if (sharedUrl) {
+          nextState[item.job_id] = { src: sharedUrl, loading: false, failed: false };
+        } else if (blob) {
+          nextState[item.job_id] = {
+            src: sharedPreviewRemember(scope, settings.baseUrl, item.job_id, imageId, blob),
+            loading: false,
+            failed: false,
+          };
+        } else {
+          misses.push({ job_id: item.job_id, image_id: imageId });
+          nextState[item.job_id] = { loading: true, failed: false };
+        }
+      });
+      if (!stopped) setPreviewMap((current) => ({ ...current, ...nextState }));
+      if (!misses.length) return;
+
+      try {
+        const payload = await client.batchPreviewImages(
+          misses.map((item) => ({ job_id: item.job_id, image_id: item.image_id })).slice(0, 72),
+          controller.signal
+        );
+        if (stopped) return;
+        const byJobId = new Map(payload.items.map((entry) => [entry.job_id, entry]));
+        const merged: Record<string, HistoryPreviewEntry> = {};
+        await Promise.all(
+          misses.map(async (miss) => {
+            const entry = byJobId.get(miss.job_id);
+            if (!entry) {
+              merged[miss.job_id] = { loading: false, failed: true };
+              return;
+            }
+            const blob = base64ToBlob(entry.data_base64, entry.mime);
+            if (settings.cache.enabled) {
+              await imageCachePut(scope, settings.baseUrl, miss.job_id, miss.image_id, "preview", blob, settings.cache);
+            }
+            merged[miss.job_id] = {
+              src: sharedPreviewRemember(scope, settings.baseUrl, miss.job_id, miss.image_id, blob),
+              loading: false,
+              failed: false,
+            };
+          })
+        );
+        if (!stopped) setPreviewMap((current) => ({ ...current, ...merged }));
+      } catch {
+        if (!stopped) {
+          setPreviewMap((current) => {
+            const next = { ...current };
+            misses.forEach((miss) => {
+              next[miss.job_id] = { loading: false, failed: true };
+            });
+            return next;
+          });
+        }
+      }
+    })();
+
+    return () => {
+      stopped = true;
+      controller.abort();
+    };
+  }, [client, recordsKey, scope, settings.baseUrl, settings.cache, targets]);
+
+  return previewMap;
+}
+
 // -----------------------------
 // History Page
 // -----------------------------
@@ -11432,6 +13066,7 @@ function PickerPage() {
   const [sidebarHoverOpen, setSidebarHoverOpen] = useState(false);
   const [showArchivedSessions, setShowArchivedSessions] = useState(false);
   const [showShortcutHelp, setShowShortcutHelp] = useState(false);
+  const [pendingPoolCenterKey, setPendingPoolCenterKey] = useState<string | null>(null);
   const [sessionMenuId, setSessionMenuId] = useState<string | null>(null);
   const [newSessionDraft, setNewSessionDraft] = useState("");
   const [visibleSessionCount, setVisibleSessionCount] = useState(16);
@@ -11441,6 +13076,10 @@ function PickerPage() {
   const previousSessionIdRef = useRef<string | null>(null);
   const previousSessionItemsRef = useRef<Map<string, PickerSessionItem>>(new Map());
   const immersiveRevealTimeoutsRef = useRef<Record<string, number>>({});
+  const filmstripScrollRef = useRef<HTMLDivElement | null>(null);
+  const preferredScrollRef = useRef<HTMLDivElement | null>(null);
+  const filmstripItemRefs = useRef<Record<string, HTMLDivElement | null>>({});
+  const preferredItemRefs = useRef<Record<string, HTMLDivElement | null>>({});
 
   const currentSession = useMemo(
     () => sessions.find((s) => s.session_id === currentSessionId) || null,
@@ -11852,6 +13491,56 @@ function PickerPage() {
     patchSession(currentSession.session_id, (session) => pickerRevealKeyInStage({ session, key, compareMode }));
   };
 
+  const setPoolItemRef = (bucket: "FILMSTRIP" | "PREFERRED", key: string, node: HTMLDivElement | null) => {
+    const target = bucket === "FILMSTRIP" ? filmstripItemRefs.current : preferredItemRefs.current;
+    if (node) {
+      target[key] = node;
+      return;
+    }
+    delete target[key];
+  };
+
+  const centerPoolCard = (key: string) => {
+    const bucket = pickerBucketOf(itemMap.get(key) || null);
+    const containerTestId = bucket === "PREFERRED" ? "picker-preferred-scroll" : bucket === "FILMSTRIP" ? "picker-filmstrip-scroll" : "";
+    const refContainer = bucket === "PREFERRED" ? preferredScrollRef.current : bucket === "FILMSTRIP" ? filmstripScrollRef.current : null;
+    const domContainer = typeof document !== "undefined"
+      ? document.querySelector<HTMLDivElement>(`[data-testid="${containerTestId}"]`)
+      : null;
+    const container = refContainer || domContainer;
+    const refCard = bucket === "PREFERRED" ? preferredItemRefs.current[key] : bucket === "FILMSTRIP" ? filmstripItemRefs.current[key] : null;
+    const testId = bucket === "PREFERRED" ? `picker-preferred-card-${key}` : bucket === "FILMSTRIP" ? `picker-filmstrip-card-${key}` : "";
+    const domCard = container?.querySelector<HTMLElement>(`[data-testid="${testId}"]`) || null;
+    const card = refCard || domCard;
+    if (!container || !card) return;
+    const containerRect = container.getBoundingClientRect();
+    const cardRect = card.getBoundingClientRect();
+    const itemCenter = (cardRect.left - containerRect.left) + container.scrollLeft + cardRect.width / 2;
+    const rawTarget = itemCenter - container.clientWidth / 2;
+    const maxScrollLeft = Math.max(0, container.scrollWidth - container.clientWidth);
+    const nextScrollLeft = clamp(rawTarget, 0, maxScrollLeft);
+    if (Math.abs(container.scrollLeft - nextScrollLeft) < 1) return;
+    const previousScrollLeft = container.scrollLeft;
+    try {
+      container.scrollTo({ left: nextScrollLeft, behavior: "smooth" });
+      if (typeof window !== "undefined") {
+        window.setTimeout(() => {
+          if (Math.abs(container.scrollLeft - previousScrollLeft) < 1) {
+            container.scrollLeft = nextScrollLeft;
+          }
+        }, 180);
+      }
+    } catch {
+      container.scrollLeft = nextScrollLeft;
+    }
+  };
+
+  const focusAndCenterPoolItem = (key: string) => {
+    if (!currentSession) return;
+    setFocus(currentSession.session_id, key);
+    setPendingPoolCenterKey(key);
+  };
+
   const stageFocusKeys = useMemo(
     () => stageSlots.filter(Boolean) as string[],
     [stageSlots]
@@ -11896,6 +13585,26 @@ function PickerPage() {
       });
     };
   }, []);
+
+  useEffect(() => {
+    filmstripItemRefs.current = {};
+    preferredItemRefs.current = {};
+  }, [currentSession?.session_id]);
+
+  useEffect(() => {
+    if (!pendingPoolCenterKey) return;
+    if (typeof window === "undefined") {
+      centerPoolCard(pendingPoolCenterKey);
+      setPendingPoolCenterKey(null);
+      return;
+    }
+    const rafId = window.requestAnimationFrame(() => {
+      centerPoolCard(pendingPoolCenterKey);
+      window.setTimeout(() => centerPoolCard(pendingPoolCenterKey), 90);
+      setPendingPoolCenterKey(null);
+    });
+    return () => window.cancelAnimationFrame(rafId);
+  }, [pendingPoolCenterKey, filmstripItems, preferredItems, compareMode]);
 
   const applyKeyboardRating = (rating: number) => {
     if (!focusKey) return;
@@ -12136,7 +13845,7 @@ function PickerPage() {
         <button
           type="button"
           className="absolute inset-0 z-0"
-          onClick={() => slotKey && setFocus(currentSession.session_id, slotKey)}
+          onClick={() => slotKey && focusAndCenterPoolItem(slotKey)}
           title="聚焦该图片"
         />
         <div className={cn("relative w-full", immersiveHeightClass)}>
@@ -12479,7 +14188,7 @@ function PickerPage() {
                       darkStage={darkStage}
                       jobRec={item ? jobsById.get(item.job_id) : undefined}
                       displayName={item ? pickerDisplayName(item, jobsById.get(item.job_id)) : "-"}
-                      onFocus={() => slotKey && setFocus(currentSession.session_id, slotKey)}
+                      onFocus={() => slotKey && focusAndCenterPoolItem(slotKey)}
                       onEnsureImage={() => {}}
                       onBest={() => slotKey && toggleBest(slotKey)}
                       onRate={(n) => slotKey && rateItem(slotKey, n)}
@@ -12520,6 +14229,7 @@ function PickerPage() {
               ) : (
                 <div
                   data-testid="picker-filmstrip-scroll"
+                  ref={filmstripScrollRef}
                   className="flex gap-3 overflow-x-auto pb-2"
                   onWheel={(e) => {
                     if (Math.abs(e.deltaY) > Math.abs(e.deltaX)) {
@@ -12538,6 +14248,8 @@ function PickerPage() {
                       <motion.div
                         layout
                         key={`film_${key}`}
+                        data-testid={`picker-filmstrip-card-${key}`}
+                        ref={(node) => setPoolItemRef("FILMSTRIP", key, node)}
                         className={cn(
                           "w-64 flex-none overflow-hidden rounded-[24px] border",
                           active ? "border-zinc-900 shadow-md dark:border-white" : "border-zinc-200 dark:border-white/10"
@@ -12613,6 +14325,7 @@ function PickerPage() {
               ) : (
                 <div
                   data-testid="picker-preferred-scroll"
+                  ref={preferredScrollRef}
                   className="flex gap-3 overflow-x-auto pb-2"
                   onWheel={(e) => {
                     if (Math.abs(e.deltaY) > Math.abs(e.deltaX)) {
@@ -12629,6 +14342,8 @@ function PickerPage() {
                       <motion.div
                         layout
                         key={`pref_${key}`}
+                        data-testid={`picker-preferred-card-${key}`}
+                        ref={(node) => setPoolItemRef("PREFERRED", key, node)}
                         className={cn(
                           "w-64 flex-none overflow-hidden rounded-[24px] border",
                           active ? "border-amber-500 shadow-md dark:border-amber-300" : "border-zinc-200 dark:border-white/10"

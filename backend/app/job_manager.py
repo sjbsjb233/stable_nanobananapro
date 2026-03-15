@@ -692,7 +692,17 @@ class JobManager:
             if idx >= settings.max_reference_images - 1:
                 break
 
-        new_job_id, new_token, _, created_at = self.create_job(req, refs, user)
+        retry_owner = user
+        if str((user or {}).get("role") or "").upper() == "ADMIN":
+            owner = meta.get("owner") if isinstance(meta.get("owner"), dict) else {}
+            owner_id = str(owner.get("user_id") or "")
+            original_owner = user_store.get_user_by_id(owner_id) if owner_id else None
+            if original_owner:
+                retry_owner = original_owner
+            elif owner:
+                retry_owner = owner
+
+        new_job_id, new_token, _, created_at = self.create_job(req, refs, retry_owner)
         return new_job_id, new_token, created_at
 
     def _run_job(self, job_id: str) -> None:
