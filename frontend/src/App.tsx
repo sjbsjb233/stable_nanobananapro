@@ -2999,11 +2999,8 @@ function pickerRevealKeyInStage(args: {
   if (visibleKeys.includes(key)) {
     return session.focus_key === key ? session : { ...session, focus_key: key };
   }
-  const nextVisible = [key, ...visibleKeys.filter((slotKey) => slotKey !== key)].slice(0, slotCount);
-  const slots = [null, null, null, null] as Array<string | null>;
-  nextVisible.forEach((slotKey, index) => {
-    slots[index] = slotKey;
-  });
+  const slots = [...currentSlots];
+  slots[0] = key;
   return {
     ...session,
     slots,
@@ -11266,7 +11263,7 @@ function PickerCompareSlot({
     compareMode === "FOUR"
       ? "h-[210px] sm:h-[220px] md:h-[240px] xl:h-[255px] 2xl:h-[280px]"
       : compareMode === "TWO"
-        ? "h-[260px] sm:h-[300px] md:h-[340px] xl:h-[400px]"
+        ? "h-[360px] sm:h-[420px] md:h-[500px] xl:h-[560px]"
         : "h-[320px] sm:h-[380px] md:h-[430px] xl:h-[500px]";
 
   return (
@@ -11443,6 +11440,7 @@ function PickerPage() {
   const autoImportedRef = useRef<Record<string, boolean>>({});
   const previousSessionIdRef = useRef<string | null>(null);
   const previousSessionItemsRef = useRef<Map<string, PickerSessionItem>>(new Map());
+  const immersiveRevealTimeoutsRef = useRef<Record<string, number>>({});
 
   const currentSession = useMemo(
     () => sessions.find((s) => s.session_id === currentSessionId) || null,
@@ -11854,22 +11852,58 @@ function PickerPage() {
     patchSession(currentSession.session_id, (session) => pickerRevealKeyInStage({ session, key, compareMode }));
   };
 
-  const focusListKeys = useMemo(
-    () => orderedItemsByPool.map((it) => pickerItemKey(it)),
-    [orderedItemsByPool]
+  const stageFocusKeys = useMemo(
+    () => stageSlots.filter(Boolean) as string[],
+    [stageSlots]
   );
 
-  const stepFocus = (direction: 1 | -1) => {
-    if (!focusListKeys.length) return;
-    const currentIndex = focusKey ? focusListKeys.indexOf(focusKey) : -1;
+  const stepFocus = (direction: 1 | -1, fromKey?: string | null) => {
+    if (!currentSession || !stageFocusKeys.length) return;
+    const originKey = fromKey || focusKey;
+    const currentIndex = originKey ? stageFocusKeys.indexOf(originKey) : -1;
     const nextIndex =
       currentIndex < 0
         ? direction > 0
           ? 0
-          : focusListKeys.length - 1
-        : (currentIndex + direction + focusListKeys.length) % focusListKeys.length;
-    const nextKey = focusListKeys[nextIndex];
-    if (nextKey) activatePickerItem(nextKey);
+          : stageFocusKeys.length - 1
+        : (currentIndex + direction + stageFocusKeys.length) % stageFocusKeys.length;
+    const nextKey = stageFocusKeys[nextIndex];
+    if (nextKey) setFocus(currentSession.session_id, nextKey);
+  };
+
+  const [immersiveRevealKeys, setImmersiveRevealKeys] = useState<Record<string, true>>({});
+
+  const revealImmersiveControls = (key: string, durationMs = 2600) => {
+    if (typeof window === "undefined") return;
+    const existing = immersiveRevealTimeoutsRef.current[key];
+    if (existing) window.clearTimeout(existing);
+    setImmersiveRevealKeys((current) => ({ ...current, [key]: true }));
+    immersiveRevealTimeoutsRef.current[key] = window.setTimeout(() => {
+      setImmersiveRevealKeys((current) => {
+        if (!current[key]) return current;
+        const next = { ...current };
+        delete next[key];
+        return next;
+      });
+      delete immersiveRevealTimeoutsRef.current[key];
+    }, durationMs);
+  };
+
+  useEffect(() => {
+    return () => {
+      Object.values(immersiveRevealTimeoutsRef.current).forEach((timerId) => {
+        if (typeof window !== "undefined") window.clearTimeout(timerId);
+      });
+    };
+  }, []);
+
+  const applyKeyboardRating = (rating: number) => {
+    if (!focusKey) return;
+    rateItem(focusKey, rating);
+    if (immersiveMode && rating > 0) {
+      revealImmersiveControls(focusKey);
+      stepFocus(1, focusKey);
+    }
   };
 
   useEffect(() => {
@@ -11968,7 +12002,9 @@ function PickerPage() {
         }
       }
       if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.tagName === "SELECT" || t.isContentEditable)) return;
-      const shortcutHelpPressed = e.key === "?" || (e.key === "/" && e.shiftKey);
+      const shortcutHelpPressed =
+        (!e.metaKey && !e.ctrlKey && !e.altKey)
+        && (e.key === "?" || e.key === "？" || e.key === "/" || e.code === "Slash");
       if (shortcutHelpPressed) {
         e.preventDefault();
         setShowShortcutHelp((current) => !current);
@@ -12000,7 +12036,7 @@ function PickerPage() {
       if (!focusItem) return;
       if (["1", "2", "3", "4", "5"].includes(e.key)) {
         e.preventDefault();
-        rateItem(focusKey, Number(e.key));
+        applyKeyboardRating(Number(e.key));
         return;
       }
       if (e.key === "0") {
@@ -12026,7 +12062,7 @@ function PickerPage() {
     currentSession?.session_id,
     compareMode,
     focusKey,
-    focusListKeys.join("|"),
+    stageFocusKeys.join("|"),
     itemMap,
     immersiveMode,
     sessionItems,
@@ -12079,16 +12115,18 @@ function PickerPage() {
     const display = item ? pickerDisplayName(item, jobRec) : `空槽位 ${label}`;
     const hasImage = pickerItemHasImage(item);
     const status = item ? pickerItemJobStatus(item, jobRec) : "UNKNOWN";
+    const controlsVisible = Boolean(slotKey && immersiveRevealKeys[slotKey]);
     const immersiveHeightClass =
       compareMode === "FOUR"
         ? "h-[44vh] min-h-[300px] md:h-[46vh]"
         : compareMode === "TWO"
-          ? "h-[76vh] min-h-[360px] md:h-[80vh]"
+          ? "h-[58vh] min-h-[360px] md:h-[66vh]"
           : "h-[78vh] min-h-[380px] md:h-[82vh]";
 
     return (
       <div
         key={`${label}_${slotKey || "empty"}_immersive`}
+        data-testid={`picker-immersive-slot-${label}`}
         className={cn(
           "group relative overflow-hidden rounded-2xl border",
           slotKey && slotKey === focusKey ? "border-white shadow-[0_0_0_1px_rgba(255,255,255,0.35)]" : "border-white/15",
@@ -12126,7 +12164,7 @@ function PickerPage() {
             <div className="absolute inset-0 z-10 flex items-center justify-center bg-black/70 text-sm font-bold text-white">404</div>
           ) : null}
         </div>
-        <div className="pointer-events-none absolute left-3 top-3 z-20 flex items-center gap-2 opacity-0 transition group-hover:opacity-100">
+        <div className={cn("pointer-events-none absolute left-3 top-3 z-20 flex items-center gap-2 transition", controlsVisible ? "opacity-100" : "opacity-0 group-hover:opacity-100")}>
           <span className="rounded-full bg-black/55 px-2 py-1 text-xs font-bold text-white">{label}</span>
           <button
             type="button"
@@ -12143,7 +12181,7 @@ function PickerPage() {
             {isBest ? "移回片池" : "移入优选"}
           </button>
         </div>
-        <div className="pointer-events-none absolute right-3 top-3 z-20 opacity-0 transition group-hover:opacity-100">
+        <div className={cn("pointer-events-none absolute right-3 top-3 z-20 transition", controlsVisible ? "opacity-100" : "opacity-0 group-hover:opacity-100")}>
           {item ? (
             <Button
               variant="danger"
@@ -12158,7 +12196,10 @@ function PickerPage() {
           ) : null}
         </div>
         {item ? (
-          <div className="pointer-events-none absolute inset-x-0 bottom-0 z-20 border-t border-white/10 bg-black/55 px-3 py-2 opacity-0 backdrop-blur transition group-hover:opacity-100">
+          <div
+            data-testid={`picker-immersive-overlay-${label}`}
+            className={cn("pointer-events-none absolute inset-x-0 bottom-0 z-20 border-t border-white/10 bg-black/55 px-3 py-2 backdrop-blur transition", controlsVisible ? "opacity-100" : "opacity-0 group-hover:opacity-100")}
+          >
             <div className="flex items-center justify-between gap-2">
               <div className="truncate text-xs font-semibold text-zinc-200">{display}</div>
               {hasImage ? (
@@ -12420,7 +12461,7 @@ function PickerPage() {
               </div>
               <div className="text-[11px] text-zinc-500 dark:text-zinc-400">{compareMode} · {darkStage ? "Dark Stage" : "Light Stage"}</div>
             </div>
-            <div className={cn("grid gap-2.5", compareMode === "FOUR" ? "grid-cols-1 xl:grid-cols-2" : "grid-cols-1")}>
+            <div className={cn("grid gap-2.5", compareMode === "FOUR" ? "grid-cols-1 xl:grid-cols-2" : compareMode === "TWO" ? "grid-cols-1 lg:grid-cols-2" : "grid-cols-1")}>
               {stageSlots.map((slotKey, idx) => {
                 const item = slotKey ? itemMap.get(slotKey) || null : null;
                 const label = String.fromCharCode(65 + idx);
@@ -12678,7 +12719,7 @@ function PickerPage() {
               </div>
 
               <div className="flex-1 overflow-auto">
-                <div className={cn("grid gap-3", compareMode === "FOUR" ? "grid-cols-1 lg:grid-cols-2" : "grid-cols-1")}>
+                <div className={cn("grid gap-3", compareMode === "FOUR" ? "grid-cols-1 lg:grid-cols-2" : compareMode === "TWO" ? "grid-cols-1 lg:grid-cols-2" : "grid-cols-1")}>
                   {immersiveSlots.map((slotKey, idx) => renderImmersiveSlot(slotKey || null, String.fromCharCode(65 + idx)))}
                 </div>
               </div>
