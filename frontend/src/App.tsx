@@ -12911,21 +12911,21 @@ function PickerCompareSlot({
     >
       <button
         type="button"
-        className="absolute inset-0 z-0"
+        className="absolute inset-0 z-10"
         onClick={onFocus}
         title="聚焦该图片"
         data-testid={`picker-focus-${slotLabel}`}
       />
       <div className={cn("relative w-full", mediaHeightClass)}>
         {!item ? (
-          <div className="flex h-full items-center justify-center text-sm text-zinc-500 dark:text-zinc-400">空槽位 {slotLabel}</div>
+          <div className="pointer-events-none flex h-full items-center justify-center text-sm text-zinc-500 dark:text-zinc-400">空槽位 {slotLabel}</div>
         ) : !hasImage ? (
           <PickerPendingVisual status={status} />
         ) : image?.url ? (
           <img
             src={image.url}
             alt={`${item.job_id}-${item.image_id}`}
-            className="h-full w-full object-contain opacity-0 blur-sm transition duration-300"
+            className="pointer-events-none h-full w-full object-contain opacity-0 blur-sm transition duration-300"
             onLoad={(e) => {
               const el = e.currentTarget;
               el.classList.remove("opacity-0", "blur-sm");
@@ -13844,20 +13844,20 @@ function PickerPage() {
       >
         <button
           type="button"
-          className="absolute inset-0 z-0"
+          className="absolute inset-0 z-10"
           onClick={() => slotKey && focusAndCenterPoolItem(slotKey)}
           title="聚焦该图片"
         />
         <div className={cn("relative w-full", immersiveHeightClass)}>
           {!item ? (
-            <div className="flex h-full items-center justify-center text-sm text-zinc-400">{display}</div>
+            <div className="pointer-events-none flex h-full items-center justify-center text-sm text-zinc-400">{display}</div>
           ) : !hasImage ? (
             <PickerPendingVisual status={status} />
           ) : state?.url ? (
             <img
               src={state.url}
               alt={display}
-              className="h-full w-full object-contain opacity-0 blur-sm transition duration-300"
+              className="pointer-events-none h-full w-full object-contain opacity-0 blur-sm transition duration-300"
               onLoad={(e) => {
                 const el = e.currentTarget;
                 el.classList.remove("opacity-0", "blur-sm");
