@@ -2861,17 +2861,80 @@ function pickerScheduleSession(args: {
   };
 }
 
+function pickerFillSlot(args: {
+  session: PickerSession;
+  compareMode: PickerCompareMode;
+  schedulerSettings: PickerSchedulerSettings;
+  fillSlotIndex: number;
+}) {
+  const { session, compareMode, schedulerSettings, fillSlotIndex } = args;
+  const visibleItems = pickerVisibleCandidateItems(session.items);
+  const mode = pickerScheduleMode(visibleItems);
+  const slotCount = pickerCompareModeSlotCount(compareMode);
+  const currentTurn = (session.scheduler?.turn || 0) + 1;
+  const recentHistory = session.scheduler?.recent_history?.[compareMode] || [];
+  const currentSlots = pickerValidSlots(session);
+  const visibleSlotKeys = currentSlots.slice(0, slotCount);
+  const preservedKeys = visibleSlotKeys.filter((key, index) => index !== fillSlotIndex && Boolean(key)) as string[];
+  const selected = pickerSelectKeys({
+    items: visibleItems,
+    compareMode,
+    mode,
+    currentTurn,
+    schedulerSettings,
+    recentHistory,
+    currentStageKeys: [],
+    preservedKeys,
+  });
+  const replacement = selected.find((key) => !preservedKeys.includes(key)) || null;
+  const slots = [...currentSlots];
+  slots[fillSlotIndex] = replacement;
+  const visibleKeys = slots.slice(0, slotCount).filter(Boolean) as string[];
+  const items = pickerRecordExposure({
+    session: { ...session, slots: currentSlots },
+    compareMode,
+    visibleKeys,
+    markOnlyNew: true,
+  });
+  const historyLimit = schedulerSettings.recentHistory[compareMode];
+  const mergedRecent = [...visibleKeys, ...recentHistory.filter((key) => !visibleKeys.includes(key))].slice(0, historyLimit);
+  const focusKey =
+    session.focus_key && visibleKeys.includes(session.focus_key)
+      ? session.focus_key
+      : visibleKeys[0] || null;
+
+  return {
+    ...session,
+    compare_mode: compareMode,
+    items,
+    slots,
+    focus_key: focusKey,
+    best_image: pickerUpdateBestImage(items),
+    scheduler: {
+      ...(session.scheduler || createEmptyPickerScheduler()),
+      turn: currentTurn,
+      last_mode: mode,
+      last_boundary_at: isoNow(),
+      recent_history: {
+        ...(session.scheduler?.recent_history || createEmptyPickerRecentHistory()),
+        [compareMode]: mergedRecent,
+      },
+    },
+  };
+}
+
 function pickerApplyRating(session: PickerSession, key: string, rating: number) {
   const now = isoNow();
+  const nextRating = rating > 0 ? clamp(Math.round(rating), 1, 5) : undefined;
   return {
     ...session,
     items: session.items.map((item) =>
       pickerItemKey(item) === key
         ? {
             ...item,
-            rating,
-            reviewed: true,
-            last_rated_at: now,
+            rating: nextRating,
+            reviewed: nextRating != null,
+            last_rated_at: nextRating != null ? now : null,
           }
         : item
     ),
@@ -2895,6 +2958,7 @@ function pickerApplyHardAction(args: {
         ...item,
         bucket: "DELETED" as PickerBucket,
         pool: "FILMSTRIP",
+        picked: false,
         last_hard_action_at: now,
       };
     }
@@ -2911,16 +2975,40 @@ function pickerApplyHardAction(args: {
     ...session,
     items,
     best_image: pickerUpdateBestImage(items),
-    focus_key: session.focus_key === key ? null : session.focus_key,
+    focus_key: action === "delete" && session.focus_key === key ? null : session.focus_key,
     slots: pickerValidSlots(session).map((slotKey) => (slotKey === key ? null : slotKey)),
   };
-  return pickerScheduleSession({
+  if (slotIndex < 0) return next;
+  return pickerFillSlot({
     session: next,
     compareMode,
     schedulerSettings,
-    reason: "fill",
-    fillSlotIndex: slotIndex >= 0 ? slotIndex : 0,
+    fillSlotIndex: slotIndex,
   });
+}
+
+function pickerRevealKeyInStage(args: {
+  session: PickerSession;
+  key: string;
+  compareMode: PickerCompareMode;
+}) {
+  const { session, key, compareMode } = args;
+  const slotCount = pickerCompareModeSlotCount(compareMode);
+  const currentSlots = pickerValidSlots(session);
+  const visibleKeys = currentSlots.slice(0, slotCount).filter(Boolean) as string[];
+  if (visibleKeys.includes(key)) {
+    return session.focus_key === key ? session : { ...session, focus_key: key };
+  }
+  const nextVisible = [key, ...visibleKeys.filter((slotKey) => slotKey !== key)].slice(0, slotCount);
+  const slots = [null, null, null, null] as Array<string | null>;
+  nextVisible.forEach((slotKey, index) => {
+    slots[index] = slotKey;
+  });
+  return {
+    ...session,
+    slots,
+    focus_key: key,
+  };
 }
 
 function pickerLayoutPreserveKeys(session: PickerSession, nextMode: PickerCompareMode) {
@@ -11346,6 +11434,7 @@ function PickerPage() {
   });
   const [sidebarHoverOpen, setSidebarHoverOpen] = useState(false);
   const [showArchivedSessions, setShowArchivedSessions] = useState(false);
+  const [showShortcutHelp, setShowShortcutHelp] = useState(false);
   const [sessionMenuId, setSessionMenuId] = useState<string | null>(null);
   const [newSessionDraft, setNewSessionDraft] = useState("");
   const [visibleSessionCount, setVisibleSessionCount] = useState(16);
@@ -11723,14 +11812,18 @@ function PickerPage() {
       push({ kind: "info", title: "暂无可切换图片" });
       return;
     }
-    patchSession(currentSession.session_id, (session) =>
-      pickerScheduleSession({
+    patchSession(currentSession.session_id, (session) => {
+      const next = pickerScheduleSession({
         session,
         compareMode,
         schedulerSettings: settings.pickerScheduler,
         reason: "next",
-      })
-    );
+      });
+      return {
+        ...next,
+        focus_key: next.slots.find(Boolean) || null,
+      };
+    });
   };
 
   const setSessionMode = (mode: PickerCompareMode) => {
@@ -11756,10 +11849,28 @@ function PickerPage() {
     patchSession(currentSession.session_id, (s) => ({ ...s, layout_preset: layout }));
   };
 
+  const activatePickerItem = (key: string) => {
+    if (!currentSession) return;
+    patchSession(currentSession.session_id, (session) => pickerRevealKeyInStage({ session, key, compareMode }));
+  };
+
   const focusListKeys = useMemo(
     () => orderedItemsByPool.map((it) => pickerItemKey(it)),
     [orderedItemsByPool]
   );
+
+  const stepFocus = (direction: 1 | -1) => {
+    if (!focusListKeys.length) return;
+    const currentIndex = focusKey ? focusListKeys.indexOf(focusKey) : -1;
+    const nextIndex =
+      currentIndex < 0
+        ? direction > 0
+          ? 0
+          : focusListKeys.length - 1
+        : (currentIndex + direction + focusListKeys.length) % focusListKeys.length;
+    const nextKey = focusListKeys[nextIndex];
+    if (nextKey) activatePickerItem(nextKey);
+  };
 
   useEffect(() => {
     if (!currentSession) return;
@@ -11826,7 +11937,7 @@ function PickerPage() {
   };
 
   const downloadPicked = async () => {
-    const picked = sessionItems.filter((it) => it.picked && pickerItemHasImage(it));
+    const picked = sessionItems.filter((it) => it.picked && pickerBucketOf(it) !== "DELETED" && pickerItemHasImage(it));
     if (!picked.length) {
       push({ kind: "info", title: "请先勾选要下载的图片" });
       return;
@@ -11840,67 +11951,88 @@ function PickerPage() {
     push({ kind: "success", title: `已触发下载 ${ok}/${picked.length} 张` });
   };
 
-  const downloadFocus = async () => {
-    if (!focusKey) return;
-    const item = itemMap.get(focusKey);
-    if (!item || !pickerItemHasImage(item)) return;
-    const ok = await downloadOne(item);
-    if (ok) push({ kind: "success", title: "下载已触发" });
-  };
-
   useEffect(() => {
     if (!currentSession) return;
     const onKey = (e: KeyboardEvent) => {
       const t = e.target as HTMLElement | null;
-      if (e.key === "Escape" && immersiveMode) {
-        e.preventDefault();
-        setImmersiveMode(false);
-        return;
+      if (e.key === "Escape") {
+        if (showShortcutHelp) {
+          e.preventDefault();
+          setShowShortcutHelp(false);
+          return;
+        }
+        if (immersiveMode) {
+          e.preventDefault();
+          setImmersiveMode(false);
+          return;
+        }
       }
       if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.tagName === "SELECT" || t.isContentEditable)) return;
+      const shortcutHelpPressed = e.key === "?" || (e.key === "/" && e.shiftKey);
+      if (shortcutHelpPressed) {
+        e.preventDefault();
+        setShowShortcutHelp((current) => !current);
+        return;
+      }
+      if (showShortcutHelp) return;
       if (e.key.toLowerCase() === "f") {
         e.preventDefault();
         setImmersiveMode((v) => !v);
         return;
       }
-      if (!focusKey) return;
+      if (e.key === " " || e.code === "Space") {
+        e.preventDefault();
+        stepFocus(e.shiftKey ? -1 : 1);
+        return;
+      }
+      if (e.key.toLowerCase() === "n") {
+        e.preventDefault();
+        shiftToNextBatch();
+        return;
+      }
+      if (!focusKey) {
+        if (["1", "2", "3", "4", "5", "0", "b", "d"].includes(e.key.toLowerCase())) {
+          e.preventDefault();
+        }
+        return;
+      }
       const focusItem = itemMap.get(focusKey);
       if (!focusItem) return;
       if (["1", "2", "3", "4", "5"].includes(e.key)) {
+        e.preventDefault();
         rateItem(focusKey, Number(e.key));
         return;
       }
-      if (compareMode === "ONE" && (e.key === "ArrowLeft" || e.key === "ArrowRight")) {
-        if (focusListKeys.length < 2) return;
-        const i = focusListKeys.indexOf(focusKey);
-        if (i < 0) return;
-        const next = e.key === "ArrowRight" ? (i + 1) % focusListKeys.length : (i - 1 + focusListKeys.length) % focusListKeys.length;
-        patchSession(currentSession.session_id, (session) => ({
-          ...session,
-          focus_key: focusListKeys[next],
-          slots: [focusListKeys[next], null, null, null],
-        }));
+      if (e.key === "0") {
+        e.preventDefault();
+        rateItem(focusKey, 0);
         return;
       }
       const key = e.key.toLowerCase();
-      if (key === "d" && !e.shiftKey) {
-        e.preventDefault();
-        downloadFocus();
-        return;
-      }
-      if (e.key === "Enter") {
+      if (key === "b" && !e.shiftKey && pickerItemHasImage(focusItem)) {
         e.preventDefault();
         toggleBest(focusKey);
         return;
       }
-      if (e.key === "Backspace") {
+      if (key === "d" && !e.shiftKey) {
         e.preventDefault();
         deleteFromPicker(focusKey);
+        return;
       }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [currentSession?.session_id, focusKey, compareMode, focusListKeys.join("|"), itemMap, immersiveMode, patchSession]);
+  }, [
+    currentSession?.session_id,
+    compareMode,
+    focusKey,
+    focusListKeys.join("|"),
+    itemMap,
+    immersiveMode,
+    sessionItems,
+    settings.pickerScheduler,
+    showShortcutHelp,
+  ]);
 
   if (!currentSession) {
     return (
@@ -11914,7 +12046,30 @@ function PickerPage() {
   const selectedCount = sessionItems.filter((it) => it.picked && pickerBucketOf(it) !== "DELETED").length;
   const activeMode = pickerScheduleMode(pickerVisibleCandidateItems(sessionItems));
   const pendingReviewCount = filmstripItems.filter((item) => !item.reviewed).length;
+  const filmstripGeneratingCount = filmstripItems.filter((item) => {
+    const status = pickerItemJobStatus(item, jobsById.get(item.job_id));
+    return !pickerItemHasImage(item) && status !== "FAILED" && status !== "CANCELLED";
+  }).length;
+  const filmstripFailedCount = filmstripItems.filter((item) => pickerItemJobStatus(item, jobsById.get(item.job_id)) === "FAILED").length;
   const immersiveSlots = normalizedSlots.slice(0, pickerCompareModeSlotCount(compareMode));
+  const pickerStatChips = [
+    { key: "mode", label: `当前模式 ${activeMode}`, testId: "picker-stat-mode" },
+    { key: "pending", label: `未审 Filmstrip ${pendingReviewCount}`, testId: "picker-stat-pending" },
+    { key: "filmstrip", label: `Filmstrip ${filmstripItems.length}`, testId: "picker-stat-filmstrip" },
+    { key: "preferred", label: `优选池 ${preferredItems.length}`, testId: "picker-stat-preferred" },
+    { key: "selected", label: `已选 ${selectedCount}`, testId: "picker-stat-selected" },
+  ];
+  const shortcutItems = [
+    ["Space", "焦点移动到下一张"],
+    ["Shift + Space", "回到上一张"],
+    ["1~5", "给焦点图片打分"],
+    ["0", "清空评分"],
+    ["B", "加入或移出优选池"],
+    ["D", "从当前 session 删除"],
+    ["N", "切换下一组"],
+    ["F", "进入或退出全屏"],
+    ["?", "显示或关闭快捷键帮助"],
+  ];
 
   const renderImmersiveSlot = (slotKey: string | null, label: string) => {
     const item = slotKey ? itemMap.get(slotKey) || null : null;
@@ -12245,11 +12400,15 @@ function PickerPage() {
               <Button variant="secondary" onClick={downloadPicked}>下载选中</Button>
             </div>
             <div className="mt-3 flex flex-wrap items-center gap-2 text-xs text-zinc-500 dark:text-zinc-400">
-              <span className="rounded-full border border-zinc-200 bg-white px-3 py-1 dark:border-white/10 dark:bg-zinc-950/40" data-testid="picker-stat-mode">当前模式 {activeMode}</span>
-              <span className="rounded-full border border-zinc-200 bg-white px-3 py-1 dark:border-white/10 dark:bg-zinc-950/40" data-testid="picker-stat-pending">未审 Filmstrip {pendingReviewCount}</span>
-              <span className="rounded-full border border-zinc-200 bg-white px-3 py-1 dark:border-white/10 dark:bg-zinc-950/40" data-testid="picker-stat-filmstrip">Filmstrip {filmstripItems.length}</span>
-              <span className="rounded-full border border-zinc-200 bg-white px-3 py-1 dark:border-white/10 dark:bg-zinc-950/40" data-testid="picker-stat-preferred">优选池 {preferredItems.length}</span>
-              <span className="rounded-full border border-zinc-200 bg-white px-3 py-1 dark:border-white/10 dark:bg-zinc-950/40" data-testid="picker-stat-selected">已选 {selectedCount}</span>
+              {pickerStatChips.map((chip) => (
+                <span
+                  key={chip.key}
+                  className="rounded-full border border-zinc-200 bg-white px-3 py-1 dark:border-white/10 dark:bg-zinc-950/40"
+                  data-testid={chip.testId}
+                >
+                  {chip.label}
+                </span>
+              ))}
             </div>
           </Card>
 
@@ -12295,8 +12454,22 @@ function PickerPage() {
           <div className="grid gap-4 lg:grid-cols-2">
             <Card className="min-w-0 overflow-hidden" testId="picker-filmstrip-panel">
               <div className="mb-3 flex items-center justify-between">
-                <div>
-                  <div className="text-sm font-bold text-zinc-900 dark:text-zinc-50">Filmstrip</div>
+                <div className="min-w-0">
+                  <div className="flex items-center gap-2">
+                    <div className="text-sm font-bold text-zinc-900 dark:text-zinc-50">Filmstrip</div>
+                    <div className="flex items-center gap-1 whitespace-nowrap text-[10px]">
+                      {filmstripGeneratingCount > 0 ? (
+                        <span className="rounded-full border border-sky-300/80 bg-sky-500/10 px-2 py-0.5 font-semibold text-sky-700 dark:border-sky-400/30 dark:text-sky-200">
+                          生成中 {filmstripGeneratingCount}
+                        </span>
+                      ) : null}
+                      {filmstripFailedCount > 0 ? (
+                        <span className="rounded-full border border-rose-300/80 bg-rose-500/10 px-2 py-0.5 font-semibold text-rose-700 dark:border-rose-400/30 dark:text-rose-200">
+                          失败 {filmstripFailedCount}
+                        </span>
+                      ) : null}
+                    </div>
+                  </div>
                   <div className="text-xs text-zinc-500 dark:text-zinc-400">横向片池适合快速浏览、评分和硬决策。</div>
                 </div>
                 <div className="text-xs text-zinc-500 dark:text-zinc-400">已选 {selectedCount} / 总计 {filmstripItems.length + preferredItems.length}</div>
@@ -12332,17 +12505,7 @@ function PickerPage() {
                         <button
                           type="button"
                           className="relative block h-40 w-full overflow-hidden bg-zinc-100 dark:bg-zinc-900"
-                          onClick={() => {
-                            if (compareMode === "ONE") {
-                              patchSession(currentSession.session_id, (session) => ({
-                                ...session,
-                                focus_key: key,
-                                slots: [key, null, null, null],
-                              }));
-                            } else {
-                              setFocus(currentSession.session_id, key);
-                            }
-                          }}
+                          onClick={() => activatePickerItem(key)}
                         >
                           {!hasImage ? (
                             <PickerPendingVisual status={status} />
@@ -12433,17 +12596,7 @@ function PickerPage() {
                         <button
                           type="button"
                           className="relative block h-44 w-full overflow-hidden bg-zinc-100 dark:bg-zinc-900"
-                          onClick={() => {
-                            if (compareMode === "ONE") {
-                              patchSession(currentSession.session_id, (session) => ({
-                                ...session,
-                                focus_key: key,
-                                slots: [key, null, null, null],
-                              }));
-                            } else {
-                              setFocus(currentSession.session_id, key);
-                            }
-                          }}
+                          onClick={() => activatePickerItem(key)}
                         >
                           {state?.url ? (
                             <img
@@ -12502,8 +12655,17 @@ function PickerPage() {
             <div className="absolute inset-0 bg-[radial-gradient(circle_at_top,rgba(255,255,255,0.08),transparent_56%)]" />
             <div className="relative flex h-full flex-col px-4 pb-4 pt-3 md:px-6">
               <div className="mb-3 flex items-center justify-between gap-2">
-                <div className="min-w-0">
-                  <div className="truncate text-sm font-bold">{currentSession.name} · 沉浸式审阅</div>
+                <div className="min-w-0 flex-1">
+                  <div className="flex items-center gap-2 overflow-hidden whitespace-nowrap">
+                    <div className="truncate text-sm font-bold">{currentSession.name} · 沉浸式审阅</div>
+                    <div className="flex min-w-0 items-center gap-1 overflow-x-auto text-[10px] text-zinc-300/80 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
+                      {pickerStatChips.map((chip) => (
+                        <span key={chip.key} className="rounded-full border border-white/12 bg-white/6 px-2 py-0.5 font-medium text-zinc-300/80">
+                          {chip.label}
+                        </span>
+                      ))}
+                    </div>
+                  </div>
                   <div className="text-[11px] text-zinc-300">悬停显示评分与优选控件，按 `Esc` 退出</div>
                 </div>
                 <div className="flex items-center gap-2">
@@ -12521,6 +12683,43 @@ function PickerPage() {
                 </div>
               </div>
             </div>
+          </motion.div>
+        ) : null}
+      </AnimatePresence>
+
+      <AnimatePresence>
+        {showShortcutHelp ? (
+          <motion.div
+            className="fixed inset-0 z-[72] flex items-end justify-end bg-black/20 p-4"
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+          >
+            <button type="button" className="absolute inset-0" onClick={() => setShowShortcutHelp(false)} aria-label="关闭快捷键帮助" />
+            <motion.div
+              initial={{ opacity: 0, y: 12 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: 12 }}
+              className="relative w-full max-w-sm rounded-3xl border border-zinc-200 bg-white/95 p-4 shadow-2xl backdrop-blur dark:border-white/10 dark:bg-zinc-950/92"
+            >
+              <div className="flex items-center justify-between gap-3">
+                <div>
+                  <div className="text-sm font-bold text-zinc-900 dark:text-zinc-50">Picker 快捷键</div>
+                  <div className="text-[11px] text-zinc-500 dark:text-zinc-400">仅在 picker 页面生效，普通模式和全屏审阅都可用。</div>
+                </div>
+                <Button variant="ghost" className="!px-2 !py-1 text-xs" onClick={() => setShowShortcutHelp(false)}>
+                  关闭
+                </Button>
+              </div>
+              <div className="mt-3 space-y-2">
+                {shortcutItems.map(([combo, label]) => (
+                  <div key={combo} className="flex items-center justify-between gap-4 rounded-2xl bg-zinc-50 px-3 py-2 text-xs dark:bg-white/5">
+                    <span className="font-semibold text-zinc-900 dark:text-zinc-100">{combo}</span>
+                    <span className="text-right text-zinc-500 dark:text-zinc-400">{label}</span>
+                  </div>
+                ))}
+              </div>
+            </motion.div>
           </motion.div>
         ) : null}
       </AnimatePresence>

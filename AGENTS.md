@@ -205,6 +205,10 @@ srv/stable/
 5. 默认先 `open`，再 `snapshot`，再根据最新 ref 做 `click/fill/type`
 6. 页面发生明显变化后重新 `snapshot`，不要复用旧 ref
 7. 如果某个流程需要重复回归，优先补到 `tools/playwright/tests/e2e/` 并通过 `npm --prefix tools/playwright run test:e2e` 执行
+8. 如果测试过程中临时启动了前端 dev server、后端 uvicorn、docker 仿真容器外的附加服务，或打开了 Playwright 浏览器 session，测试结束后必须显式清理，不能假设脚本结束后会自动退出
+9. 清理时至少确认两类资源：
+   - 临时服务端口不再监听，例如 `5173`、`5178`、`8000`、`8011`、其他本次测试新开的端口
+   - Playwright 会话已关闭，优先使用 `./tools/playwright/scripts/playwright-cli.sh close`、`close-all`，必要时再用 `kill-all`
 
 ### 8.3 推荐工具顺序
 
@@ -220,6 +224,7 @@ srv/stable/
 - `snapshot` 是核心步骤；没有新快照时，不要假设旧元素 ref 仍然有效
 - 优先用本地 CLI 原生命令，不要上来就写大段脚本
 - 一次性排查可用 CLI；重复回归场景优先沉淀为 e2e 测试
+- 若本次测试临时起了服务或浏览器，会话结束前必须主动回收，避免残留后台进程占用端口影响后续开发
 
 ### 8.4 针对本项目的固定入口
 
@@ -262,6 +267,7 @@ srv/stable/
 - 实际执行了哪些页面操作
 - 控制台是否有报错或 warning
 - 是否只做了浏览器验证，还是还执行了真实提交/写操作
+- 测试结束后是否已清理临时服务、端口监听和 Playwright 会话；如果没有清理，要明确列出残留项
 
 ## 9. Agent 执行约定
 
