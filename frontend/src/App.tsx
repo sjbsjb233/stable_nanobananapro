@@ -1948,6 +1948,13 @@ const FALLBACK_BASE_URL =
     ? `${window.location.protocol}//${window.location.hostname}:8000`
     : "http://127.0.0.1:8000";
 
+function normalizeBackendBaseUrl(value: string | null | undefined, fallback = FALLBACK_BASE_URL) {
+  const normalized = `${value || ""}`.trim().replace(/\/+$/, "");
+  return normalized || fallback;
+}
+
+const DEFAULT_BASE_URL = normalizeBackendBaseUrl(RUNTIME_BASE_URL || ENV_BASE_URL || FALLBACK_BASE_URL);
+
 const DEFAULT_PARAMS_TEMPLATE: DefaultParams = {
   aspect_ratio: "1:1",
   image_size: "1K",
@@ -1959,7 +1966,7 @@ const DEFAULT_PARAMS_TEMPLATE: DefaultParams = {
 };
 
 const DEFAULT_SETTINGS: SettingsV1 = {
-  baseUrl: RUNTIME_BASE_URL || ENV_BASE_URL || FALLBACK_BASE_URL,
+  baseUrl: DEFAULT_BASE_URL,
   defaultModel: "gemini-3.1-flash-image-preview",
   jobAuthMode: "TOKEN",
   adminModeEnabled: false,
@@ -2084,6 +2091,7 @@ function coerceSettings(raw: any): SettingsV1 {
   const effectiveDefaultParams = normalizeDefaultParams(defaultParamsByModel[base.defaultModel]);
   return {
     ...base,
+    baseUrl: normalizeBackendBaseUrl(base.baseUrl, DEFAULT_BASE_URL),
     defaultParams: effectiveDefaultParams,
     defaultParamsByModel,
     cache: {
@@ -4113,6 +4121,98 @@ function useAdminProviderSummary(enabled: boolean) {
   return providerSummary;
 }
 
+function useBackendConnectionEditor() {
+  const { push } = useToast();
+  const settings = useSettingsStore((s) => s.settings);
+  const setSettings = useSettingsStore((s) => s.setSettings);
+  const [baseUrl, setBaseUrlState] = useState(settings.baseUrl);
+  const [health, setHealth] = useState<any | null>(null);
+  const [testing, setTesting] = useState(false);
+
+  useEffect(() => {
+    setBaseUrlState(settings.baseUrl);
+  }, [settings.baseUrl]);
+
+  const setBaseUrl = (value: string) => {
+    setBaseUrlState(value);
+    setHealth(null);
+  };
+
+  const clearHealth = () => setHealth(null);
+
+  const saveBaseUrl = () => {
+    const nextBaseUrl = normalizeBackendBaseUrl(baseUrl, DEFAULT_BASE_URL);
+    setSettings({ baseUrl: nextBaseUrl });
+    push({ kind: "success", title: "已保存后端地址" });
+  };
+
+  const testConnection = async () => {
+    const nextBaseUrl = normalizeBackendBaseUrl(baseUrl, DEFAULT_BASE_URL);
+    setTesting(true);
+    setHealth(null);
+    try {
+      const response = await new ApiClient({ ...settings, baseUrl: nextBaseUrl }).health();
+      setHealth(response);
+      push({ kind: "success", title: "连接成功" });
+    } catch (e: any) {
+      setHealth({ __error: e });
+      push({ kind: "error", title: "连接失败", message: e?.error?.message || "" });
+    } finally {
+      setTesting(false);
+    }
+  };
+
+  return {
+    baseUrl,
+    normalizedBaseUrl: normalizeBackendBaseUrl(baseUrl, DEFAULT_BASE_URL),
+    setBaseUrl,
+    saveBaseUrl,
+    testConnection,
+    testing,
+    health,
+    clearHealth,
+  };
+}
+
+function BackendConnectionHealthResult({
+  health,
+  compact = false,
+  testId,
+}: {
+  health: any | null;
+  compact?: boolean;
+  testId?: string;
+}) {
+  if (!health) return null;
+
+  return (
+    <div
+      data-testid={testId}
+      className={cn(
+        "mt-3 rounded-2xl border border-zinc-200 bg-white/60 p-3 text-xs dark:border-white/10 dark:bg-zinc-950/30",
+        compact && "rounded-xl border-zinc-200/80 bg-zinc-50/70 p-2.5 text-[11px] dark:border-white/10 dark:bg-white/[0.03]"
+      )}
+    >
+      <div className="font-bold text-zinc-900 dark:text-zinc-50">Health</div>
+      {health?.__error?.error?.code === "NETWORK_ERROR" ? (
+        <div className="mt-2 rounded-xl border border-amber-200 bg-amber-50 p-2 text-[11px] text-amber-900 dark:border-amber-900 dark:bg-amber-950/30 dark:text-amber-100">
+          浏览器报 NETWORK_ERROR 但后端日志是 200，最常见原因是 <span className="font-semibold">CORS 拦截响应</span>。
+          也可能是 HTTPS 页面请求 HTTP（Mixed Content）或证书/代理问题。
+          请打开 DevTools Console/Network 查看是否有 CORS 报错，并在后端开启允许当前前端 Origin 的 CORS（尤其要允许 credentials 与 `X-Job-Token`）。
+        </div>
+      ) : null}
+      <pre
+        className={cn(
+          "mt-2 overflow-auto rounded-xl bg-black/90 p-2 text-[11px] text-white",
+          compact ? "max-h-32" : "max-h-40"
+        )}
+      >
+        {JSON.stringify(health, null, 2)}
+      </pre>
+    </div>
+  );
+}
+
 // -----------------------------
 // UI primitives
 // -----------------------------
@@ -4957,12 +5057,14 @@ function LoginPage() {
   const { push } = useToast();
   const setSession = useAuthStore((s) => s.setSession);
   const settings = useSettingsStore((s) => s.settings);
+  const backendConnection = useBackendConnectionEditor();
 
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [turnstileToken, setTurnstileToken] = useState<string | null>(null);
   const [turnstileKey, setTurnstileKey] = useState(0);
   const [submitting, setSubmitting] = useState(false);
+  const [connectionExpanded, setConnectionExpanded] = useState(false);
 
   const handleLogin = async () => {
     if (!username.trim() || !password) {
@@ -5026,7 +5128,51 @@ function LoginPage() {
         <Card className="border-zinc-900/10 bg-white/88 p-6 shadow-[0_32px_80px_rgba(15,23,42,0.14)] dark:border-white/10 dark:bg-zinc-950/85" hover={false}>
           <div className="text-sm font-semibold uppercase tracking-[0.22em] text-zinc-500 dark:text-zinc-400">Password Login</div>
           <div className="mt-2 text-2xl font-black text-zinc-950 dark:text-white">进入控制台</div>
-          <div className="mt-2 text-sm text-zinc-600 dark:text-zinc-300">当前后端地址：{settings.baseUrl}</div>
+          <button
+            type="button"
+            data-testid="login-backend-connection-trigger"
+            aria-expanded={connectionExpanded}
+            onClick={() => setConnectionExpanded((value) => !value)}
+            className="mt-2 inline-flex max-w-full items-center gap-2 rounded-lg border border-zinc-200/70 bg-zinc-50/75 px-2.5 py-1.5 text-left text-xs text-zinc-500 transition hover:border-zinc-300 hover:text-zinc-700 dark:border-white/10 dark:bg-white/[0.03] dark:text-zinc-400 dark:hover:text-zinc-200"
+          >
+            <span>当前后端地址</span>
+            <span className="min-w-0 truncate font-mono text-[11px] text-zinc-600 dark:text-zinc-300">{settings.baseUrl}</span>
+          </button>
+          {connectionExpanded ? (
+            <div
+              data-testid="login-backend-connection-panel"
+              className="mt-3 rounded-xl border border-zinc-200/80 bg-zinc-50/70 p-3 dark:border-white/10 dark:bg-white/[0.03]"
+            >
+              <Field label={<span className="text-[11px] font-medium text-zinc-500 dark:text-zinc-400">后端地址</span>}>
+                <Input
+                  testId="backend-baseurl-input"
+                  value={backendConnection.baseUrl}
+                  onChange={backendConnection.setBaseUrl}
+                  placeholder="http://127.0.0.1:8000"
+                  className="rounded-lg border-zinc-200/80 bg-white/80 px-2.5 py-1.5 text-xs dark:border-white/10 dark:bg-zinc-950/70"
+                />
+              </Field>
+              <div className="mt-3 flex flex-wrap items-center gap-2">
+                <Button
+                  testId="backend-connection-test"
+                  variant="secondary"
+                  className="rounded-lg px-2.5 py-1.5 text-xs"
+                  onClick={backendConnection.testConnection}
+                  disabled={backendConnection.testing}
+                >
+                  {backendConnection.testing ? "测试中…" : "测试连接"}
+                </Button>
+                <Button
+                  testId="backend-connection-save"
+                  className="rounded-lg px-2.5 py-1.5 text-xs"
+                  onClick={backendConnection.saveBaseUrl}
+                >
+                  保存
+                </Button>
+              </div>
+              <BackendConnectionHealthResult health={backendConnection.health} compact testId="backend-connection-health" />
+            </div>
+          ) : null}
 
           <div className="mt-6 space-y-4">
             <Field label="username">
@@ -15397,8 +15543,8 @@ function SettingsPage() {
   const resetSettings = useSettingsStore((s) => s.resetSettings);
   const clearJobs = useJobsStore((s) => s.clearJobs);
   const jobs = useJobsStore((s) => s.jobs);
+  const backendConnection = useBackendConnectionEditor();
 
-  const [baseUrl, setBaseUrl] = useState(settings.baseUrl);
   const [defaultModel, setDefaultModel] = useState<ModelId>(settings.defaultModel || catalog.default_model);
   const [jobAuthMode, setJobAuthMode] = useState<JobAuthMode>(settings.jobAuthMode);
 
@@ -15426,11 +15572,7 @@ function SettingsPage() {
   const [polishRatingWeight, setPolishRatingWeight] = useState(settings.pickerScheduler.polishRatingWeight);
   const [cacheStatsState, setCacheStatsState] = useState<ImageCacheStats>({ count: 0, size: 0 });
 
-  const [health, setHealth] = useState<any | null>(null);
-  const [testing, setTesting] = useState(false);
-
   useEffect(() => {
-    setBaseUrl(settings.baseUrl);
     setDefaultModel(settings.defaultModel || catalog.default_model);
     setJobAuthMode(settings.jobAuthMode);
     setTheme(settings.ui.theme);
@@ -15460,7 +15602,7 @@ function SettingsPage() {
 
   const save = () => {
     const next: Partial<SettingsV1> = {
-      baseUrl: baseUrl.trim().replace(/\/$/, ""),
+      baseUrl: backendConnection.normalizedBaseUrl,
       defaultModel,
       jobAuthMode,
       ui: {
@@ -15494,22 +15636,6 @@ function SettingsPage() {
     };
     setSettings(next);
     push({ kind: "success", title: "已保存设置" });
-  };
-
-  const testHealth = async () => {
-    setTesting(true);
-    setHealth(null);
-    try {
-      const tmp = new ApiClient({ ...settings, baseUrl });
-      const r = await tmp.health();
-      setHealth(r);
-      push({ kind: "success", title: "连接成功" });
-    } catch (e: any) {
-      setHealth({ __error: e });
-      push({ kind: "error", title: "连接失败", message: e?.error?.message || "" });
-    } finally {
-      setTesting(false);
-    }
   };
 
   const exportAll = () => {
@@ -15572,7 +15698,12 @@ function SettingsPage() {
           <div className="text-sm font-bold text-zinc-900 dark:text-zinc-50">后端连接</div>
           <div className="mt-3 grid grid-cols-1 gap-3 md:grid-cols-3">
             <Field label="baseUrl">
-              <Input value={baseUrl} onChange={setBaseUrl} placeholder="http://127.0.0.1:8000" />
+              <Input
+                testId="backend-baseurl-input"
+                value={backendConnection.baseUrl}
+                onChange={backendConnection.setBaseUrl}
+                placeholder="http://127.0.0.1:8000"
+              />
             </Field>
             <Field label="jobAuthMode">
               <Select
@@ -15593,30 +15724,22 @@ function SettingsPage() {
             </Field>
           </div>
           <div className="mt-3 flex flex-wrap items-center gap-2">
-            <Button variant="secondary" onClick={testHealth} disabled={testing}>
-              {testing ? "测试中…" : "测试连接"}
+            <Button
+              testId="backend-connection-test"
+              variant="secondary"
+              onClick={backendConnection.testConnection}
+              disabled={backendConnection.testing}
+            >
+              {backendConnection.testing ? "测试中…" : "测试连接"}
             </Button>
-            <Button variant="ghost" onClick={() => {
-              setHealth(null);
-            }}>
+            <Button testId="backend-connection-save" onClick={backendConnection.saveBaseUrl}>
+              保存
+            </Button>
+            <Button variant="ghost" onClick={backendConnection.clearHealth}>
               清空结果
             </Button>
           </div>
-          {health ? (
-            <div className="mt-3 rounded-2xl border border-zinc-200 bg-white/60 p-3 text-xs dark:border-white/10 dark:bg-zinc-950/30">
-              <div className="font-bold text-zinc-900 dark:text-zinc-50">Health</div>
-              {health?.__error?.error?.code === "NETWORK_ERROR" ? (
-                <div className="mt-2 rounded-xl border border-amber-200 bg-amber-50 p-2 text-[11px] text-amber-900 dark:border-amber-900 dark:bg-amber-950/30 dark:text-amber-100">
-                  浏览器报 NETWORK_ERROR 但后端日志是 200，最常见原因是 <span className="font-semibold">CORS 拦截响应</span>。
-                  也可能是 HTTPS 页面请求 HTTP（Mixed Content）或证书/代理问题。
-                  请打开 DevTools Console/Network 查看是否有 CORS 报错，并在后端开启允许当前前端 Origin 的 CORS（尤其要允许 credentials 与 `X-Job-Token`）。
-                </div>
-              ) : null}
-              <pre className="mt-2 max-h-40 overflow-auto rounded-xl bg-black/90 p-2 text-[11px] text-white">
-                {JSON.stringify(health, null, 2)}
-              </pre>
-            </div>
-          ) : null}
+          <BackendConnectionHealthResult health={backendConnection.health} testId="backend-connection-health" />
         </Card>
 
         <Card>
