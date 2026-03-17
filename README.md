@@ -14,12 +14,19 @@ stable_nanobananapro/
   backend/                          # FastAPI 后端
   frontend/                         # React 前端
   scripts/
+    worktree-dev.sh                 # Codex/worktree 开发入口
     init-buildx.sh                  # 初始化 buildx（跨架构构建）
     build-local-sim-images.sh       # 构建本地仿真镜像（tag=git hash）
   release.sh                        # 一键构建并 push 到 Docker Hub
+  .codex-dev-env/                   # 共享缓存 + worktree 私有运行态（git ignore）
   srv/                              # 本地仿真目录（已 git ignore）
   srv_server/                       # 服务器部署模板目录（可直接上传）
 ```
+
+## 开发流程边界
+
+- Agent / Codex worktree 流程：只使用 `./scripts/worktree-dev.sh`，不创建/删除 `git worktree`，也不调用 Docker。
+- 手工本地仿真 Docker 流程：保留本文后半部分，供你人工验证镜像与部署链路；Agent 默认不调用。
 
 ## 后端能力概览
 
@@ -40,62 +47,117 @@ stable_nanobananapro/
   - `result/image_0.png`
   - `logs/job.log`
 
-## 一、日常本地开发流程
+## 一、Codex Worktree 开发流程（Agent 唯一入口）
 
-### 1. 后端开发启动
-
-```bash
-cd backend
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-cp .env.example .env   # 如果你有自己的 .env，可以跳过
-uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
-```
-
-文档地址：
-
-- Swagger: `http://localhost:8000/docs`
-- OpenAPI: `http://localhost:8000/openapi.json`
-
-### 2. 前端开发启动
+### 1. 初始化当前 worktree
 
 ```bash
-cd frontend
-npm install
-cp .env.example .env
-npm run dev
+./scripts/worktree-dev.sh bootstrap
 ```
 
-默认前端：`http://localhost:5173`
+作用：
 
-可配项：
+- 识别当前 `cwd` 对应的 worktree
+- 在主仓库 `.codex-dev-env/shared/` 复用或创建 Python / npm / Playwright 依赖缓存
+- 在 `.codex-dev-env/instances/<instance-id>/` 创建当前 worktree 私有 env、日志、PID、`backend-data`、Playwright 运行态
+- 建立这些稳定入口：
+  - `backend/.venv`
+  - `backend/.env`
+  - `backend/data`
+  - `frontend/.env`
+  - `frontend/node_modules`
+  - `tools/playwright/node_modules`
+  - `tools/playwright/.playwright-browsers`
+  - `tools/playwright/.playwright-home`
+  - `tools/playwright/.playwright-cli`
+  - `tools/playwright/.cache`
+  - `tools/playwright/output`
+  - `tools/playwright/test-results`
 
-- `VITE_API_BASE_URL=http://127.0.0.1:8000`
-- `VITE_TURNSTILE_SITE_KEY=0x4AAAAAACoBxRJwxj2oUZDc`
-- `VITE_LOG_LEVEL=INFO`
-- `VITE_LOG_RETENTION_DAYS=3`
-- `VITE_LOG_MAX_ENTRIES=1200`
+实例元数据：
 
-新增后端认证/配额相关 env：
+- `.codex-dev-env/instances/<instance-id>/instance.json`
+- `.codex-dev-env/instances/<instance-id>/instance.env`
+
+固定环境变量：
+
+- `NBP_INSTANCE_ID`
+- `NBP_BACKEND_PORT`
+- `NBP_FRONTEND_PORT`
+- `NBP_BACKEND_URL`
+- `NBP_FRONTEND_URL`
+- `NBP_BACKEND_DATA_DIR`
+
+### 2. 启动、停止、查看状态
+
+```bash
+./scripts/worktree-dev.sh up backend
+./scripts/worktree-dev.sh up frontend
+./scripts/worktree-dev.sh up all
+./scripts/worktree-dev.sh down
+./scripts/worktree-dev.sh status
+./scripts/worktree-dev.sh shellenv
+```
+
+说明：
+
+- 后端固定使用无 `reload` 的 `uvicorn`
+- 前端固定使用当前实例端口启动 `vite`
+- 端口分配规则：
+  - `backend = 18000 + slot * 10`
+  - `frontend = 18001 + slot * 10`
+- `status` 会输出当前 worktree、实例 id、端口、URL、PID、日志位置、依赖 key
+- `shellenv` 可配合 `eval "$(./scripts/worktree-dev.sh shellenv)"` 临时注入实例环境
+
+### 3. 测试
+
+```bash
+./scripts/worktree-dev.sh test backend
+./scripts/worktree-dev.sh test e2e
+```
+
+说明：
+
+- `test backend` 直接在当前实例环境下执行 `pytest -q`
+- `test e2e` 默认读取当前实例的 `NBP_FRONTEND_URL`
+- 如果 `tools/playwright/tests/e2e/` 里没有 spec，会直接返回，不会去跑 Docker
+
+### 4. Playwright CLI
+
+当需要真实浏览器自动化时，仍统一走 `tools/playwright/` 下的本地 CLI，但入口地址应来自当前实例：
+
+```bash
+./scripts/worktree-dev.sh up all
+eval "$(./scripts/worktree-dev.sh shellenv)"
+./tools/playwright/scripts/playwright-cli.sh open "$NBP_FRONTEND_URL" --headed
+./tools/playwright/scripts/playwright-cli.sh snapshot
+```
+
+说明：
+
+- `tools/playwright/.playwright-browsers` 现在是共享浏览器缓存
+- `tools/playwright/.playwright-home`、`.playwright-cli`、`.cache`、`output`、`test-results` 都是实例私有
+- `frontend/scripts/*.mjs` 会优先读取 `NBP_FRONTEND_URL`、`NBP_BACKEND_URL`、`NBP_BACKEND_DATA_DIR`
+- 默认仍不要给 `playwright-cli.sh open ...` 传 `--browser chrome`
+
+### 5. 实例 env 说明
+
+首次 `bootstrap` 会从 `backend/.env.example`、`frontend/.env.example` 生成实例专属 env，并写到：
+
+- `.codex-dev-env/instances/<instance-id>/env/backend.env`
+- `.codex-dev-env/instances/<instance-id>/env/frontend.env`
+
+常见需要自行补充的配置：
 
 - `SESSION_SECRET_KEY`
+- `TURNSTILE_SECRET_KEY`
 - `TEST_ENV_ADMIN_BYPASS`
 - `BOOTSTRAP_ADMIN_USERNAME`
 - `BOOTSTRAP_ADMIN_PASSWORD`
-- `TURNSTILE_SITE_KEY`
-- `TURNSTILE_SECRET_KEY`
-- `DEFAULT_USER_DAILY_IMAGE_LIMIT`
-- `DEFAULT_USER_CONCURRENT_JOBS_LIMIT`
-- `DEFAULT_ADMIN_CONCURRENT_JOBS_LIMIT`
-- `DEFAULT_USER_TURNSTILE_JOB_COUNT_THRESHOLD`
-- `DEFAULT_USER_TURNSTILE_DAILY_USAGE_THRESHOLD`
-
-新增多中转站调度配置：
-
 - `UPSTREAM_PROVIDERS_JSON`
+- `VITE_TURNSTILE_SITE_KEY`
 
-示例：
+多中转站配置示例：
 
 ```json
 [
@@ -108,81 +170,19 @@ npm run dev
     "cost_per_image_cny": 0.09,
     "initial_balance_cny": 21.5,
     "supported_models": ["gemini-2.5-flash-image", "gemini-3-pro-image-preview", "gemini-3.1-flash-image-preview"]
-  },
-  {
-    "provider_id": "zx2",
-    "label": "ZX2",
-    "adapter_type": "gemini_v1beta",
-    "base_url": "http://zx2.example/v1beta",
-    "api_key": "sk-xxx",
-    "cost_per_image_cny": 0.05,
-    "initial_balance_cny": 10,
-    "supported_models": ["gemini-3.1-flash-image-preview"]
   }
 ]
 ```
 
-说明：
+补充说明：
 
-- `adapter_type=openai_chat_image` 适配通过 `/v1/chat/completions` 返回图片链接或 data URI 的中转站
+- `adapter_type=openai_chat_image` 适配 `/v1/chat/completions`
 - `adapter_type=gemini_v1beta` 适配 Gemini 原生 `v1beta/models/*:generateContent`
-- provider 的启用状态、备注、剩余余额、运行时成功率/熔断状态由后端持久化到 `data/providers.json`
-- 如果未配置 `UPSTREAM_PROVIDERS_JSON`，后端会退回旧的单一 `GEMINI_API_KEY + GEMINI_API_BASE_URL` 模式
+- provider 运行时状态仍由后端写入实例自己的 `backend-data/providers.json`
+- 如果未配置 `UPSTREAM_PROVIDERS_JSON`，后端会退回单一 `GEMINI_API_KEY + GEMINI_API_BASE_URL`
+- 当 `TEST_ENV_ADMIN_BYPASS=true` 时，Playwright 可直接访问目标页面，无需伪造 cookie / session
 
-测试环境直通 admin：
-
-- 新增后端开关 `TEST_ENV_ADMIN_BYPASS=false`
-- 当它设为 `true` 时，后端会把所有需要登录的请求直接判定为 bootstrap admin / 现有可用 admin
-- 该模式下不会校验 cookie、session，也不会要求登录页 Turnstile；前端首屏 `/v1/auth/me` 会直接返回 admin 会话
-- 适合本地 Playwright 自动化与联调，不要在正式生产环境开启
-- 使用本地 Playwright CLI 时，如果当前就是旁路模式，直接访问目标页面即可，不要额外伪造 cookie / session
-
-### 3. 本地开发测试
-
-```bash
-cd backend
-pytest -q
-```
-
-### 4. 统一目录 Playwright CLI
-
-本项目把 Playwright 相关文件统一收拢到 `tools/playwright/`，不再把入口和缓存散落在仓库根目录。
-
-首次安装：
-
-```bash
-./tools/playwright/scripts/setup-playwright.sh
-```
-
-安装完成后可直接从仓库根目录调用：
-
-```bash
-./tools/playwright/scripts/playwright-cli.sh --help
-./tools/playwright/scripts/playwright-cli.sh open http://127.0.0.1:5178 --headed
-./tools/playwright/scripts/playwright-cli.sh snapshot
-```
-
-说明：
-
-- `tools/playwright/node_modules/` 保存 Playwright Node 依赖
-- `tools/playwright/.playwright-browsers/` 保存浏览器二进制
-- `tools/playwright/.playwright-home/` 保存 `playwright-cli` 的 daemon 与运行态缓存
-- `tools/playwright/.playwright-cli/` 保存 CLI 快照与控制台日志
-- `frontend/scripts/*.mjs` 会自动复用这套 Playwright 依赖
-- `./tools/playwright/scripts/playwright-cli.sh open ...` 不要传 `--browser chrome`
-- 默认 headless 模式优先走项目内 `chromium-headless-shell`
-- 传 `--headed` 时会切到项目内完整 Chromium
-- 后续需要重复执行、可回归的验证时，优先把流程沉淀到 `tools/playwright/tests/e2e/` 里
-- 如需安装全部浏览器，可执行 `npm --prefix tools/playwright run pw:install:all`
-
-可直接使用的 e2e 入口：
-
-```bash
-npm --prefix tools/playwright run test:e2e
-npm --prefix tools/playwright run test:e2e:headed
-```
-
-## 二、本地“生产仿真”流程（Docker）
+## 二、本地“生产仿真”流程（Docker，人工专用）
 
 目的：在 Mac 上以生产姿势运行（不挂源码、不用 reload、用镜像启动）。
 

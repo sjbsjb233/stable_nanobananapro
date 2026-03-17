@@ -5,6 +5,7 @@ import io
 import json
 import threading
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -25,6 +26,7 @@ from app.user_store import user_store
 PNG_1X1 = base64.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO7m6XQAAAAASUVORK5CYII="
 )
+UTC_PLUS_8 = timezone(timedelta(hours=8))
 
 
 def make_png(width: int = 2200, height: int = 1600, color: tuple[int, int, int] = (52, 120, 210)) -> bytes:
@@ -41,10 +43,23 @@ def make_webp(width: int = 1200, height: int = 900, color: tuple[int, int, int] 
     return out.getvalue()
 
 
+def iso_at(offset: timedelta) -> str:
+    return (datetime.now(UTC_PLUS_8) + offset).replace(microsecond=0).isoformat()
+
+
+def configured_cors_origin() -> str:
+    for middleware in app.user_middleware:
+        allow_origins = getattr(middleware, "kwargs", {}).get("allow_origins")
+        if allow_origins:
+            return allow_origins[0]
+    return "http://127.0.0.1:5173"
+
+
 @pytest.fixture
 def client(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> TestClient:
     monkeypatch.setattr(settings, "data_dir", tmp_path)
     monkeypatch.setattr(settings, "log_dir", tmp_path / "logs")
+    monkeypatch.setattr(settings, "cors_allow_origins", "http://127.0.0.1:5173,http://localhost:5173")
     monkeypatch.setattr(settings, "bootstrap_admin_username", "admin")
     monkeypatch.setattr(settings, "bootstrap_admin_password", "admin123456")
     monkeypatch.setattr(settings, "turnstile_secret_key", "test-secret")
@@ -158,7 +173,7 @@ def test_cors_preflight_allows_patch_for_admin_endpoints(client: TestClient) -> 
     resp = client.options(
         "/v1/admin/policy",
         headers={
-            "Origin": "http://127.0.0.1:5173",
+            "Origin": configured_cors_origin(),
             "Access-Control-Request-Method": "PATCH",
         },
     )
@@ -168,6 +183,11 @@ def test_cors_preflight_allows_patch_for_admin_endpoints(client: TestClient) -> 
 
 
 def test_announcements_require_auth_and_admin_management(client: TestClient) -> None:
+    starts_at = iso_at(timedelta(hours=-2))
+    ends_at = iso_at(timedelta(hours=12))
+    invalid_starts_at = iso_at(timedelta(hours=2))
+    invalid_ends_at = iso_at(timedelta(hours=1))
+
     unauthorized = client.get("/v1/announcements/active")
     assert unauthorized.status_code == 401
 
@@ -183,8 +203,8 @@ def test_announcements_require_auth_and_admin_management(client: TestClient) -> 
             "title": "bad",
             "body": "bad",
             "status": "ACTIVE",
-            "starts_at": "2026-03-16T10:00:00+08:00",
-            "ends_at": "2026-03-16T09:00:00+08:00",
+            "starts_at": invalid_starts_at,
+            "ends_at": invalid_ends_at,
         },
     )
     assert invalid.status_code == 422
@@ -198,8 +218,8 @@ def test_announcements_require_auth_and_admin_management(client: TestClient) -> 
             "priority": "HIGH",
             "status": "ACTIVE",
             "dismissible": True,
-            "starts_at": "2026-03-16T08:00:00+08:00",
-            "ends_at": "2026-03-16T23:30:00+08:00",
+            "starts_at": starts_at,
+            "ends_at": ends_at,
             "target": {"roles": ["USER"], "enabled_only": True, "user_ids": [], "exclude_user_ids": []},
         },
     )
@@ -226,6 +246,13 @@ def test_announcements_require_auth_and_admin_management(client: TestClient) -> 
 
 
 def test_active_announcements_filter_dismiss_and_delete(client: TestClient) -> None:
+    active_starts_at = iso_at(timedelta(days=-1))
+    active_ends_at = iso_at(timedelta(days=1))
+    future_starts_at = iso_at(timedelta(days=30))
+    future_ends_at = iso_at(timedelta(days=31))
+    expired_starts_at = iso_at(timedelta(days=-3))
+    expired_ends_at = iso_at(timedelta(days=-2))
+
     login(client)
     create_user = client.post(
         "/v1/admin/users",
@@ -249,8 +276,8 @@ def test_active_announcements_filter_dismiss_and_delete(client: TestClient) -> N
                 "priority": "NORMAL",
                 "status": "ACTIVE",
                 "dismissible": True,
-                "starts_at": "2026-03-15T08:00:00+08:00",
-                "ends_at": "2026-03-17T08:00:00+08:00",
+                "starts_at": active_starts_at,
+                "ends_at": active_ends_at,
                 "target": {"roles": ["USER"], "enabled_only": True, "user_ids": [], "exclude_user_ids": []},
             },
     )
@@ -266,8 +293,8 @@ def test_active_announcements_filter_dismiss_and_delete(client: TestClient) -> N
                 "priority": "HIGH",
                 "status": "ACTIVE",
                 "dismissible": True,
-                "starts_at": "2026-03-15T08:00:00+08:00",
-                "ends_at": "2026-03-17T08:00:00+08:00",
+                "starts_at": active_starts_at,
+                "ends_at": active_ends_at,
                 "target": {"roles": ["USER"], "enabled_only": True, "user_ids": [alice["user_id"]], "exclude_user_ids": []},
             },
     )
@@ -283,8 +310,8 @@ def test_active_announcements_filter_dismiss_and_delete(client: TestClient) -> N
                 "priority": "HIGH",
                 "status": "ACTIVE",
                 "dismissible": True,
-                "starts_at": "2026-03-15T08:00:00+08:00",
-                "ends_at": "2026-03-17T08:00:00+08:00",
+                "starts_at": active_starts_at,
+                "ends_at": active_ends_at,
                 "target": {"roles": ["USER"], "enabled_only": True, "user_ids": [], "exclude_user_ids": [alice["user_id"]]},
             },
     )
@@ -296,8 +323,8 @@ def test_active_announcements_filter_dismiss_and_delete(client: TestClient) -> N
             "title": "future",
             "body": "not yet live",
             "status": "ACTIVE",
-            "starts_at": "2099-01-01T00:00:00+08:00",
-            "ends_at": "2099-01-02T00:00:00+08:00",
+            "starts_at": future_starts_at,
+            "ends_at": future_ends_at,
         },
     )
     assert future.status_code == 201
@@ -308,8 +335,8 @@ def test_active_announcements_filter_dismiss_and_delete(client: TestClient) -> N
             "title": "expired",
             "body": "already expired",
             "status": "ACTIVE",
-            "starts_at": "2026-03-14T00:00:00+08:00",
-            "ends_at": "2026-03-15T00:00:00+08:00",
+            "starts_at": expired_starts_at,
+            "ends_at": expired_ends_at,
         },
     )
     assert expired.status_code == 201
@@ -320,8 +347,8 @@ def test_active_announcements_filter_dismiss_and_delete(client: TestClient) -> N
                 "title": "paused",
                 "body": "paused item",
                 "status": "PAUSED",
-                "starts_at": "2026-03-15T08:00:00+08:00",
-                "ends_at": "2026-03-17T08:00:00+08:00",
+                "starts_at": active_starts_at,
+                "ends_at": active_ends_at,
             },
         )
     assert paused.status_code == 201

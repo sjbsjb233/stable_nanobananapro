@@ -1,8 +1,9 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { chromium } from 'playwright';
+import { createStoredSettings, frontendDir, frontendPage } from './runtime.mjs';
 
-const outDir = path.join(process.cwd(), 'videos');
+const outDir = path.join(frontendDir, 'videos');
 fs.mkdirSync(outDir, { recursive: true });
 
 const sessions = [];
@@ -53,40 +54,16 @@ const context = await browser.newContext({
 });
 const page = await context.newPage();
 
-await context.addInitScript(({ jobsIn, sessionsIn }) => {
-  localStorage.setItem('nbp_settings_v1', JSON.stringify({
-    baseUrl: 'http://127.0.0.1:8000',
-    defaultModel: 'gemini-3-pro-image-preview',
-    jobAuthMode: 'ID_ONLY',
-    adminModeEnabled: false,
-    adminKey: '',
-    defaultParams: {
-      aspect_ratio: '1:1',
-      image_size: '1K',
-      thinking_level: null,
-      temperature: 0.7,
-      timeout_sec: 120,
-      max_retries: 1,
-    },
-    defaultParamsByModel: {
-      'gemini-3-pro-image-preview': {
-        aspect_ratio: '1:1',
-        image_size: '1K',
-        thinking_level: null,
-        temperature: 0.7,
-        timeout_sec: 120,
-        max_retries: 1,
-      },
-    },
-    ui: { theme: 'dark', language: 'zh-CN', reduceMotion: true },
-    polling: { intervalMs: 1200, maxIntervalMs: 5000, concurrency: 4 },
-  }));
+const storedSettings = createStoredSettings();
+
+await context.addInitScript(({ jobsIn, sessionsIn, settingsIn }) => {
+  localStorage.setItem('nbp_settings_v1', JSON.stringify(settingsIn));
   localStorage.setItem('nbp_jobs_v1', JSON.stringify(jobsIn));
   localStorage.setItem('nbp_picker_sessions_v1', JSON.stringify(sessionsIn));
   localStorage.setItem('nbp_picker_recent_v1', JSON.stringify({ last_session_id: sessionsIn[0].session_id, last_opened_at: new Date().toISOString() }));
-}, { jobsIn: jobs, sessionsIn: sessions });
+}, { jobsIn: jobs, sessionsIn: sessions, settingsIn: storedSettings });
 
-await page.goto(`http://127.0.0.1:5173/picker?session=${encodeURIComponent(sessions[0].session_id)}`, { waitUntil: 'networkidle' });
+await page.goto(frontendPage(`/picker?session=${encodeURIComponent(sessions[0].session_id)}`), { waitUntil: 'networkidle' });
 await page.waitForSelector('text=Image Picker');
 await page.waitForTimeout(900);
 
@@ -97,9 +74,9 @@ for (let i = 0; i < 24; i++) {
   if (i % 8 === 0) await page.getByRole('button', { name: 'Filmstrip' }).first().click();
   if (i % 10 === 0) await page.getByRole('button', { name: '4-up' }).first().click();
   if (i % 12 === 0) {
-    await page.goto('http://127.0.0.1:5173/history', { waitUntil: 'networkidle' });
+    await page.goto(frontendPage('/history'), { waitUntil: 'networkidle' });
     await page.waitForTimeout(350);
-    await page.goto(`http://127.0.0.1:5173/picker?session=${encodeURIComponent(sid)}`, { waitUntil: 'networkidle' });
+    await page.goto(frontendPage(`/picker?session=${encodeURIComponent(sid)}`), { waitUntil: 'networkidle' });
   }
   await page.waitForTimeout(320);
 }
