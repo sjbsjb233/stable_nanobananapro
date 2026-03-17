@@ -51,6 +51,28 @@ class UserRole(str, Enum):
     USER = "USER"
 
 
+class AnnouncementKind(str, Enum):
+    INFO = "INFO"
+    UPDATE = "UPDATE"
+    MAINTENANCE = "MAINTENANCE"
+    PROMO = "PROMO"
+    TIP = "TIP"
+    WARNING = "WARNING"
+
+
+class AnnouncementPriority(str, Enum):
+    LOW = "LOW"
+    NORMAL = "NORMAL"
+    HIGH = "HIGH"
+
+
+class AnnouncementStatus(str, Enum):
+    DRAFT = "DRAFT"
+    ACTIVE = "ACTIVE"
+    PAUSED = "PAUSED"
+    EXPIRED = "EXPIRED"
+
+
 class JobParams(BaseModel):
     aspect_ratio: str = "1:1"
     image_size: str = "1K"
@@ -363,3 +385,111 @@ class SetProviderBalanceRequest(BaseModel):
 
 class AddProviderBalanceRequest(BaseModel):
     delta_cny: float = Field(ge=0)
+
+
+class AnnouncementTargetInput(BaseModel):
+    roles: list[UserRole] = Field(default_factory=lambda: [UserRole.USER])
+    enabled_only: bool = True
+    user_ids: list[str] = Field(default_factory=list)
+    exclude_user_ids: list[str] = Field(default_factory=list)
+
+    @field_validator("roles", mode="before")
+    @classmethod
+    def normalize_roles(cls, value: Any) -> list[UserRole]:
+        if not isinstance(value, list):
+            return [UserRole.USER]
+        items: list[UserRole] = []
+        seen: set[str] = set()
+        for item in value:
+            raw = str(item or "").strip().upper()
+            if raw not in {"ADMIN", "USER"} or raw in seen:
+                continue
+            items.append(UserRole(raw))
+            seen.add(raw)
+        return items or [UserRole.USER]
+
+    @field_validator("user_ids", "exclude_user_ids", mode="before")
+    @classmethod
+    def normalize_user_ids(cls, value: Any) -> list[str]:
+        if value is None:
+            return []
+        if isinstance(value, str):
+            raw_items = value.split(",")
+        elif isinstance(value, list):
+            raw_items = value
+        else:
+            return []
+        out: list[str] = []
+        seen: set[str] = set()
+        for item in raw_items:
+            raw = str(item or "").strip()
+            if not raw or raw in seen:
+                continue
+            out.append(raw)
+            seen.add(raw)
+        return out
+
+
+class AnnouncementItem(BaseModel):
+    announcement_id: str
+    title: str
+    body: str
+    kind: AnnouncementKind
+    priority: AnnouncementPriority
+    status: AnnouncementStatus
+    dismissible: bool = True
+    starts_at: datetime | None = None
+    ends_at: datetime | None = None
+    target: AnnouncementTargetInput = Field(default_factory=AnnouncementTargetInput)
+    created_at: datetime
+    updated_at: datetime
+    created_by_user_id: str
+    created_by_username: str
+    dismissed_count: int = 0
+
+
+class AnnouncementListResponse(BaseModel):
+    server_time: datetime
+    items: list[AnnouncementItem] = Field(default_factory=list)
+
+
+class CreateAnnouncementRequest(BaseModel):
+    title: str = Field(min_length=1, max_length=120)
+    body: str = Field(min_length=1, max_length=4000)
+    kind: AnnouncementKind = AnnouncementKind.INFO
+    priority: AnnouncementPriority = AnnouncementPriority.NORMAL
+    status: AnnouncementStatus = AnnouncementStatus.DRAFT
+    dismissible: bool = True
+    starts_at: datetime | None = None
+    ends_at: datetime | None = None
+    target: AnnouncementTargetInput = Field(default_factory=AnnouncementTargetInput)
+
+    @field_validator("title", "body")
+    @classmethod
+    def normalize_text(cls, value: str) -> str:
+        return str(value).strip()
+
+
+class UpdateAnnouncementRequest(BaseModel):
+    title: str | None = Field(default=None, min_length=1, max_length=120)
+    body: str | None = Field(default=None, min_length=1, max_length=4000)
+    kind: AnnouncementKind | None = None
+    priority: AnnouncementPriority | None = None
+    status: AnnouncementStatus | None = None
+    dismissible: bool | None = None
+    starts_at: datetime | None = None
+    ends_at: datetime | None = None
+    target: AnnouncementTargetInput | None = None
+
+    @field_validator("title", "body")
+    @classmethod
+    def normalize_optional_text(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        raw = str(value).strip()
+        return raw or None
+
+
+class DismissAnnouncementResponse(BaseModel):
+    success: bool = True
+    announcement_id: str

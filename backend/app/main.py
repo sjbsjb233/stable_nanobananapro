@@ -17,6 +17,7 @@ from starlette.middleware.cors import CORSMiddleware
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from .config import cors_allow_all_origins, ensure_data_dirs, get_cors_origins, settings
+from .announcement_store import announcement_store
 from .errors import api_error
 from .gemini_client import ReferenceImage
 from .job_manager import job_manager
@@ -35,13 +36,17 @@ from .logging_setup import get_logger, setup_logging
 from .provider_store import provider_store
 from .schemas import (
     ActiveJobsRequest,
+    AnnouncementItem,
+    AnnouncementListResponse,
     AddProviderBalanceRequest,
     BatchPreviewRequest,
     BatchMetaRequest,
     CreateJobRequest,
     CreateJobResponse,
+    CreateAnnouncementRequest,
     CreateUserRequest,
     DashboardSummaryRequest,
+    DismissAnnouncementResponse,
     ErrorCode,
     ErrorResponse,
     GoogleRemainingConfiguredResponse,
@@ -55,6 +60,7 @@ from .schemas import (
     RetryJobRequest,
     SetProviderBalanceRequest,
     TurnstileVerifyRequest,
+    UpdateAnnouncementRequest,
     UpdateProviderRequest,
     UpdateSystemPolicyRequest,
     UpdateUserRequest,
@@ -104,6 +110,7 @@ def _startup() -> None:
     ensure_data_dirs()
     user_store.ensure_initialized()
     provider_store.ensure_initialized()
+    announcement_store.ensure_initialized()
     recovered_jobs = job_manager.fail_incomplete_jobs_on_startup()
     logger.info(
         "Backend startup: version=%s deployed_at=%s data_dir=%s recovered_jobs=%s",
@@ -625,6 +632,19 @@ def _parse_admin_time_bound(value: str | None, *, end_of_day: bool = False) -> d
     return dt
 
 
+def _validate_announcement_time_window(starts_at: datetime | None, ends_at: datetime | None) -> None:
+    if starts_at is not None and starts_at.tzinfo is None:
+        local_tz = now_local().tzinfo
+        if local_tz is not None:
+            starts_at = starts_at.replace(tzinfo=local_tz)
+    if ends_at is not None and ends_at.tzinfo is None:
+        local_tz = now_local().tzinfo
+        if local_tz is not None:
+            ends_at = ends_at.replace(tzinfo=local_tz)
+    if starts_at is not None and ends_at is not None and ends_at <= starts_at:
+        raise api_error(ErrorCode.INVALID_INPUT, "Announcement ends_at must be later than starts_at", http_status=422)
+
+
 def _request_prompt_preview(job_id: str, max_len: int = 120) -> str:
     try:
         request_payload = storage.load_request(job_id)
@@ -798,6 +818,29 @@ async def logout(request: Request, _: dict[str, Any] = Depends(get_current_user)
 @app.get(f"{settings.api_prefix}/auth/me")
 async def auth_me(request: Request, current_user: dict[str, Any] = Depends(get_current_user)) -> dict[str, Any]:
     return _session_payload(request, current_user)
+
+
+@app.get(f"{settings.api_prefix}/announcements/active", response_model=AnnouncementListResponse)
+async def active_announcements(current_user: dict[str, Any] = Depends(get_current_user)) -> dict[str, Any]:
+    items = announcement_store.list_active_for_user(current_user)
+    return {
+        "server_time": now_local(),
+        "items": items,
+    }
+
+
+@app.post(
+    f"{settings.api_prefix}/announcements/{{announcement_id}}/dismiss",
+    response_model=DismissAnnouncementResponse,
+)
+async def dismiss_announcement(
+    announcement_id: str,
+    current_user: dict[str, Any] = Depends(get_current_user),
+) -> dict[str, Any]:
+    if str(current_user.get("role") or "").upper() == "ADMIN":
+        return {"success": True, "announcement_id": announcement_id}
+    announcement_store.dismiss_announcement(str(current_user.get("user_id") or ""), announcement_id)
+    return {"success": True, "announcement_id": announcement_id}
 
 
 @app.post(f"{settings.api_prefix}/auth/turnstile/generation")
@@ -1867,6 +1910,61 @@ def _admin_overview_payload() -> dict[str, Any]:
 @app.get(f"{settings.api_prefix}/admin/overview")
 async def admin_overview(_: dict[str, Any] = Depends(get_admin_user)) -> dict[str, Any]:
     return _admin_overview_payload()
+
+
+@app.get(f"{settings.api_prefix}/admin/announcements", response_model=AnnouncementListResponse)
+async def admin_announcements(_: dict[str, Any] = Depends(get_admin_user)) -> dict[str, Any]:
+    return {
+        "server_time": now_local(),
+        "items": announcement_store.list_announcements(),
+    }
+
+
+@app.post(
+    f"{settings.api_prefix}/admin/announcements",
+    response_model=AnnouncementItem,
+    status_code=status.HTTP_201_CREATED,
+)
+async def admin_create_announcement(
+    payload: CreateAnnouncementRequest,
+    current_user: dict[str, Any] = Depends(get_admin_user),
+) -> dict[str, Any]:
+    _validate_announcement_time_window(payload.starts_at, payload.ends_at)
+    return announcement_store.create_announcement(payload.model_dump(mode="json"), current_user)
+
+
+@app.patch(
+    f"{settings.api_prefix}/admin/announcements/{{announcement_id}}",
+    response_model=AnnouncementItem,
+)
+async def admin_update_announcement(
+    announcement_id: str,
+    payload: UpdateAnnouncementRequest,
+    _: dict[str, Any] = Depends(get_admin_user),
+) -> dict[str, Any]:
+    patch = payload.model_dump(exclude_unset=True, mode="json")
+    existing = announcement_store.get_announcement(announcement_id)
+    if existing is None:
+        raise api_error(ErrorCode.INVALID_INPUT, "Announcement not found", http_status=404)
+    _validate_announcement_time_window(
+        _parse_iso(patch.get("starts_at")) if "starts_at" in patch else _parse_iso(existing.get("starts_at")),
+        _parse_iso(patch.get("ends_at")) if "ends_at" in patch else _parse_iso(existing.get("ends_at")),
+    )
+    updated = announcement_store.update_announcement(announcement_id, patch)
+    if updated is None:
+        raise api_error(ErrorCode.INVALID_INPUT, "Announcement not found", http_status=404)
+    return updated
+
+
+@app.delete(f"{settings.api_prefix}/admin/announcements/{{announcement_id}}")
+async def admin_delete_announcement(
+    announcement_id: str,
+    _: dict[str, Any] = Depends(get_admin_user),
+) -> dict[str, Any]:
+    deleted = announcement_store.delete_announcement(announcement_id)
+    if not deleted:
+        raise api_error(ErrorCode.INVALID_INPUT, "Announcement not found", http_status=404)
+    return {"deleted": True, "announcement_id": announcement_id}
 
 
 @app.get(f"{settings.api_prefix}/admin/users")

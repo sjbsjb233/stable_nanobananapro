@@ -452,6 +452,64 @@ type AuthSession = {
   generation_turnstile_verified_until?: string | null;
 };
 
+type AnnouncementKind = "INFO" | "UPDATE" | "MAINTENANCE" | "PROMO" | "TIP" | "WARNING";
+
+type AnnouncementPriority = "LOW" | "NORMAL" | "HIGH";
+
+type AnnouncementStatus = "DRAFT" | "ACTIVE" | "PAUSED" | "EXPIRED";
+
+type AnnouncementTarget = {
+  roles: UserRole[];
+  enabled_only: boolean;
+  user_ids: string[];
+  exclude_user_ids: string[];
+};
+
+type AnnouncementItem = {
+  announcement_id: string;
+  title: string;
+  body: string;
+  kind: AnnouncementKind;
+  priority: AnnouncementPriority;
+  status: AnnouncementStatus;
+  dismissible: boolean;
+  starts_at?: string | null;
+  ends_at?: string | null;
+  target: AnnouncementTarget;
+  created_at: string;
+  updated_at: string;
+  created_by_user_id: string;
+  created_by_username: string;
+  dismissed_count: number;
+};
+
+type AnnouncementListResponse = {
+  server_time: string;
+  items: AnnouncementItem[];
+};
+
+type AnnouncementUpsertPayload = {
+  title: string;
+  body: string;
+  kind: AnnouncementKind;
+  priority: AnnouncementPriority;
+  status: AnnouncementStatus;
+  dismissible: boolean;
+  starts_at: string | null;
+  ends_at: string | null;
+  target: AnnouncementTarget;
+};
+
+type AnnouncementModalState = {
+  open: boolean;
+  items: AnnouncementItem[];
+};
+
+type AnnouncementDismissPayload = {
+  success: boolean;
+  announcement_id: string;
+};
+
 type SystemPolicy = {
   default_user_daily_image_limit: number;
   default_user_extra_daily_image_limit: number;
@@ -1723,6 +1781,113 @@ function getApiErrorMessage(error: any, fallback: string) {
   const validationMessage = formatValidationIssues(error?.error?.details);
   if (validationMessage) return validationMessage;
   return error?.error?.message || fallback;
+}
+
+type AnnouncementDraft = {
+  title: string;
+  body: string;
+  kind: AnnouncementKind;
+  priority: AnnouncementPriority;
+  status: AnnouncementStatus;
+  dismissible: boolean;
+  starts_at: string;
+  ends_at: string;
+  roles_mode: "USER" | "ALL";
+  enabled_only: boolean;
+  user_ids_text: string;
+  exclude_user_ids_text: string;
+};
+
+function splitCommaSeparatedIds(value: string) {
+  return Array.from(
+    new Set(
+      value
+        .split(",")
+        .map((item) => item.trim())
+        .filter(Boolean)
+    )
+  );
+}
+
+function emptyAnnouncementDraft(): AnnouncementDraft {
+  return {
+    title: "",
+    body: "",
+    kind: "INFO",
+    priority: "NORMAL",
+    status: "DRAFT",
+    dismissible: true,
+    starts_at: "",
+    ends_at: "",
+    roles_mode: "USER",
+    enabled_only: true,
+    user_ids_text: "",
+    exclude_user_ids_text: "",
+  };
+}
+
+function announcementDraftFromItem(item: AnnouncementItem): AnnouncementDraft {
+  return {
+    title: item.title || "",
+    body: item.body || "",
+    kind: item.kind || "INFO",
+    priority: item.priority || "NORMAL",
+    status: item.status || "DRAFT",
+    dismissible: item.dismissible !== false,
+    starts_at: (item.starts_at || "").slice(0, 16),
+    ends_at: (item.ends_at || "").slice(0, 16),
+    roles_mode: item.target?.roles?.includes("ADMIN") ? "ALL" : "USER",
+    enabled_only: item.target?.enabled_only !== false,
+    user_ids_text: (item.target?.user_ids || []).join(", "),
+    exclude_user_ids_text: (item.target?.exclude_user_ids || []).join(", "),
+  };
+}
+
+function announcementDraftToPayload(draft: AnnouncementDraft): AnnouncementUpsertPayload {
+  return {
+    title: draft.title.trim(),
+    body: draft.body.trim(),
+    kind: draft.kind,
+    priority: draft.priority,
+    status: draft.status,
+    dismissible: draft.dismissible,
+    starts_at: draft.starts_at || null,
+    ends_at: draft.ends_at || null,
+    target: {
+      roles: draft.roles_mode === "ALL" ? (["USER", "ADMIN"] as UserRole[]) : (["USER"] as UserRole[]),
+      enabled_only: draft.enabled_only,
+      user_ids: splitCommaSeparatedIds(draft.user_ids_text),
+      exclude_user_ids: splitCommaSeparatedIds(draft.exclude_user_ids_text),
+    },
+  };
+}
+
+function announcementKindMeta(kind: AnnouncementKind) {
+  switch (kind) {
+    case "UPDATE":
+      return { label: "更新", chip: "bg-sky-100 text-sky-700 dark:bg-sky-500/15 dark:text-sky-200" };
+    case "MAINTENANCE":
+      return { label: "维护", chip: "bg-amber-100 text-amber-700 dark:bg-amber-500/15 dark:text-amber-200" };
+    case "PROMO":
+      return { label: "活动", chip: "bg-emerald-100 text-emerald-700 dark:bg-emerald-500/15 dark:text-emerald-200" };
+    case "TIP":
+      return { label: "提示", chip: "bg-violet-100 text-violet-700 dark:bg-violet-500/15 dark:text-violet-200" };
+    case "WARNING":
+      return { label: "提醒", chip: "bg-rose-100 text-rose-700 dark:bg-rose-500/15 dark:text-rose-200" };
+    default:
+      return { label: "公告", chip: "bg-zinc-100 text-zinc-700 dark:bg-zinc-800 dark:text-zinc-200" };
+  }
+}
+
+function announcementPriorityMeta(priority: AnnouncementPriority) {
+  switch (priority) {
+    case "HIGH":
+      return { label: "高优先级", chip: "bg-rose-600 text-white" };
+    case "LOW":
+      return { label: "低优先级", chip: "bg-zinc-200 text-zinc-700 dark:bg-zinc-800 dark:text-zinc-200" };
+    default:
+      return { label: "普通优先级", chip: "bg-sky-600 text-white" };
+  }
 }
 
 // concurrency-limited map
@@ -3191,6 +3356,157 @@ function ToastProvider({ children }: { children: React.ReactNode }) {
   );
 }
 
+function AnnouncementAutoModal() {
+  const client = useApiClient();
+  const { user, isAdmin } = useAuthSession();
+  const [modalState, setModalState] = useState<AnnouncementModalState>({ open: false, items: [] });
+  const [dismissingIds, setDismissingIds] = useState<Record<string, boolean>>({});
+
+  useEffect(() => {
+    if (!user || isAdmin) {
+      setModalState({ open: false, items: [] });
+      setDismissingIds({});
+      return;
+    }
+
+    let stopped = false;
+    let intervalId: number | null = null;
+
+    const load = async () => {
+      try {
+        const payload = await client.listActiveAnnouncements();
+        if (stopped) return;
+        const items = Array.isArray(payload?.items) ? payload.items : [];
+        setModalState({
+          open: items.length > 0,
+          items,
+        });
+      } catch (error: any) {
+        if (stopped) return;
+        logWarn("announcement", "active announcement fetch failed", {
+          user_id: user.user_id,
+          message: error?.error?.message || error?.message || "request failed",
+        });
+      }
+    };
+
+    load();
+    intervalId = window.setInterval(load, 60_000);
+
+    return () => {
+      stopped = true;
+      if (intervalId != null) window.clearInterval(intervalId);
+    };
+  }, [client, isAdmin, user?.user_id]);
+
+  const dismissAnnouncement = async (announcementId: string) => {
+    if (!announcementId || dismissingIds[announcementId]) return;
+    setDismissingIds((current) => ({ ...current, [announcementId]: true }));
+    try {
+      await client.dismissAnnouncement(announcementId);
+      setModalState((current) => {
+        const items = current.items.filter((item) => item.announcement_id !== announcementId);
+        return {
+          open: items.length > 0,
+          items,
+        };
+      });
+    } catch (error: any) {
+      logWarn("announcement", "dismiss announcement failed", {
+        announcement_id: announcementId,
+        message: error?.error?.message || error?.message || "request failed",
+      });
+    } finally {
+      setDismissingIds((current) => {
+        const next = { ...current };
+        delete next[announcementId];
+        return next;
+      });
+    }
+  };
+
+  if (!modalState.open || !modalState.items.length || !user || isAdmin) return null;
+
+  return (
+    <div className="fixed inset-0 z-[70] flex items-center justify-center bg-zinc-950/38 px-4 py-6 backdrop-blur-[2px]">
+      <div
+        className="w-full max-w-3xl rounded-[28px] border border-zinc-200 bg-[linear-gradient(180deg,rgba(255,255,255,0.98),rgba(244,244,245,0.96))] p-5 shadow-[0_28px_100px_rgba(15,23,42,0.3)] dark:border-white/10 dark:bg-[linear-gradient(180deg,rgba(24,24,27,0.96),rgba(9,9,11,0.94))]"
+        role="dialog"
+        aria-modal="true"
+        aria-label="Announcements"
+      >
+        <div className="flex flex-wrap items-start justify-between gap-3">
+          <div>
+            <div className="text-xs font-semibold uppercase tracking-[0.2em] text-zinc-500 dark:text-zinc-400">Broadcast</div>
+            <div className="mt-1 text-2xl font-black text-zinc-950 dark:text-white">系统广播</div>
+            <div className="mt-2 text-sm text-zinc-600 dark:text-zinc-300">
+              当前账号有 {modalState.items.length} 条有效广播。关闭后，这条广播后续不会再次弹出。
+            </div>
+          </div>
+          <div className="rounded-full border border-zinc-200 bg-white px-3 py-1 text-xs font-semibold text-zinc-600 dark:border-white/10 dark:bg-zinc-950/40 dark:text-zinc-300">
+            自动同步
+          </div>
+        </div>
+
+        <div className="mt-4 max-h-[68vh] space-y-3 overflow-y-auto pr-1">
+          {modalState.items.map((item) => {
+            const kindMeta = announcementKindMeta(item.kind);
+            const priorityMeta = announcementPriorityMeta(item.priority);
+            return (
+              <div
+                key={item.announcement_id}
+                className={cn(
+                  "rounded-[24px] border p-4 shadow-sm",
+                  item.priority === "HIGH"
+                    ? "border-rose-200 bg-rose-50/90 dark:border-rose-500/30 dark:bg-rose-950/20"
+                    : "border-zinc-200 bg-white/80 dark:border-white/10 dark:bg-zinc-950/35"
+                )}
+              >
+                <div className="flex flex-wrap items-start justify-between gap-3">
+                  <div className="min-w-0 flex-1">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className={cn("rounded-full px-2.5 py-1 text-[11px] font-semibold", kindMeta.chip)}>{kindMeta.label}</span>
+                      <span className={cn("rounded-full px-2.5 py-1 text-[11px] font-semibold", priorityMeta.chip)}>{priorityMeta.label}</span>
+                      <span className="rounded-full border border-zinc-200 px-2.5 py-1 text-[11px] font-semibold text-zinc-500 dark:border-white/10 dark:text-zinc-300">
+                        生效：{formatLocal(item.starts_at || item.created_at)}
+                      </span>
+                      {item.ends_at ? (
+                        <span className="rounded-full border border-zinc-200 px-2.5 py-1 text-[11px] font-semibold text-zinc-500 dark:border-white/10 dark:text-zinc-300">
+                          截止：{formatLocal(item.ends_at)}
+                        </span>
+                      ) : null}
+                    </div>
+                    <div className="mt-3 text-lg font-bold text-zinc-950 dark:text-white">{item.title}</div>
+                    <div className="mt-2 whitespace-pre-wrap text-sm leading-6 text-zinc-700 dark:text-zinc-200">{item.body}</div>
+                    <div className="mt-3 text-[11px] text-zinc-500 dark:text-zinc-400">
+                      发布者：{item.created_by_username || "-"} · 更新时间：{formatLocal(item.updated_at)}
+                    </div>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    {item.dismissible ? (
+                      <Button
+                        variant="secondary"
+                        onClick={() => dismissAnnouncement(item.announcement_id)}
+                        disabled={dismissingIds[item.announcement_id]}
+                      >
+                        {dismissingIds[item.announcement_id] ? "关闭中…" : "关闭"}
+                      </Button>
+                    ) : (
+                      <span className="rounded-full border border-amber-200 bg-amber-50 px-3 py-1 text-[11px] font-semibold text-amber-700 dark:border-amber-500/30 dark:bg-amber-950/20 dark:text-amber-200">
+                        不可关闭
+                      </span>
+                    )}
+                  </div>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // -----------------------------
 // API client
 // -----------------------------
@@ -3508,9 +3824,49 @@ class ApiClient {
     });
   }
 
+  listActiveAnnouncements(signal?: AbortSignal) {
+    return this.request<AnnouncementListResponse>("/announcements/active", { method: "GET", signal });
+  }
+
+  dismissAnnouncement(announcementId: string, signal?: AbortSignal) {
+    return this.request<AnnouncementDismissPayload>(`/announcements/${encodeURIComponent(announcementId)}/dismiss`, {
+      method: "POST",
+      signal,
+    });
+  }
+
   // Admin
   adminOverview(signal?: AbortSignal) {
     return this.request<AdminOverviewResponse>("/admin/overview", { method: "GET", signal });
+  }
+
+  adminListAnnouncements(signal?: AbortSignal) {
+    return this.request<AnnouncementListResponse>("/admin/announcements", { method: "GET", signal });
+  }
+
+  adminCreateAnnouncement(payload: AnnouncementUpsertPayload, signal?: AbortSignal) {
+    return this.request<AnnouncementItem>("/admin/announcements", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+      signal,
+    });
+  }
+
+  adminUpdateAnnouncement(announcementId: string, payload: Partial<AnnouncementUpsertPayload>, signal?: AbortSignal) {
+    return this.request<AnnouncementItem>(`/admin/announcements/${encodeURIComponent(announcementId)}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+      signal,
+    });
+  }
+
+  adminDeleteAnnouncement(announcementId: string, signal?: AbortSignal) {
+    return this.request<{ deleted: boolean; announcement_id: string }>(`/admin/announcements/${encodeURIComponent(announcementId)}`, {
+      method: "DELETE",
+      signal,
+    });
   }
 
   adminProviders(signal?: AbortSignal) {
@@ -6085,6 +6441,14 @@ function AdminPageLegacy() {
   const [providerAddBalanceDrafts, setProviderAddBalanceDrafts] = useState<Record<string, string>>({});
   const [savingProviderId, setSavingProviderId] = useState<string | null>(null);
   const [savingProviderBalanceId, setSavingProviderBalanceId] = useState<string | null>(null);
+  const [announcements, setAnnouncements] = useState<AnnouncementItem[]>([]);
+  const [announcementStatusFilter, setAnnouncementStatusFilter] = useState<AnnouncementStatus | "ALL">("ALL");
+  const [announcementKindFilter, setAnnouncementKindFilter] = useState<AnnouncementKind | "ALL">("ALL");
+  const [selectedAnnouncementId, setSelectedAnnouncementId] = useState<string | null>(null);
+  const [announcementEditorMode, setAnnouncementEditorMode] = useState<"create" | "edit">("create");
+  const [announcementDraft, setAnnouncementDraft] = useState<AnnouncementDraft>(emptyAnnouncementDraft());
+  const [savingAnnouncement, setSavingAnnouncement] = useState(false);
+  const [deletingAnnouncementId, setDeletingAnnouncementId] = useState<string | null>(null);
 
   const [policyDraft, setPolicyDraft] = useState<SystemPolicy | null>(null);
   const [savingPolicy, setSavingPolicy] = useState(false);
@@ -6750,6 +7114,14 @@ function AdminPage() {
   const [providerAddBalanceDrafts, setProviderAddBalanceDrafts] = useState<Record<string, string>>({});
   const [savingProviderId, setSavingProviderId] = useState<string | null>(null);
   const [savingProviderBalanceId, setSavingProviderBalanceId] = useState<string | null>(null);
+  const [announcements, setAnnouncements] = useState<AnnouncementItem[]>([]);
+  const [announcementStatusFilter, setAnnouncementStatusFilter] = useState<AnnouncementStatus | "ALL">("ALL");
+  const [announcementKindFilter, setAnnouncementKindFilter] = useState<AnnouncementKind | "ALL">("ALL");
+  const [selectedAnnouncementId, setSelectedAnnouncementId] = useState<string | null>(null);
+  const [announcementEditorMode, setAnnouncementEditorMode] = useState<"create" | "edit">("create");
+  const [announcementDraft, setAnnouncementDraft] = useState<AnnouncementDraft>(emptyAnnouncementDraft());
+  const [savingAnnouncement, setSavingAnnouncement] = useState(false);
+  const [deletingAnnouncementId, setDeletingAnnouncementId] = useState<string | null>(null);
 
   const [policyDraft, setPolicyDraft] = useState<SystemPolicy | null>(null);
   const [savingPolicy, setSavingPolicy] = useState(false);
@@ -6859,7 +7231,11 @@ function AdminPage() {
     if (!silent) setLoading(true);
     setRefreshing(true);
     try {
-      const [overviewPayload, usersPayload] = await Promise.all([client.adminOverview(), client.adminUsers()]);
+      const [overviewPayload, usersPayload, announcementsPayload] = await Promise.all([
+        client.adminOverview(),
+        client.adminUsers(),
+        client.adminListAnnouncements(),
+      ]);
       setOverview(overviewPayload);
       setPolicyDraft(overviewPayload.policy);
       const providerItems = overviewPayload.providers?.providers || [];
@@ -6871,6 +7247,8 @@ function AdminPage() {
       setProviderAddBalanceDrafts((prev) => Object.fromEntries(providerItems.map((item) => [item.provider_id, prev[item.provider_id] || ""])));
       setUsers(usersPayload.users || []);
       setSelectedUserId((current) => current || usersPayload.users?.[0]?.user_id || null);
+      setAnnouncements(announcementsPayload.items || []);
+      setSelectedAnnouncementId((current) => current || announcementsPayload.items?.[0]?.announcement_id || null);
     } catch (e: any) {
       push({ kind: "error", title: "Admin 数据加载失败", message: e?.error?.message || "请检查后端状态" });
     } finally {
@@ -7090,6 +7468,57 @@ function AdminPage() {
     }
   };
 
+  const startNewAnnouncement = () => {
+    setAnnouncementEditorMode("create");
+    setSelectedAnnouncementId(null);
+    setAnnouncementDraft(emptyAnnouncementDraft());
+  };
+
+  const saveAnnouncement = async () => {
+    const payload = announcementDraftToPayload(announcementDraft);
+    if (!payload.title || !payload.body) {
+      push({ kind: "error", title: "广播保存失败", message: "标题和内容不能为空" });
+      return;
+    }
+    if (payload.starts_at && payload.ends_at && new Date(payload.ends_at).getTime() <= new Date(payload.starts_at).getTime()) {
+      push({ kind: "error", title: "广播保存失败", message: "结束时间必须晚于开始时间" });
+      return;
+    }
+    setSavingAnnouncement(true);
+    try {
+      const saved = selectedAnnouncement
+        ? await client.adminUpdateAnnouncement(selectedAnnouncement.announcement_id, payload)
+        : await client.adminCreateAnnouncement(payload);
+      await loadAdminData({ silent: true });
+      setAnnouncementEditorMode("edit");
+      setSelectedAnnouncementId(saved.announcement_id);
+      push({ kind: "success", title: selectedAnnouncement ? "广播已更新" : "广播已创建" });
+    } catch (e: any) {
+      push({ kind: "error", title: "广播保存失败", message: getApiErrorMessage(e, "请检查输入") });
+    } finally {
+      setSavingAnnouncement(false);
+    }
+  };
+
+  const deleteAnnouncement = async (announcementId: string) => {
+    if (!confirm("删除这条广播后，用户端下次轮询将不再显示。是否继续？")) return;
+    setDeletingAnnouncementId(announcementId);
+    try {
+      await client.adminDeleteAnnouncement(announcementId);
+      await loadAdminData({ silent: true });
+      if (selectedAnnouncementId === announcementId) {
+        setAnnouncementEditorMode("create");
+        setSelectedAnnouncementId(null);
+        setAnnouncementDraft(emptyAnnouncementDraft());
+      }
+      push({ kind: "success", title: "广播已删除" });
+    } catch (e: any) {
+      push({ kind: "error", title: "广播删除失败", message: getApiErrorMessage(e, "请稍后重试") });
+    } finally {
+      setDeletingAnnouncementId(null);
+    }
+  };
+
   const loadSelectedUserTasks = async ({ cursor = null, append = false }: { cursor?: string | null; append?: boolean } = {}) => {
     if (!selectedUser) {
       setTaskItems([]);
@@ -7167,6 +7596,33 @@ function AdminPage() {
         { key: "daily_image_access_hard_limit" as const, label: "图片访问硬上限", value: selectedUser.policy.daily_image_access_hard_limit ?? "默认/无限制" },
       ]
     : [];
+  const filteredAnnouncements = useMemo(() => {
+    return announcements.filter((item) => {
+      if (announcementStatusFilter !== "ALL" && item.status !== announcementStatusFilter) return false;
+      if (announcementKindFilter !== "ALL" && item.kind !== announcementKindFilter) return false;
+      return true;
+    });
+  }, [announcementKindFilter, announcementStatusFilter, announcements]);
+  const selectedAnnouncement = useMemo(
+    () => announcements.find((item) => item.announcement_id === selectedAnnouncementId) || null,
+    [announcements, selectedAnnouncementId]
+  );
+
+  useEffect(() => {
+    if (selectedAnnouncement && announcementEditorMode === "edit") {
+      setAnnouncementDraft(announcementDraftFromItem(selectedAnnouncement));
+      return;
+    }
+    setAnnouncementDraft(emptyAnnouncementDraft());
+  }, [announcementEditorMode, selectedAnnouncement]);
+
+  useEffect(() => {
+    if (announcementEditorMode === "create") return;
+    if (selectedAnnouncementId && filteredAnnouncements.some((item) => item.announcement_id === selectedAnnouncementId)) return;
+    const fallbackId = filteredAnnouncements[0]?.announcement_id || null;
+    setSelectedAnnouncementId(fallbackId);
+    setAnnouncementEditorMode(fallbackId ? "edit" : "create");
+  }, [announcementEditorMode, filteredAnnouncements, selectedAnnouncementId]);
 
   return (
     <PageContainer className="max-w-[1900px] px-5 2xl:px-8">
@@ -7561,6 +8017,221 @@ function AdminPage() {
                 </div>
               </div>
             )) : <EmptyHint text="暂无 provider 配置" />}
+          </div>
+        </Card>
+      </div>
+
+      <div className="mt-4 grid grid-cols-1 gap-4 xl:grid-cols-[0.92fr_1.08fr]">
+        <Card hover={false}>
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <div className="text-sm font-bold text-zinc-900 dark:text-zinc-50">广播列表</div>
+              <div className="text-xs text-zinc-600 dark:text-zinc-300">这里只管理自动弹出的用户广播，不提供用户侧常驻入口。</div>
+            </div>
+            <Button variant="primary" onClick={startNewAnnouncement}>新建广播</Button>
+          </div>
+
+          <div className="mt-4 grid grid-cols-1 gap-3 md:grid-cols-2">
+            <Field label="状态">
+              <Select
+                value={announcementStatusFilter}
+                onChange={(value) => setAnnouncementStatusFilter(value as AnnouncementStatus | "ALL")}
+                options={[
+                  { value: "ALL", label: "全部状态" },
+                  { value: "DRAFT", label: "DRAFT" },
+                  { value: "ACTIVE", label: "ACTIVE" },
+                  { value: "PAUSED", label: "PAUSED" },
+                  { value: "EXPIRED", label: "EXPIRED" },
+                ]}
+              />
+            </Field>
+            <Field label="类型">
+              <Select
+                value={announcementKindFilter}
+                onChange={(value) => setAnnouncementKindFilter(value as AnnouncementKind | "ALL")}
+                options={[
+                  { value: "ALL", label: "全部类型" },
+                  { value: "INFO", label: "INFO" },
+                  { value: "UPDATE", label: "UPDATE" },
+                  { value: "MAINTENANCE", label: "MAINTENANCE" },
+                  { value: "PROMO", label: "PROMO" },
+                  { value: "TIP", label: "TIP" },
+                  { value: "WARNING", label: "WARNING" },
+                ]}
+              />
+            </Field>
+          </div>
+
+          <div className="mt-4 space-y-2">
+            {filteredAnnouncements.length ? filteredAnnouncements.map((item) => {
+              const kindMeta = announcementKindMeta(item.kind);
+              const priorityMeta = announcementPriorityMeta(item.priority);
+              const active = item.announcement_id === selectedAnnouncementId;
+              return (
+                <button
+                  key={item.announcement_id}
+                  type="button"
+                  onClick={() => {
+                    setAnnouncementEditorMode("edit");
+                    setSelectedAnnouncementId(item.announcement_id);
+                  }}
+                  className={cn(
+                    "w-full rounded-2xl border p-3 text-left transition",
+                    active
+                      ? "border-zinc-900 bg-zinc-900 text-white dark:border-white dark:bg-white dark:text-zinc-900"
+                      : "border-zinc-200 bg-white/70 hover:border-zinc-400 dark:border-white/10 dark:bg-zinc-950/30"
+                  )}
+                >
+                  <div className="flex items-start justify-between gap-3">
+                    <div className="min-w-0 flex-1">
+                      <div className="truncate text-sm font-bold">{item.title}</div>
+                      <div className={cn("mt-1 text-[11px]", active ? "text-white/80 dark:text-zinc-700" : "text-zinc-500 dark:text-zinc-400")}>
+                        {item.announcement_id.slice(0, 8)} · {formatLocal(item.updated_at)}
+                      </div>
+                    </div>
+                    <div className={cn("text-right text-[11px]", active ? "text-white/80 dark:text-zinc-700" : "text-zinc-500 dark:text-zinc-400")}>
+                      <div>{item.dismissed_count} 已关闭</div>
+                      <div>{item.target?.user_ids?.length ? "定向" : "普通投放"}</div>
+                    </div>
+                  </div>
+                  <div className="mt-2 flex flex-wrap gap-2">
+                    <span className={cn("rounded-full px-2 py-0.5 text-[10px] font-semibold", kindMeta.chip)}>{kindMeta.label}</span>
+                    <span className={cn("rounded-full px-2 py-0.5 text-[10px] font-semibold", priorityMeta.chip)}>{priorityMeta.label}</span>
+                    <span className={cn("rounded-full px-2 py-0.5 text-[10px] font-semibold", active ? "bg-white/15 text-white dark:bg-zinc-900/10 dark:text-zinc-900" : "bg-zinc-100 text-zinc-700 dark:bg-zinc-800 dark:text-zinc-200")}>
+                      {item.status}
+                    </span>
+                  </div>
+                </button>
+              );
+            }) : <EmptyHint text="当前筛选条件下没有广播" />}
+          </div>
+        </Card>
+
+        <Card hover={false}>
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <div className="text-sm font-bold text-zinc-900 dark:text-zinc-50">{selectedAnnouncement ? "编辑广播" : "新建广播"}</div>
+              <div className="text-xs text-zinc-600 dark:text-zinc-300">所有广播都只会在用户有命中内容时自动弹出中央窗口。</div>
+            </div>
+            <div className="flex items-center gap-2">
+              {selectedAnnouncement ? (
+                <Button
+                  variant="danger"
+                  onClick={() => deleteAnnouncement(selectedAnnouncement.announcement_id)}
+                  disabled={deletingAnnouncementId === selectedAnnouncement.announcement_id}
+                >
+                  {deletingAnnouncementId === selectedAnnouncement.announcement_id ? "删除中…" : "删除广播"}
+                </Button>
+              ) : null}
+              <Button variant="secondary" onClick={startNewAnnouncement}>清空表单</Button>
+              <Button variant="primary" onClick={saveAnnouncement} disabled={savingAnnouncement}>{savingAnnouncement ? "保存中…" : "保存广播"}</Button>
+            </div>
+          </div>
+
+          <div className="mt-4 grid grid-cols-1 gap-4 md:grid-cols-2">
+            <Field label="标题">
+              <Input value={announcementDraft.title} onChange={(value) => setAnnouncementDraft((current) => ({ ...current, title: value }))} placeholder="例如：本周维护安排" />
+            </Field>
+            <Field label="类型">
+              <Select
+                value={announcementDraft.kind}
+                onChange={(value) => setAnnouncementDraft((current) => ({ ...current, kind: value as AnnouncementKind }))}
+                options={[
+                  { value: "INFO", label: "INFO" },
+                  { value: "UPDATE", label: "UPDATE" },
+                  { value: "MAINTENANCE", label: "MAINTENANCE" },
+                  { value: "PROMO", label: "PROMO" },
+                  { value: "TIP", label: "TIP" },
+                  { value: "WARNING", label: "WARNING" },
+                ]}
+              />
+            </Field>
+            <Field label="优先级">
+              <Select
+                value={announcementDraft.priority}
+                onChange={(value) => setAnnouncementDraft((current) => ({ ...current, priority: value as AnnouncementPriority }))}
+                options={[
+                  { value: "LOW", label: "LOW" },
+                  { value: "NORMAL", label: "NORMAL" },
+                  { value: "HIGH", label: "HIGH" },
+                ]}
+              />
+            </Field>
+            <Field label="状态">
+              <Select
+                value={announcementDraft.status}
+                onChange={(value) => setAnnouncementDraft((current) => ({ ...current, status: value as AnnouncementStatus }))}
+                options={[
+                  { value: "DRAFT", label: "DRAFT" },
+                  { value: "ACTIVE", label: "ACTIVE" },
+                  { value: "PAUSED", label: "PAUSED" },
+                  { value: "EXPIRED", label: "EXPIRED" },
+                ]}
+              />
+            </Field>
+            <Field label="开始时间">
+              <Input value={announcementDraft.starts_at} onChange={(value) => setAnnouncementDraft((current) => ({ ...current, starts_at: value }))} type="datetime-local" />
+            </Field>
+            <Field label="结束时间">
+              <Input value={announcementDraft.ends_at} onChange={(value) => setAnnouncementDraft((current) => ({ ...current, ends_at: value }))} type="datetime-local" />
+            </Field>
+          </div>
+
+          <div className="mt-4 grid grid-cols-1 gap-4 xl:grid-cols-[1.2fr_0.8fr]">
+            <Field label="内容">
+              <TextArea
+                value={announcementDraft.body}
+                onChange={(value) => setAnnouncementDraft((current) => ({ ...current, body: value }))}
+                rows={10}
+                placeholder="支持纯文本和换行。用户关闭后，这条广播不会再次弹出。"
+              />
+            </Field>
+
+            <div className="space-y-4">
+              <div className="rounded-2xl border border-zinc-200 bg-zinc-50/80 p-4 dark:border-white/10 dark:bg-zinc-950/30">
+                <div className="text-sm font-semibold text-zinc-900 dark:text-zinc-50">投放范围</div>
+                <div className="mt-3 space-y-3">
+                  <Field label="roles">
+                    <Select
+                      value={announcementDraft.roles_mode}
+                      onChange={(value) => setAnnouncementDraft((current) => ({ ...current, roles_mode: value as "USER" | "ALL" }))}
+                      options={[
+                        { value: "USER", label: "仅普通用户" },
+                        { value: "ALL", label: "角色字段含 ADMIN" },
+                      ]}
+                    />
+                  </Field>
+                  <Field label="enabled_only">
+                    <div className="flex h-[42px] items-center">
+                      <Switch value={announcementDraft.enabled_only} onChange={(value) => setAnnouncementDraft((current) => ({ ...current, enabled_only: value }))} />
+                    </div>
+                  </Field>
+                  <Field label="user_ids 白名单">
+                    <TextArea value={announcementDraft.user_ids_text} onChange={(value) => setAnnouncementDraft((current) => ({ ...current, user_ids_text: value }))} rows={3} placeholder="user_id1, user_id2" />
+                  </Field>
+                  <Field label="exclude_user_ids 黑名单">
+                    <TextArea value={announcementDraft.exclude_user_ids_text} onChange={(value) => setAnnouncementDraft((current) => ({ ...current, exclude_user_ids_text: value }))} rows={3} placeholder="user_id3, user_id4" />
+                  </Field>
+                </div>
+              </div>
+
+              <div className="rounded-2xl border border-zinc-200 bg-white/70 p-4 text-xs text-zinc-600 dark:border-white/10 dark:bg-zinc-950/30 dark:text-zinc-300">
+                <div className="font-semibold text-zinc-900 dark:text-zinc-50">行为说明</div>
+                <div className="mt-2 space-y-1">
+                  <div>管理员本人不会收到广播，即使 roles 包含 ADMIN。</div>
+                  <div>用户侧仅在有命中广播时自动弹出，不会有常驻入口。</div>
+                  <div>关闭状态按账号保存，跨浏览器/跨设备生效。</div>
+                  <div>删除、停用、过期后，用户侧下次轮询即不再显示。</div>
+                </div>
+                <div className="mt-3 flex items-center justify-between rounded-xl border border-zinc-200 bg-zinc-50 px-3 py-2 dark:border-white/10 dark:bg-zinc-950/40">
+                  <div>
+                    <div className="font-semibold text-zinc-900 dark:text-zinc-50">允许关闭</div>
+                    <div className="text-[11px] text-zinc-500 dark:text-zinc-400">建议保持开启，符合本功能“低打扰”定位。</div>
+                  </div>
+                  <Switch value={announcementDraft.dismissible} onChange={(value) => setAnnouncementDraft((current) => ({ ...current, dismissible: value }))} />
+                </div>
+              </div>
+            </div>
           </div>
         </Card>
       </div>
@@ -15222,6 +15893,7 @@ export default function App() {
                 <PickerSessionJobSync />
                 <FailedBatchSessionCleanup />
                 <PendingSessionDirectHydrator />
+                <AnnouncementAutoModal />
                 <TopNav />
                 <AnimatedRoutes />
                 <Footer />
