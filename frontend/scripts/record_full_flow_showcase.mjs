@@ -1,11 +1,10 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { chromium } from 'playwright';
+import { createStoredSettings, frontendDir, frontendPage, jobsDir } from './runtime.mjs';
 
-const root = path.resolve(process.cwd(), '..');
-const jobsDir = path.join(root, 'backend', 'data', 'jobs');
-const outDir = path.join(process.cwd(), 'videos');
-const tmpDir = path.join(process.cwd(), 'tmp');
+const outDir = path.join(frontendDir, 'videos');
+const tmpDir = path.join(frontendDir, 'tmp');
 fs.mkdirSync(outDir, { recursive: true });
 fs.mkdirSync(tmpDir, { recursive: true });
 
@@ -234,42 +233,20 @@ const selectSessionDropdown = async (index) => {
   }, index);
 };
 
-await context.addInitScript(({ jobsIn }) => {
-  localStorage.setItem('nbp_settings_v1', JSON.stringify({
-    baseUrl: 'http://127.0.0.1:8000',
-    defaultModel: 'gemini-3-pro-image-preview',
-    jobAuthMode: 'ID_ONLY',
-    adminModeEnabled: false,
-    adminKey: '',
-    defaultParams: {
-      aspect_ratio: '1:1',
-      image_size: '1K',
-      thinking_level: null,
-      temperature: 0.7,
-      timeout_sec: 120,
-      max_retries: 1,
-    },
-    defaultParamsByModel: {
-      'gemini-3-pro-image-preview': {
-        aspect_ratio: '1:1',
-        image_size: '1K',
-        thinking_level: null,
-        temperature: 0.7,
-        timeout_sec: 120,
-        max_retries: 1,
-      },
-    },
-    ui: { theme: 'dark', language: 'zh-CN', reduceMotion: false },
-    polling: { intervalMs: 1200, maxIntervalMs: 5000, concurrency: 4 },
-  }));
+const storedSettings = createStoredSettings({
+  ui: { reduceMotion: false },
+});
+
+await context.addInitScript(({ jobsIn, settingsIn }) => {
+  localStorage.setItem('nbp_settings_v1', JSON.stringify(settingsIn));
   localStorage.setItem('nbp_jobs_v1', JSON.stringify(jobsIn));
   localStorage.setItem('nbp_picker_sessions_v1', JSON.stringify([]));
   localStorage.setItem('nbp_picker_recent_v1', JSON.stringify({ last_session_id: '', last_opened_at: new Date().toISOString() }));
   localStorage.setItem('nbp_history_auto_refresh_pref_v1', JSON.stringify(false));
-}, { jobsIn: jobs.slice(0, 200) });
+}, { jobsIn: jobs.slice(0, 200), settingsIn: storedSettings });
 
 await runStep('进入 Create 页', async () => {
-  await page.goto('http://127.0.0.1:5173/create', { waitUntil: 'domcontentloaded' });
+  await page.goto(frontendPage('/create'), { waitUntil: 'domcontentloaded' });
   await page.waitForSelector('text=Create Job');
   await sleep(1200);
 });
@@ -345,7 +322,7 @@ await runStep('展示分页与平均耗时', async () => {
 
 await runStep('观察运行态进度条', async () => {
   if (createdJobId) {
-    await page.goto(`http://127.0.0.1:5173/history?job=${createdJobId}`, { waitUntil: 'domcontentloaded' });
+    await page.goto(frontendPage(`/history?job=${createdJobId}`), { waitUntil: 'domcontentloaded' });
     await page.waitForSelector('text=History');
     await sleep(700);
   }
@@ -363,7 +340,7 @@ await runStep('观察运行态进度条', async () => {
 
 const previewJob = importable[0];
 await runStep('切换到成功任务并展示预览图', async () => {
-  await page.goto(`http://127.0.0.1:5173/history?job=${previewJob.job_id}`, { waitUntil: 'domcontentloaded' });
+  await page.goto(frontendPage(`/history?job=${previewJob.job_id}`), { waitUntil: 'domcontentloaded' });
   await page.waitForSelector('text=结果预览');
   await sleep(1500);
   const copyBtn = page.getByRole('button', { name: '复制 image_id' });
@@ -379,7 +356,7 @@ await runStep('进入 Picker', async () => {
     await toPicker.first().click();
     await page.waitForURL(/\/picker/);
   } else {
-    await page.goto(`http://127.0.0.1:5173/picker?job=${previewJob.job_id}`, { waitUntil: 'domcontentloaded' });
+    await page.goto(frontendPage(`/picker?job=${previewJob.job_id}`), { waitUntil: 'domcontentloaded' });
   }
   await page.waitForSelector('text=Image Picker');
   await sleep(1500);
@@ -483,10 +460,10 @@ await runStep('全屏审阅功能演示', async () => {
 }, false);
 
 await runStep('返回 History 并进入 Dashboard', async () => {
-  await page.goto('http://127.0.0.1:5173/history', { waitUntil: 'domcontentloaded' });
+  await page.goto(frontendPage('/history'), { waitUntil: 'domcontentloaded' });
   await page.waitForSelector('text=History');
   await sleep(1100);
-  await page.goto('http://127.0.0.1:5173/', { waitUntil: 'domcontentloaded' });
+  await page.goto(frontendPage('/'), { waitUntil: 'domcontentloaded' });
   await page.waitForSelector('text=Dashboard');
   await sleep(2200);
 }, false);

@@ -1,10 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { chromium } from "playwright";
-
-const frontendDir = process.cwd();
-const repoDir = path.resolve(frontendDir, "..");
-const jobsDir = path.join(repoDir, "backend", "data", "jobs");
+import { createStoredSettings, frontendDir, frontendPage, jobsDir } from "./runtime.mjs";
 
 function safeReadJson(p, fallback = null) {
   try {
@@ -54,7 +51,7 @@ const jobRecords = jobDirs
 const running = jobRecords.find((j) => j.status_cache === "RUNNING" || j.status_cache === "QUEUED");
 const imageJobs = jobRecords.filter((j) => j.image_ids.length > 0);
 if (!imageJobs.length) {
-  throw new Error("No image jobs found in backend/data/jobs.");
+  throw new Error(`No image jobs found in ${jobsDir}.`);
 }
 
 const selectedForPicker = imageJobs.slice(0, Math.min(8, imageJobs.length));
@@ -93,41 +90,14 @@ const pickerSession = {
   focus_key: pickerItems[0] ? `${pickerItems[0].job_id}::${pickerItems[0].image_id}` : null,
 };
 
-const settings = {
-  baseUrl: "http://127.0.0.1:8000",
-  defaultModel: "gemini-3-pro-image-preview",
-  jobAuthMode: "ID_ONLY",
-  adminModeEnabled: false,
-  adminKey: "",
-  defaultParams: {
-    aspect_ratio: "1:1",
-    image_size: "1K",
-    thinking_level: null,
-    temperature: 0.7,
-    timeout_sec: 120,
-    max_retries: 1,
-  },
-  defaultParamsByModel: {
-    "gemini-3-pro-image-preview": {
-      aspect_ratio: "1:1",
-      image_size: "1K",
-      thinking_level: null,
-      temperature: 0.7,
-      timeout_sec: 120,
-      max_retries: 1,
-    },
-  },
+const settings = createStoredSettings({
   ui: {
-    theme: "dark",
-    language: "zh-CN",
     reduceMotion: false,
   },
   polling: {
-    intervalMs: 1200,
-    maxIntervalMs: 5000,
     concurrency: 5,
   },
-};
+});
 
 const localJobs = jobRecords.slice(0, 30).map((j) => ({
   job_id: j.job_id,
@@ -181,7 +151,7 @@ async function shot(name) {
   });
 }
 
-await page.goto(`http://127.0.0.1:5173/picker?session=${encodeURIComponent(sessionId)}`, { waitUntil: "networkidle" });
+await page.goto(frontendPage(`/picker?session=${encodeURIComponent(sessionId)}`), { waitUntil: "networkidle" });
 await page.waitForSelector("text=Image Picker", { timeout: 15000 });
 await shot("01-picker-two-up.png");
 
@@ -222,13 +192,13 @@ await page.evaluate(() => {
   s.jobAuthMode = "ID_ONLY";
   localStorage.setItem("nbp_settings_v1", JSON.stringify(s));
 });
-await page.goto("http://127.0.0.1:5173/history", { waitUntil: "networkidle" });
+await page.goto(frontendPage("/history"), { waitUntil: "networkidle" });
 await page.waitForSelector("text=History");
 await shot("06-history-auto-refresh-running.png");
 
-await page.goto("http://127.0.0.1:5173/history?job=" + encodeURIComponent(selectedForPicker[0].job_id), { waitUntil: "networkidle" });
+await page.goto(frontendPage(`/history?job=${encodeURIComponent(selectedForPicker[0].job_id)}`), { waitUntil: "networkidle" });
 await page.waitForSelector("text=任务操作");
 await shot("07-history-detail-picker-entry.png");
 
 await browser.close();
-console.log("Screenshots generated in frontend/screenshots/picker");
+console.log(`Screenshots generated in ${path.join(frontendDir, "screenshots", "picker")}`);

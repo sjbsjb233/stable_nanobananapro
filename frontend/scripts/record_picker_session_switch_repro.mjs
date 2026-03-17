@@ -1,8 +1,9 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { chromium } from 'playwright';
+import { createStoredSettings, frontendDir, frontendPage } from './runtime.mjs';
 
-const outDir = path.join(process.cwd(), 'videos');
+const outDir = path.join(frontendDir, 'videos');
 fs.mkdirSync(outDir, { recursive: true });
 
 let dialogCount = 0;
@@ -29,40 +30,16 @@ page.on('dialog', async (dialog) => {
   await dialog.accept(`切换测试会话-${dialogCount}`);
 });
 
-await context.addInitScript(() => {
-  localStorage.setItem('nbp_settings_v1', JSON.stringify({
-    baseUrl: 'http://127.0.0.1:8000',
-    defaultModel: 'gemini-3-pro-image-preview',
-    jobAuthMode: 'ID_ONLY',
-    adminModeEnabled: false,
-    adminKey: '',
-    defaultParams: {
-      aspect_ratio: '1:1',
-      image_size: '1K',
-      thinking_level: null,
-      temperature: 0.7,
-      timeout_sec: 120,
-      max_retries: 1,
-    },
-    defaultParamsByModel: {
-      'gemini-3-pro-image-preview': {
-        aspect_ratio: '1:1',
-        image_size: '1K',
-        thinking_level: null,
-        temperature: 0.7,
-        timeout_sec: 120,
-        max_retries: 1,
-      },
-    },
-    ui: { theme: 'dark', language: 'zh-CN', reduceMotion: true },
-    polling: { intervalMs: 1200, maxIntervalMs: 5000, concurrency: 4 },
-  }));
+const storedSettings = createStoredSettings();
+
+await context.addInitScript(({ settingsIn }) => {
+  localStorage.setItem('nbp_settings_v1', JSON.stringify(settingsIn));
   localStorage.setItem('nbp_jobs_v1', JSON.stringify([]));
   localStorage.setItem('nbp_picker_sessions_v1', JSON.stringify([]));
   localStorage.setItem('nbp_picker_recent_v1', JSON.stringify({ last_session_id: '', last_opened_at: new Date().toISOString() }));
-});
+}, { settingsIn: storedSettings });
 
-await page.goto('http://127.0.0.1:5173/picker', { waitUntil: 'networkidle' });
+await page.goto(frontendPage('/picker'), { waitUntil: 'networkidle' });
 await page.waitForSelector('text=Image Picker');
 await page.waitForTimeout(800);
 
