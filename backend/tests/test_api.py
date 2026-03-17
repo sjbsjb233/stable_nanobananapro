@@ -5,6 +5,7 @@ import io
 import json
 import threading
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -15,6 +16,7 @@ from app.config import settings
 from app.gemini_client import GeminiError, gemini_client
 from app.job_manager import job_manager
 from app.main import app
+from app.announcement_store import announcement_store
 from app.provider_store import provider_store
 from app.rate_limiter import InMemoryRateLimiter
 from app.storage import storage
@@ -24,6 +26,7 @@ from app.user_store import user_store
 PNG_1X1 = base64.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO7m6XQAAAAASUVORK5CYII="
 )
+UTC_PLUS_8 = timezone(timedelta(hours=8))
 
 
 def make_png(width: int = 2200, height: int = 1600, color: tuple[int, int, int] = (52, 120, 210)) -> bytes:
@@ -40,10 +43,23 @@ def make_webp(width: int = 1200, height: int = 900, color: tuple[int, int, int] 
     return out.getvalue()
 
 
+def iso_at(offset: timedelta) -> str:
+    return (datetime.now(UTC_PLUS_8) + offset).replace(microsecond=0).isoformat()
+
+
+def configured_cors_origin() -> str:
+    for middleware in app.user_middleware:
+        allow_origins = getattr(middleware, "kwargs", {}).get("allow_origins")
+        if allow_origins:
+            return allow_origins[0]
+    return "http://127.0.0.1:5173"
+
+
 @pytest.fixture
 def client(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> TestClient:
     monkeypatch.setattr(settings, "data_dir", tmp_path)
     monkeypatch.setattr(settings, "log_dir", tmp_path / "logs")
+    monkeypatch.setattr(settings, "cors_allow_origins", "http://127.0.0.1:5173,http://localhost:5173")
     monkeypatch.setattr(settings, "bootstrap_admin_username", "admin")
     monkeypatch.setattr(settings, "bootstrap_admin_password", "admin123456")
     monkeypatch.setattr(settings, "turnstile_secret_key", "test-secret")
@@ -56,6 +72,7 @@ def client(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> TestClient:
     storage.jobs_dir.mkdir(parents=True, exist_ok=True)
     user_store.path = tmp_path / "auth" / "users.json"
     provider_store.path = tmp_path / "providers.json"
+    announcement_store.path = tmp_path / "announcements.json"
     provider_store.reset_runtime_state()
 
     async def fake_turnstile(token: str, remote_ip: str | None = None):
@@ -156,13 +173,218 @@ def test_cors_preflight_allows_patch_for_admin_endpoints(client: TestClient) -> 
     resp = client.options(
         "/v1/admin/policy",
         headers={
-            "Origin": "http://127.0.0.1:5173",
+            "Origin": configured_cors_origin(),
             "Access-Control-Request-Method": "PATCH",
         },
     )
     assert resp.status_code == 200
     allow_methods = resp.headers.get("access-control-allow-methods", "")
     assert "PATCH" in allow_methods
+
+
+def test_announcements_require_auth_and_admin_management(client: TestClient) -> None:
+    starts_at = iso_at(timedelta(hours=-2))
+    ends_at = iso_at(timedelta(hours=12))
+    invalid_starts_at = iso_at(timedelta(hours=2))
+    invalid_ends_at = iso_at(timedelta(hours=1))
+
+    unauthorized = client.get("/v1/announcements/active")
+    assert unauthorized.status_code == 401
+
+    login(client)
+
+    admin_active = client.get("/v1/announcements/active")
+    assert admin_active.status_code == 200
+    assert admin_active.json()["items"] == []
+
+    invalid = client.post(
+        "/v1/admin/announcements",
+        json={
+            "title": "bad",
+            "body": "bad",
+            "status": "ACTIVE",
+            "starts_at": invalid_starts_at,
+            "ends_at": invalid_ends_at,
+        },
+    )
+    assert invalid.status_code == 422
+
+    created = client.post(
+        "/v1/admin/announcements",
+        json={
+            "title": "maintenance",
+            "body": "backend will restart tonight",
+            "kind": "MAINTENANCE",
+            "priority": "HIGH",
+            "status": "ACTIVE",
+            "dismissible": True,
+            "starts_at": starts_at,
+            "ends_at": ends_at,
+            "target": {"roles": ["USER"], "enabled_only": True, "user_ids": [], "exclude_user_ids": []},
+        },
+    )
+    assert created.status_code == 201
+    announcement = created.json()
+    assert announcement["title"] == "maintenance"
+    assert announcement["status"] == "ACTIVE"
+
+    listed = client.get("/v1/admin/announcements")
+    assert listed.status_code == 200
+    assert listed.json()["items"][0]["announcement_id"] == announcement["announcement_id"]
+
+    updated = client.patch(
+        f"/v1/admin/announcements/{announcement['announcement_id']}",
+        json={"status": "PAUSED", "title": "maintenance paused"},
+    )
+    assert updated.status_code == 200
+    assert updated.json()["status"] == "PAUSED"
+    assert updated.json()["title"] == "maintenance paused"
+
+    deleted = client.delete(f"/v1/admin/announcements/{announcement['announcement_id']}")
+    assert deleted.status_code == 200
+    assert deleted.json()["deleted"] is True
+
+
+def test_active_announcements_filter_dismiss_and_delete(client: TestClient) -> None:
+    active_starts_at = iso_at(timedelta(days=-1))
+    active_ends_at = iso_at(timedelta(days=1))
+    future_starts_at = iso_at(timedelta(days=30))
+    future_ends_at = iso_at(timedelta(days=31))
+    expired_starts_at = iso_at(timedelta(days=-3))
+    expired_ends_at = iso_at(timedelta(days=-2))
+
+    login(client)
+    create_user = client.post(
+        "/v1/admin/users",
+        json={
+            "username": "alice",
+            "password": "alice123456",
+            "role": "USER",
+            "enabled": True,
+            "policy_overrides": {},
+        },
+    )
+    assert create_user.status_code == 201
+    alice = create_user.json()
+
+    visible = client.post(
+        "/v1/admin/announcements",
+        json={
+            "title": "welcome",
+            "body": "hello alice",
+                "kind": "INFO",
+                "priority": "NORMAL",
+                "status": "ACTIVE",
+                "dismissible": True,
+                "starts_at": active_starts_at,
+                "ends_at": active_ends_at,
+                "target": {"roles": ["USER"], "enabled_only": True, "user_ids": [], "exclude_user_ids": []},
+            },
+    )
+    assert visible.status_code == 201
+    visible_id = visible.json()["announcement_id"]
+
+    targeted = client.post(
+        "/v1/admin/announcements",
+        json={
+            "title": "targeted",
+            "body": "only alice should see this",
+                "kind": "TIP",
+                "priority": "HIGH",
+                "status": "ACTIVE",
+                "dismissible": True,
+                "starts_at": active_starts_at,
+                "ends_at": active_ends_at,
+                "target": {"roles": ["USER"], "enabled_only": True, "user_ids": [alice["user_id"]], "exclude_user_ids": []},
+            },
+    )
+    assert targeted.status_code == 201
+    targeted_id = targeted.json()["announcement_id"]
+
+    excluded = client.post(
+        "/v1/admin/announcements",
+        json={
+            "title": "excluded",
+            "body": "alice must not see this",
+                "kind": "WARNING",
+                "priority": "HIGH",
+                "status": "ACTIVE",
+                "dismissible": True,
+                "starts_at": active_starts_at,
+                "ends_at": active_ends_at,
+                "target": {"roles": ["USER"], "enabled_only": True, "user_ids": [], "exclude_user_ids": [alice["user_id"]]},
+            },
+    )
+    assert excluded.status_code == 201
+
+    future = client.post(
+        "/v1/admin/announcements",
+        json={
+            "title": "future",
+            "body": "not yet live",
+            "status": "ACTIVE",
+            "starts_at": future_starts_at,
+            "ends_at": future_ends_at,
+        },
+    )
+    assert future.status_code == 201
+
+    expired = client.post(
+        "/v1/admin/announcements",
+        json={
+            "title": "expired",
+            "body": "already expired",
+            "status": "ACTIVE",
+            "starts_at": expired_starts_at,
+            "ends_at": expired_ends_at,
+        },
+    )
+    assert expired.status_code == 201
+
+    paused = client.post(
+        "/v1/admin/announcements",
+        json={
+                "title": "paused",
+                "body": "paused item",
+                "status": "PAUSED",
+                "starts_at": active_starts_at,
+                "ends_at": active_ends_at,
+            },
+        )
+    assert paused.status_code == 201
+
+    login(client, "alice", "alice123456")
+    active = client.get("/v1/announcements/active")
+    assert active.status_code == 200
+    ids = [item["announcement_id"] for item in active.json()["items"]]
+    assert ids == [targeted_id, visible_id]
+
+    dismissed = client.post(f"/v1/announcements/{visible_id}/dismiss")
+    assert dismissed.status_code == 200
+    assert dismissed.json()["success"] is True
+
+    dismissed_again = client.post(f"/v1/announcements/{visible_id}/dismiss")
+    assert dismissed_again.status_code == 200
+
+    after_dismiss = client.get("/v1/announcements/active")
+    assert after_dismiss.status_code == 200
+    ids_after_dismiss = [item["announcement_id"] for item in after_dismiss.json()["items"]]
+    assert ids_after_dismiss == [targeted_id]
+
+    login(client)
+    updated = client.patch(
+        f"/v1/admin/announcements/{visible_id}",
+        json={"body": "hello alice, updated"},
+    )
+    assert updated.status_code == 200
+
+    removed = client.delete(f"/v1/admin/announcements/{targeted_id}")
+    assert removed.status_code == 200
+
+    login(client, "alice", "alice123456")
+    final_active = client.get("/v1/announcements/active")
+    assert final_active.status_code == 200
+    assert final_active.json()["items"] == []
 
 
 def test_job_lifecycle(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:

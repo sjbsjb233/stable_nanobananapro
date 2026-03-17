@@ -1,9 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { chromium } from 'playwright';
-
-const repoDir = path.resolve(process.cwd(), '..');
-const jobsDir = path.join(repoDir, 'backend', 'data', 'jobs');
+import { createStoredSettings, frontendDir, frontendPage, jobsDir } from './runtime.mjs';
 
 function safeJson(file, fallback = null) {
   try {
@@ -55,7 +53,7 @@ for (const id of jobDirs) {
 }
 
 if (!refs.length) {
-  throw new Error('No renderable images found in backend/data/jobs');
+  throw new Error(`No renderable images found in ${jobsDir}`);
 }
 
 jobs.sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
@@ -111,49 +109,29 @@ page.on('console', (msg) => {
 
 const firstSession = sessions[0].session_id;
 
-await context.addInitScript(({ jobsIn, sessionsIn, firstIn }) => {
-  localStorage.setItem('nbp_settings_v1', JSON.stringify({
-    baseUrl: 'http://127.0.0.1:8000',
-    defaultModel: 'gemini-3-pro-image-preview',
-    jobAuthMode: 'ID_ONLY',
-    adminModeEnabled: false,
-    adminKey: '',
-    defaultParams: {
-      aspect_ratio: '1:1',
-      image_size: '1K',
-      thinking_level: null,
-      temperature: 0.7,
-      timeout_sec: 120,
-      max_retries: 1,
-    },
-    defaultParamsByModel: {
-      'gemini-3-pro-image-preview': {
-        aspect_ratio: '1:1',
-        image_size: '1K',
-        thinking_level: null,
-        temperature: 0.7,
-        timeout_sec: 120,
-        max_retries: 1,
-      },
-    },
-    ui: { theme: 'dark', language: 'zh-CN', reduceMotion: true },
-    polling: { intervalMs: 1200, maxIntervalMs: 5000, concurrency: 5 },
-  }));
+const storedSettings = createStoredSettings({
+  polling: {
+    concurrency: 5,
+  },
+});
+
+await context.addInitScript(({ jobsIn, sessionsIn, firstIn, settingsIn }) => {
+  localStorage.setItem('nbp_settings_v1', JSON.stringify(settingsIn));
   localStorage.setItem('nbp_jobs_v1', JSON.stringify(jobsIn));
   localStorage.setItem('nbp_picker_sessions_v1', JSON.stringify(sessionsIn));
   localStorage.setItem('nbp_picker_recent_v1', JSON.stringify({ last_session_id: firstIn, last_opened_at: new Date().toISOString() }));
   localStorage.setItem('nbp_history_auto_refresh_pref_v1', JSON.stringify(false));
-}, { jobsIn: jobs.slice(0, 240), sessionsIn: sessions, firstIn: firstSession });
+}, { jobsIn: jobs.slice(0, 240), sessionsIn: sessions, firstIn: firstSession, settingsIn: storedSettings });
 
 const mustSee = async (label) => {
   const ok = await page.locator('text=Image Picker').first().isVisible().catch(() => false);
   if (!ok) {
-    await page.screenshot({ path: `frontend/screenshots/picker/stress-real-fail-${label}.png`, fullPage: true });
+    await page.screenshot({ path: path.join(frontendDir, 'screenshots', 'picker', `stress-real-fail-${label}.png`), fullPage: true });
     throw new Error(`White screen or picker missing at ${label}`);
   }
 };
 
-await page.goto(`http://127.0.0.1:5173/picker?session=${encodeURIComponent(firstSession)}`, { waitUntil: 'networkidle' });
+await page.goto(frontendPage(`/picker?session=${encodeURIComponent(firstSession)}`), { waitUntil: 'networkidle' });
 await mustSee('init');
 
 for (let i = 0; i < 260; i++) {
@@ -170,10 +148,10 @@ for (let i = 0; i < 260; i++) {
   }
 
   if (i % 25 === 0) {
-    await page.goto('http://127.0.0.1:5173/history', { waitUntil: 'networkidle' });
+    await page.goto(frontendPage('/history'), { waitUntil: 'networkidle' });
     const h = await page.locator('text=History').first().isVisible().catch(() => false);
     if (!h) throw new Error(`History missing at ${i}`);
-    await page.goto(`http://127.0.0.1:5173/picker?session=${encodeURIComponent(sid)}`, { waitUntil: 'networkidle' });
+    await page.goto(frontendPage(`/picker?session=${encodeURIComponent(sid)}`), { waitUntil: 'networkidle' });
   }
 
   if (i % 7 === 0) {

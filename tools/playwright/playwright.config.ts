@@ -1,6 +1,9 @@
 import { defineConfig } from "@playwright/test";
 
-const baseURL = process.env.PW_BASE_URL || "http://127.0.0.1:5178";
+const baseURL =
+  process.env.PW_BASE_URL ||
+  process.env.NBP_FRONTEND_URL ||
+  `http://127.0.0.1:${process.env.NBP_FRONTEND_PORT || "5173"}`;
 
 export default defineConfig({
   testDir: "./tests/e2e",

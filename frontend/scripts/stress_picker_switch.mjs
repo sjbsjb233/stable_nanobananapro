@@ -1,4 +1,6 @@
+import path from 'node:path';
 import { chromium } from 'playwright';
+import { createStoredSettings, frontendDir, frontendPage } from './runtime.mjs';
 
 const SESSION_COUNT = 24;
 const ITEMS_PER_SESSION = 16;
@@ -76,49 +78,29 @@ page.on('console', (msg) => {
   }
 });
 
-await context.addInitScript(({ jobsIn, sessionsIn, firstIn }) => {
-  localStorage.setItem('nbp_settings_v1', JSON.stringify({
-    baseUrl: 'http://127.0.0.1:8000',
-    defaultModel: 'gemini-3-pro-image-preview',
-    jobAuthMode: 'ID_ONLY',
-    adminModeEnabled: false,
-    adminKey: '',
-    defaultParams: {
-      aspect_ratio: '1:1',
-      image_size: '1K',
-      thinking_level: null,
-      temperature: 0.7,
-      timeout_sec: 120,
-      max_retries: 1,
-    },
-    defaultParamsByModel: {
-      'gemini-3-pro-image-preview': {
-        aspect_ratio: '1:1',
-        image_size: '1K',
-        thinking_level: null,
-        temperature: 0.7,
-        timeout_sec: 120,
-        max_retries: 1,
-      },
-    },
-    ui: { theme: 'dark', language: 'zh-CN', reduceMotion: true },
-    polling: { intervalMs: 1200, maxIntervalMs: 5000, concurrency: 3 },
-  }));
+const storedSettings = createStoredSettings({
+  polling: {
+    concurrency: 3,
+  },
+});
+
+await context.addInitScript(({ jobsIn, sessionsIn, firstIn, settingsIn }) => {
+  localStorage.setItem('nbp_settings_v1', JSON.stringify(settingsIn));
   localStorage.setItem('nbp_jobs_v1', JSON.stringify(jobsIn));
   localStorage.setItem('nbp_picker_sessions_v1', JSON.stringify(sessionsIn));
   localStorage.setItem('nbp_picker_recent_v1', JSON.stringify({ last_session_id: firstIn, last_opened_at: new Date().toISOString() }));
-}, { jobsIn: jobs, sessionsIn: sessions, firstIn: firstSession });
+}, { jobsIn: jobs, sessionsIn: sessions, firstIn: firstSession, settingsIn: storedSettings });
 
 const assertAppVisible = async (step) => {
   await page.waitForTimeout(50);
   const ok = await page.locator('text=Image Picker').first().isVisible().catch(() => false);
   if (!ok) {
-    await page.screenshot({ path: `frontend/screenshots/picker/stress-fail-${step}.png`, fullPage: true });
+    await page.screenshot({ path: path.join(frontendDir, 'screenshots', 'picker', `stress-fail-${step}.png`), fullPage: true });
     throw new Error(`Picker header not visible at step ${step}`);
   }
 };
 
-await page.goto(`http://127.0.0.1:5173/picker?session=${encodeURIComponent(firstSession)}`, { waitUntil: 'networkidle' });
+await page.goto(frontendPage(`/picker?session=${encodeURIComponent(firstSession)}`), { waitUntil: 'networkidle' });
 await assertAppVisible('init');
 
 for (let i = 0; i < 240; i++) {
@@ -136,13 +118,13 @@ for (let i = 0; i < 240; i++) {
   }
 
   if (i % 30 === 0) {
-    await page.goto('http://127.0.0.1:5173/history', { waitUntil: 'networkidle' });
+    await page.goto(frontendPage('/history'), { waitUntil: 'networkidle' });
     const historyOk = await page.locator('text=History').first().isVisible().catch(() => false);
     if (!historyOk) {
-      await page.screenshot({ path: `frontend/screenshots/picker/stress-history-fail-${i}.png`, fullPage: true });
+      await page.screenshot({ path: path.join(frontendDir, 'screenshots', 'picker', `stress-history-fail-${i}.png`), fullPage: true });
       throw new Error(`History page not visible at loop ${i}`);
     }
-    await page.goto(`http://127.0.0.1:5173/picker?session=${encodeURIComponent(sid)}`, { waitUntil: 'networkidle' });
+    await page.goto(frontendPage(`/picker?session=${encodeURIComponent(sid)}`), { waitUntil: 'networkidle' });
   }
 
   await assertAppVisible(i);
