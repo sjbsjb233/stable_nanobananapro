@@ -450,6 +450,7 @@ type AuthSession = {
   user: SessionUser;
   usage: SessionUsage;
   generation_turnstile_verified_until?: string | null;
+  emergency?: EmergencySummary;
 };
 
 type AnnouncementKind = "INFO" | "UPDATE" | "MAINTENANCE" | "PROMO" | "TIP" | "WARNING";
@@ -510,6 +511,26 @@ type AnnouncementDismissPayload = {
   announcement_id: string;
 };
 
+type EmergencySwitchKey =
+  | "pause_generation"
+  | "block_new_member_login"
+  | "lock_member_backend"
+  | "pause_image_access";
+
+type EmergencyState = {
+  active_switches: EmergencySwitchKey[];
+  operator_reason: string;
+  public_message: string;
+  updated_at?: string | null;
+  updated_by_user_id?: string | null;
+  updated_by_username?: string | null;
+};
+
+type EmergencySummary = EmergencyState & {
+  locked_for_current_user: boolean;
+  banner_message?: string | null;
+};
+
 type SystemPolicy = {
   default_user_daily_image_limit: number;
   default_user_extra_daily_image_limit: number;
@@ -545,6 +566,7 @@ type AdminOverviewResponse = {
   system: AdminSystemOverview;
   policy: SystemPolicy;
   providers: ProviderSummary;
+  emergency: EmergencyState;
 };
 
 type StorageRetentionPolicy = {
@@ -1848,6 +1870,35 @@ function getApiErrorMessage(error: any, fallback: string) {
   const validationMessage = formatValidationIssues(error?.error?.details);
   if (validationMessage) return validationMessage;
   return error?.error?.message || fallback;
+}
+
+function emergencySwitchMeta(key: EmergencySwitchKey) {
+  if (key === "pause_generation") {
+    return {
+      label: "暂停新图片生成",
+      description: "禁止新建任务和重试任务，管理员也不豁免。",
+    };
+  }
+  if (key === "block_new_member_login") {
+    return {
+      label: "禁止普通成员新登录",
+      description: "普通成员不能再创建新登录会话，管理员仍可登录。",
+    };
+  }
+  if (key === "lock_member_backend") {
+    return {
+      label: "禁止普通成员后端访问",
+      description: "普通成员仅保留 auth/me 与 logout，其余后端接口全部拦截。",
+    };
+  }
+  return {
+    label: "暂停普通成员图片访问",
+    description: "普通成员不能读取原图、预览图、引用图和批量预览。",
+  };
+}
+
+function emergencySwitchSummary(items: EmergencySwitchKey[]) {
+  return items.map((item) => emergencySwitchMeta(item).label).join("、");
 }
 
 type AnnouncementDraft = {
@@ -3962,6 +4013,23 @@ class ApiClient {
     return this.request<AdminOverviewResponse>("/admin/overview", { method: "GET", signal });
   }
 
+  adminEmergency(signal?: AbortSignal) {
+    return this.request<EmergencyState>("/admin/emergency", { method: "GET", signal });
+  }
+
+  adminUpdateEmergency(payload: {
+    active_switches: EmergencySwitchKey[];
+    operator_reason: string;
+    public_message: string;
+  }, signal?: AbortSignal) {
+    return this.request<EmergencyState>("/admin/emergency", {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+      signal,
+    });
+  }
+
   adminStorageOverview(signal?: AbortSignal) {
     return this.request<AdminStorageOverviewResponse>("/admin/storage/overview", { method: "GET", signal });
   }
@@ -4153,6 +4221,7 @@ function useAuthSession() {
     session,
     user: session?.user || null,
     usage: session?.usage || null,
+    emergency: session?.emergency || null,
     isAdmin: session?.user?.role === "ADMIN",
   };
 }
@@ -4722,6 +4791,74 @@ function TopNav() {
             + 快速创建
           </Button>
           <Button variant="ghost" onClick={handleLogout}>退出</Button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function EmergencyBanner() {
+  const { session, isAdmin } = useAuthSession();
+  const emergency = session?.emergency;
+  if (!emergency?.active_switches?.length || emergency.locked_for_current_user) return null;
+
+  return (
+    <div className="border-b border-amber-200/80 bg-amber-50/90 dark:border-amber-500/20 dark:bg-amber-950/20">
+      <div className="mx-auto flex max-w-6xl flex-col gap-2 px-4 py-3 text-sm text-amber-900 dark:text-amber-100 md:flex-row md:items-center md:justify-between">
+        <div>
+          <div className="font-semibold">系统处于紧急限制状态</div>
+          <div className="text-xs text-amber-800/90 dark:text-amber-200/90">
+            {emergency.banner_message || "部分功能已被临时限制。"} 当前限制：{emergencySwitchSummary(emergency.active_switches)}
+          </div>
+        </div>
+        <div className="text-xs text-amber-800/90 dark:text-amber-200/90">
+          {isAdmin ? "你当前看到的是管理员视角。" : "请等待管理员恢复系统。"}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function MemberEmergencyLockScreen() {
+  const client = useApiClient();
+  const navigate = useNavigate();
+  const clearSession = useAuthStore((s) => s.clearSession);
+  const { push } = useToast();
+  const { session, user } = useAuthSession();
+  const emergency = session?.emergency;
+
+  if (!session || !user || !emergency?.locked_for_current_user) return null;
+
+  const handleLogout = async () => {
+    await client.logout().catch(() => null);
+    useJobsStore.getState().scopeJobs(null);
+    clearSession();
+    push({ kind: "info", title: "已退出登录" });
+    navigate("/login");
+  };
+
+  return (
+    <div className="flex min-h-screen items-center justify-center px-4 py-8">
+      <div className="w-full max-w-3xl rounded-[32px] border border-rose-200 bg-[linear-gradient(180deg,rgba(255,250,250,0.98),rgba(255,241,242,0.96))] p-8 shadow-[0_28px_100px_rgba(127,29,29,0.15)] dark:border-rose-500/20 dark:bg-[linear-gradient(180deg,rgba(40,12,18,0.94),rgba(24,10,14,0.98))]">
+        <div className="text-xs font-semibold uppercase tracking-[0.24em] text-rose-500 dark:text-rose-300">Emergency Lock</div>
+        <div className="mt-3 text-3xl font-black text-zinc-950 dark:text-white">系统当前仅保留管理员控制面</div>
+        <div className="mt-4 text-sm leading-6 text-zinc-700 dark:text-zinc-200">
+          {emergency.public_message || "系统正在执行紧急限制，普通成员后端访问已被临时暂停。请稍后再试。"}
+        </div>
+        <div className="mt-5 flex flex-wrap gap-2">
+          {emergency.active_switches.map((item) => (
+            <span key={item} className="rounded-full border border-rose-200 bg-white/80 px-3 py-1 text-xs font-semibold text-rose-700 dark:border-rose-500/20 dark:bg-black/20 dark:text-rose-200">
+              {emergencySwitchMeta(item).label}
+            </span>
+          ))}
+        </div>
+        <div className="mt-6 rounded-2xl border border-zinc-200 bg-white/70 p-4 text-sm text-zinc-700 dark:border-white/10 dark:bg-white/5 dark:text-zinc-200">
+          <div>当前账号：{user.username}</div>
+          <div className="mt-1">最近操作：{emergency.updated_by_username || "-"} · {formatLocal(emergency.updated_at || undefined)}</div>
+          <div className="mt-1">原因：{emergency.operator_reason || "未填写"}</div>
+        </div>
+        <div className="mt-6 flex justify-end">
+          <Button variant="danger" onClick={handleLogout}>退出登录</Button>
         </div>
       </div>
     </div>
@@ -6741,6 +6878,16 @@ function AdminPageLegacy() {
   const [announcementDraft, setAnnouncementDraft] = useState<AnnouncementDraft>(emptyAnnouncementDraft());
   const [savingAnnouncement, setSavingAnnouncement] = useState(false);
   const [deletingAnnouncementId, setDeletingAnnouncementId] = useState<string | null>(null);
+  const [emergency, setEmergency] = useState<EmergencyState | null>(null);
+  const [emergencyDraftSwitches, setEmergencyDraftSwitches] = useState<Record<EmergencySwitchKey, boolean>>({
+    pause_generation: false,
+    block_new_member_login: false,
+    lock_member_backend: false,
+    pause_image_access: false,
+  });
+  const [emergencyReasonDraft, setEmergencyReasonDraft] = useState("");
+  const [emergencyMessageDraft, setEmergencyMessageDraft] = useState("");
+  const [savingEmergency, setSavingEmergency] = useState(false);
 
   const [policyDraft, setPolicyDraft] = useState<SystemPolicy | null>(null);
   const [savingPolicy, setSavingPolicy] = useState(false);
@@ -7541,6 +7688,16 @@ function AdminPage() {
   const [announcementDraft, setAnnouncementDraft] = useState<AnnouncementDraft>(emptyAnnouncementDraft());
   const [savingAnnouncement, setSavingAnnouncement] = useState(false);
   const [deletingAnnouncementId, setDeletingAnnouncementId] = useState<string | null>(null);
+  const [emergency, setEmergency] = useState<EmergencyState | null>(null);
+  const [emergencyDraftSwitches, setEmergencyDraftSwitches] = useState<Record<EmergencySwitchKey, boolean>>({
+    pause_generation: false,
+    block_new_member_login: false,
+    lock_member_backend: false,
+    pause_image_access: false,
+  });
+  const [emergencyReasonDraft, setEmergencyReasonDraft] = useState("");
+  const [emergencyMessageDraft, setEmergencyMessageDraft] = useState("");
+  const [savingEmergency, setSavingEmergency] = useState(false);
 
   const [policyDraft, setPolicyDraft] = useState<SystemPolicy | null>(null);
   const [savingPolicy, setSavingPolicy] = useState(false);
@@ -7670,13 +7827,23 @@ function AdminPage() {
     if (!silent) setLoading(true);
     setRefreshing(true);
     try {
-      const [overviewPayload, usersPayload, announcementsPayload] = await Promise.all([
+      const [overviewPayload, usersPayload, announcementsPayload, emergencyPayload] = await Promise.all([
         client.adminOverview(),
         client.adminUsers(),
         client.adminListAnnouncements(),
+        client.adminEmergency(),
       ]);
       setOverview(overviewPayload);
       setPolicyDraft(overviewPayload.policy);
+      setEmergency(emergencyPayload);
+      setEmergencyDraftSwitches({
+        pause_generation: emergencyPayload.active_switches.includes("pause_generation"),
+        block_new_member_login: emergencyPayload.active_switches.includes("block_new_member_login"),
+        lock_member_backend: emergencyPayload.active_switches.includes("lock_member_backend"),
+        pause_image_access: emergencyPayload.active_switches.includes("pause_image_access"),
+      });
+      setEmergencyReasonDraft(emergencyPayload.operator_reason || "");
+      setEmergencyMessageDraft(emergencyPayload.public_message || "");
       const providerItems = overviewPayload.providers?.providers || [];
       setProviderNotes(Object.fromEntries(providerItems.map((item) => [item.provider_id, item.note || ""])));
       setProviderEnabledDrafts(Object.fromEntries(providerItems.map((item) => [item.provider_id, Boolean(item.enabled)])));
@@ -7813,6 +7980,43 @@ function AdminPage() {
     setEditImageAccessBonusQuota(selectedUser.policy_overrides?.image_access_turnstile_bonus_quota == null ? "" : String(selectedUser.policy_overrides.image_access_turnstile_bonus_quota));
     setEditImageAccessHardLimit(selectedUser.policy_overrides?.daily_image_access_hard_limit == null ? "" : String(selectedUser.policy_overrides.daily_image_access_hard_limit));
   }, [selectedUser]);
+
+  const saveEmergencyState = async () => {
+    const operatorReason = emergencyReasonDraft.trim();
+    if (!operatorReason) {
+      push({ kind: "error", title: "请填写操作原因", message: "Danger zone 变更必须记录原因。" });
+      return;
+    }
+    const activeSwitches = (Object.entries(emergencyDraftSwitches) as Array<[EmergencySwitchKey, boolean]>)
+      .filter(([, enabled]) => enabled)
+      .map(([key]) => key);
+    const confirmMessage = [
+      activeSwitches.length ? `将启用：${emergencySwitchSummary(activeSwitches)}` : "将恢复为正常状态（关闭所有紧急开关）",
+      `原因：${operatorReason}`,
+      emergencyMessageDraft.trim() ? `用户文案：${emergencyMessageDraft.trim()}` : "用户文案：未填写",
+      "是否继续？",
+    ].join("\n");
+    if (!confirm(confirmMessage)) return;
+
+    setSavingEmergency(true);
+    try {
+      const updated = await client.adminUpdateEmergency({
+        active_switches: activeSwitches,
+        operator_reason: operatorReason,
+        public_message: emergencyMessageDraft.trim(),
+      });
+      setEmergency(updated);
+      await loadAdminData({ silent: true });
+      push({
+        kind: "success",
+        title: activeSwitches.length ? "紧急状态已更新" : "系统已恢复正常状态",
+      });
+    } catch (e: any) {
+      push({ kind: "error", title: "Danger zone 保存失败", message: getApiErrorMessage(e, "请稍后重试") });
+    } finally {
+      setSavingEmergency(false);
+    }
+  };
 
   const savePolicy = async () => {
     if (!policyDraft) return;
@@ -8145,6 +8349,13 @@ function AdminPage() {
     () => storageOverview?.suggestions.find((item) => item.cutoff_date === storageCutoffDate) || null,
     [storageCutoffDate, storageOverview]
   );
+  const activeEmergencySwitches = useMemo(
+    () =>
+      (Object.entries(emergencyDraftSwitches) as Array<[EmergencySwitchKey, boolean]>)
+        .filter(([, enabled]) => enabled)
+        .map(([key]) => key),
+    [emergencyDraftSwitches]
+  );
   const selectedUserTags = selectedUser ? adminUserRiskTags(selectedUser) : [];
   const taskPreviewMap = useAdminTaskPreviewMap(taskItems, selectedUser?.user_id || "");
   const effectivePolicyRows = selectedUser
@@ -8215,6 +8426,93 @@ function AdminPage() {
           <span className="rounded-full border border-zinc-200 bg-white px-3 py-1 dark:border-white/10 dark:bg-zinc-950/40">Succeeded Today {overview?.system.succeeded_today ?? "-"}</span>
           <span className="rounded-full border border-zinc-200 bg-white px-3 py-1 dark:border-white/10 dark:bg-zinc-950/40">Failed Today {overview?.system.failed_today ?? "-"}</span>
           <span className="rounded-full border border-zinc-200 bg-white px-3 py-1 dark:border-white/10 dark:bg-zinc-950/40">Provider Healthy {overview?.providers.providers_healthy ?? "-"}</span>
+        </div>
+      </Card>
+
+      <Card
+        hover={false}
+        className="mt-4 overflow-hidden rounded-[30px] border-rose-300/70 bg-[linear-gradient(180deg,rgba(255,251,251,0.98),rgba(255,241,242,0.95))] dark:border-rose-500/20 dark:bg-[linear-gradient(180deg,rgba(38,10,14,0.96),rgba(28,10,14,0.96))]"
+      >
+        <div className="flex flex-wrap items-start justify-between gap-3" data-testid="admin-danger-zone">
+          <div>
+            <div className="text-xs font-semibold uppercase tracking-[0.22em] text-rose-500 dark:text-rose-300">Danger Zone</div>
+            <div className="mt-1 text-xl font-black text-zinc-950 dark:text-white">紧急控制平面</div>
+            <div className="mt-1 text-sm text-zinc-600 dark:text-zinc-300">用于极端环境下快速收紧系统能力，并确保管理员仍可通过控制面恢复。</div>
+          </div>
+          <div className="text-right text-xs text-zinc-600 dark:text-zinc-300">
+            <div>最近修改：{formatLocal(emergency?.updated_at || undefined)}</div>
+            <div className="mt-1">操作人：{emergency?.updated_by_username || "-"}</div>
+          </div>
+        </div>
+
+        <div className="mt-4 flex flex-wrap gap-2">
+          {emergency?.active_switches?.length ? emergency.active_switches.map((item) => (
+            <span key={item} className="rounded-full border border-rose-200 bg-white/80 px-3 py-1 text-xs font-semibold text-rose-700 dark:border-rose-500/20 dark:bg-black/20 dark:text-rose-200">
+              {emergencySwitchMeta(item).label}
+            </span>
+          )) : (
+            <span className="rounded-full border border-emerald-200 bg-emerald-50 px-3 py-1 text-xs font-semibold text-emerald-700 dark:border-emerald-500/20 dark:bg-emerald-950/20 dark:text-emerald-200">
+              当前为正常状态
+            </span>
+          )}
+        </div>
+
+        <div className="mt-4 grid grid-cols-1 gap-4 xl:grid-cols-[1.1fr_0.9fr]">
+          <div className="space-y-3">
+            {(["pause_generation", "block_new_member_login", "lock_member_backend", "pause_image_access"] as EmergencySwitchKey[]).map((key) => {
+              const meta = emergencySwitchMeta(key);
+              return (
+                <div key={key} className="rounded-3xl border border-rose-200/70 bg-white/75 p-4 dark:border-rose-500/20 dark:bg-black/10">
+                  <div className="flex items-start justify-between gap-3">
+                    <div>
+                      <div className="text-sm font-bold text-zinc-950 dark:text-white">{meta.label}</div>
+                      <div className="mt-1 text-xs text-zinc-600 dark:text-zinc-300">{meta.description}</div>
+                    </div>
+                    <Switch
+                      testId={`admin-danger-switch-${key}`}
+                      value={Boolean(emergencyDraftSwitches[key])}
+                      onChange={(value) => setEmergencyDraftSwitches((current) => ({ ...current, [key]: value }))}
+                    />
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+
+          <div className="space-y-4">
+            <Field label="操作原因（必填）">
+              <TextArea
+                value={emergencyReasonDraft}
+                onChange={setEmergencyReasonDraft}
+                rows={4}
+                placeholder="例如：上游异常放大、疑似滥用、存储压力过高、需要临时封控。"
+              />
+            </Field>
+            <Field label="用户展示文案（可选）">
+              <TextArea
+                value={emergencyMessageDraft}
+                onChange={setEmergencyMessageDraft}
+                rows={5}
+                placeholder="例如：系统正在执行临时限制，普通成员部分功能已暂停，请稍后再试。"
+              />
+            </Field>
+
+            <div className="rounded-3xl border border-zinc-200 bg-white/80 p-4 text-sm text-zinc-700 dark:border-white/10 dark:bg-white/5 dark:text-zinc-200">
+              <div className="font-semibold text-zinc-950 dark:text-white">本次即将生效</div>
+              <div className="mt-2">
+                {activeEmergencySwitches.length ? emergencySwitchSummary(activeEmergencySwitches) : "关闭全部紧急开关，恢复正常状态"}
+              </div>
+              <div className="mt-2 text-xs text-zinc-500 dark:text-zinc-400">
+                管理员不保留生成链路豁免，仅保留控制面恢复能力。
+              </div>
+            </div>
+
+            <div className="flex justify-end">
+              <Button variant="danger" onClick={saveEmergencyState} disabled={savingEmergency}>
+                {savingEmergency ? "保存中…" : "应用紧急变更"}
+              </Button>
+            </div>
+          </div>
         </div>
       </Card>
 
@@ -16700,7 +16998,8 @@ function SettingsPage() {
 export default function App() {
   useTheme();
   useAuthBootstrap();
-  const { loading, session } = useAuthSession();
+  const { loading, session, isAdmin } = useAuthSession();
+  const isLockedMember = Boolean(session?.emergency?.locked_for_current_user && !isAdmin);
 
   return (
     <ToastProvider>
@@ -16721,13 +17020,20 @@ export default function App() {
               </div>
             ) : session ? (
               <>
-                <PickerSessionJobSync />
-                <FailedBatchSessionCleanup />
-                <PendingSessionDirectHydrator />
-                <AnnouncementAutoModal />
-                <TopNav />
-                <AnimatedRoutes />
-                <Footer />
+                {isLockedMember ? (
+                  <MemberEmergencyLockScreen />
+                ) : (
+                  <>
+                    <PickerSessionJobSync />
+                    <FailedBatchSessionCleanup />
+                    <PendingSessionDirectHydrator />
+                    <AnnouncementAutoModal />
+                    <TopNav />
+                    <EmergencyBanner />
+                    <AnimatedRoutes />
+                    <Footer />
+                  </>
+                )}
               </>
             ) : (
               <Routes>

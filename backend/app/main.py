@@ -18,6 +18,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from .config import cors_allow_all_origins, ensure_data_dirs, get_cors_origins, settings
 from .announcement_store import announcement_store
+from .emergency_state_store import emergency_state_store
 from .errors import api_error
 from .gemini_client import ReferenceImage
 from .job_manager import job_manager
@@ -52,6 +53,9 @@ from .schemas import (
     CreateUserRequest,
     DashboardSummaryRequest,
     DismissAnnouncementResponse,
+    EmergencyState,
+    EmergencyStateUpdateRequest,
+    EmergencySwitchKey,
     ErrorCode,
     GoogleRemainingUnconfiguredResponse,
     HealthResponse,
@@ -117,6 +121,7 @@ def _startup() -> None:
     user_store.ensure_initialized()
     provider_store.ensure_initialized()
     announcement_store.ensure_initialized()
+    emergency_state_store.ensure_initialized()
     storage_retention_service.ensure_initialized()
     recovered_jobs = job_manager.fail_incomplete_jobs_on_startup()
     logger.info(
@@ -185,6 +190,82 @@ def _parse_session_datetime(value: Any) -> datetime | None:
         return None
 
 
+def _emergency_state_payload() -> dict[str, Any]:
+    return emergency_state_store.get_state()
+
+
+def _emergency_summary_for_user(user: dict[str, Any] | None) -> dict[str, Any]:
+    state = _emergency_state_payload()
+    active_switches = [str(item) for item in state.get("active_switches") or []]
+    is_admin = str((user or {}).get("role") or "").upper() == "ADMIN"
+    locked_for_current_user = bool(
+        not is_admin and EmergencySwitchKey.LOCK_MEMBER_BACKEND.value in set(active_switches)
+    )
+    banner_message = None
+    if active_switches:
+        banner_message = str(state.get("public_message") or "").strip() or "系统当前处于紧急限制状态。"
+    return {
+        "active_switches": active_switches,
+        "operator_reason": str(state.get("operator_reason") or ""),
+        "public_message": str(state.get("public_message") or ""),
+        "updated_at": state.get("updated_at"),
+        "updated_by_user_id": state.get("updated_by_user_id"),
+        "updated_by_username": state.get("updated_by_username"),
+        "locked_for_current_user": locked_for_current_user,
+        "banner_message": banner_message,
+    }
+
+
+def _emergency_error(message: str, *, capability: str) -> HTTPException:
+    state = _emergency_state_payload()
+    details = {
+        "capability": capability,
+        "active_switches": list(state.get("active_switches") or []),
+        "operator_reason": str(state.get("operator_reason") or ""),
+        "public_message": str(state.get("public_message") or ""),
+        "updated_at": state.get("updated_at"),
+        "updated_by_user_id": state.get("updated_by_user_id"),
+        "updated_by_username": state.get("updated_by_username"),
+    }
+    return api_error(ErrorCode.MAINTENANCE, message, http_status=503, details=details)
+
+
+def _is_control_plane_path(path: str) -> bool:
+    return (
+        path.startswith(f"{settings.api_prefix}/admin/")
+        or path == f"{settings.api_prefix}/auth/me"
+        or path == f"{settings.api_prefix}/auth/logout"
+    )
+
+
+def _assert_login_allowed(user: dict[str, Any]) -> None:
+    if str(user.get("role") or "").upper() == "ADMIN":
+        return
+    if emergency_state_store.is_active(EmergencySwitchKey.BLOCK_NEW_MEMBER_LOGIN):
+        raise _emergency_error("普通成员登录已被临时关闭", capability="login")
+
+
+def _assert_generation_capability_allowed(user: dict[str, Any]) -> None:
+    if emergency_state_store.is_active(EmergencySwitchKey.PAUSE_GENERATION):
+        raise _emergency_error("新图片生成已被紧急暂停", capability="generation")
+
+
+def _assert_image_access_capability_allowed(user: dict[str, Any]) -> None:
+    if str(user.get("role") or "").upper() == "ADMIN":
+        return
+    if emergency_state_store.is_active(EmergencySwitchKey.PAUSE_IMAGE_ACCESS):
+        raise _emergency_error("普通成员图片访问已被紧急暂停", capability="image_access")
+
+
+def _assert_member_backend_access_allowed(request: Request, user: dict[str, Any]) -> None:
+    if str(user.get("role") or "").upper() == "ADMIN":
+        return
+    if _is_control_plane_path(request.url.path):
+        return
+    if emergency_state_store.is_active(EmergencySwitchKey.LOCK_MEMBER_BACKEND):
+        raise _emergency_error("普通成员后端访问已被紧急暂停", capability="member_backend")
+
+
 def _get_test_env_admin_user_or_none() -> dict[str, Any] | None:
     if not settings.test_env_admin_bypass:
         return None
@@ -225,6 +306,7 @@ def get_current_user(request: Request) -> dict[str, Any]:
     user = getattr(request.state, "current_user", None) or _get_authenticated_user_or_none(request)
     if not user:
         raise api_error(ErrorCode.AUTH_REQUIRED, "Authentication required", http_status=401)
+    _assert_member_backend_access_allowed(request, user)
     request.state.current_user = user
     return user
 
@@ -424,6 +506,7 @@ def _session_payload(request: Request, user: dict[str, Any]) -> dict[str, Any]:
         },
         "usage": _usage_payload(user, policy),
         "generation_turnstile_verified_until": verified_until.isoformat() if verified_until is not None else None,
+        "emergency": _emergency_summary_for_user(user),
     }
 
 
@@ -807,6 +890,7 @@ async def login(payload: LoginRequest, request: Request) -> dict[str, Any]:
             "Invalid username or password",
             http_status=401,
         )
+    _assert_login_allowed(user)
 
     request.session.clear()
     request.session["user_id"] = user["user_id"]
@@ -1558,6 +1642,7 @@ async def create_job(
     current_user: dict[str, Any] = Depends(get_current_user),
 ) -> CreateJobResponse:
     requested_job_count = _requested_job_count_from_header(x_requested_job_count)
+    _assert_generation_capability_allowed(current_user)
     pending_job = _pop_overquota_pending_job(
         request,
         user_id=str(current_user["user_id"]),
@@ -1641,6 +1726,7 @@ async def jobs_batch_previews(
     current_user: dict[str, Any] = Depends(get_current_user),
 ) -> dict[str, Any]:
     job_read_rate_limit(request)
+    _assert_image_access_capability_allowed(current_user)
     raw_images = payload.images[: max(1, int(settings.preview_batch_limit))]
 
     items: list[dict[str, Any]] = []
@@ -1697,6 +1783,7 @@ async def get_job_image(
         raise api_error(ErrorCode.JOB_NOT_FOUND, "Job not found", http_status=404)
     if not validate_image_id(image_id):
         raise api_error(ErrorCode.IMAGE_NOT_FOUND, "Image not found", http_status=404)
+    _assert_image_access_capability_allowed(current_user)
 
     image_access_gate = _image_access_verification_required(current_user)
     if image_access_gate is not None:
@@ -1724,6 +1811,7 @@ async def get_job_preview_image(
         raise api_error(ErrorCode.JOB_NOT_FOUND, "Job not found", http_status=404)
     if not validate_image_id(image_id):
         raise api_error(ErrorCode.IMAGE_NOT_FOUND, "Image not found", http_status=404)
+    _assert_image_access_capability_allowed(current_user)
 
     image_bytes, mime = job_manager.get_preview_image(job_id, x_job_token, image_id, current_user)
     return Response(
@@ -1742,6 +1830,7 @@ async def get_job_reference_image(
 ) -> Response:
     if not validate_job_id(job_id):
         raise api_error(ErrorCode.JOB_NOT_FOUND, "Job not found", http_status=404)
+    _assert_image_access_capability_allowed(current_user)
     image_bytes, mime = job_manager.get_input_reference(job_id, x_job_token, ref_path, current_user)
     return Response(content=image_bytes, media_type=mime)
 
@@ -1821,6 +1910,7 @@ async def retry_job(
 ) -> dict[str, Any]:
     if not validate_job_id(job_id):
         raise api_error(ErrorCode.JOB_NOT_FOUND, "Job not found", http_status=404)
+    _assert_generation_capability_allowed(current_user)
     gate = _assert_generation_allowed(request, current_user, requested_job_count=1)
     if payload.override_params and payload.override_params.provider_id:
         current_meta = job_manager.get_meta(job_id, x_job_token, current_user)
@@ -1938,12 +2028,32 @@ def _admin_overview_payload() -> dict[str, Any]:
         },
         "policy": user_store.get_policy(),
         "providers": _provider_summary_payload(),
+        "emergency": _emergency_state_payload(),
     }
 
 
 @app.get(f"{settings.api_prefix}/admin/overview")
 async def admin_overview(_: dict[str, Any] = Depends(get_admin_user)) -> dict[str, Any]:
     return _admin_overview_payload()
+
+
+@app.get(f"{settings.api_prefix}/admin/emergency", response_model=EmergencyState)
+async def admin_emergency(_: dict[str, Any] = Depends(get_admin_user)) -> dict[str, Any]:
+    return _emergency_state_payload()
+
+
+@app.patch(f"{settings.api_prefix}/admin/emergency", response_model=EmergencyState)
+async def admin_update_emergency(
+    payload: EmergencyStateUpdateRequest,
+    current_user: dict[str, Any] = Depends(get_admin_user),
+) -> dict[str, Any]:
+    return emergency_state_store.update_state(
+        active_switches=[item.value for item in payload.active_switches],
+        operator_reason=payload.operator_reason,
+        public_message=payload.public_message,
+        updated_by_user_id=str(current_user.get("user_id") or ""),
+        updated_by_username=str(current_user.get("username") or ""),
+    )
 
 
 @app.get(f"{settings.api_prefix}/admin/storage/overview", response_model=AdminStorageOverviewResponse)
