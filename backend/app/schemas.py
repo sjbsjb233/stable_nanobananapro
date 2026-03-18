@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 from enum import Enum
 from typing import Any, Literal
 
@@ -377,6 +377,82 @@ class UpdateSystemPolicyRequest(BaseModel):
     default_user_daily_image_access_limit: int | None = Field(default=None, ge=0)
     default_user_image_access_turnstile_bonus_quota: int | None = Field(default=None, ge=0)
     default_user_daily_image_access_hard_limit: int | None = Field(default=None, ge=0)
+
+
+class StorageRetentionPolicy(BaseModel):
+    enabled: bool = False
+    retention_days: int | None = Field(default=None, ge=1)
+
+
+class StorageRetentionRuntime(BaseModel):
+    last_run_at: datetime | None = None
+    last_cutoff_date: date | None = None
+    last_deleted_jobs: int = Field(default=0, ge=0)
+    last_freed_bytes: int = Field(default=0, ge=0)
+    last_error: str | None = None
+
+
+class AdminStorageBucket(BaseModel):
+    job_date: date
+    job_count: int = Field(ge=0)
+    total_bytes: int = Field(ge=0)
+    cumulative_jobs: int = Field(ge=0)
+    cumulative_bytes: int = Field(ge=0)
+
+
+class AdminStorageSuggestion(BaseModel):
+    retention_days: int = Field(ge=1)
+    cutoff_date: date
+    matched_jobs: int = Field(ge=0)
+    estimated_freed_bytes: int = Field(ge=0)
+    estimated_freed_ratio_of_jobs: float = Field(ge=0)
+
+
+class AdminStorageOverviewResponse(BaseModel):
+    data_total_bytes: int = Field(ge=0)
+    jobs_total_bytes: int = Field(ge=0)
+    non_job_bytes: int = Field(ge=0)
+    deletable_jobs: int = Field(ge=0)
+    deletable_bytes: int = Field(ge=0)
+    oldest_job_date: date | None = None
+    newest_job_date: date | None = None
+    buckets: list[AdminStorageBucket] = Field(default_factory=list)
+    suggestions: list[AdminStorageSuggestion] = Field(default_factory=list)
+    recommended_suggestion: AdminStorageSuggestion | None = None
+    policy: StorageRetentionPolicy
+    runtime: StorageRetentionRuntime
+
+
+class AdminStorageCleanupPreviewRequest(BaseModel):
+    cutoff_date: date
+
+
+class AdminStorageCleanupPreviewResponse(BaseModel):
+    cutoff_date: date
+    matched_jobs: int = Field(ge=0)
+    estimated_freed_bytes: int = Field(ge=0)
+    earliest_job_date: date | None = None
+    latest_job_date: date | None = None
+    active_jobs_skipped: int = Field(ge=0)
+
+
+class AdminStorageCleanupExecuteResponse(BaseModel):
+    cutoff_date: date
+    deleted_jobs: int = Field(ge=0)
+    freed_bytes: int = Field(ge=0)
+    earliest_job_date: date | None = None
+    latest_job_date: date | None = None
+    active_jobs_skipped: int = Field(ge=0)
+
+
+class UpdateStorageRetentionPolicyRequest(BaseModel):
+    enabled: bool | None = None
+    retention_days: int | None = Field(default=None, ge=1)
+
+
+class UpdateStorageRetentionPolicyResponse(BaseModel):
+    policy: StorageRetentionPolicy
+    runtime: StorageRetentionRuntime
 
 
 class UpdateProviderRequest(BaseModel):

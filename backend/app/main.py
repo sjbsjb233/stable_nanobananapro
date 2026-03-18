@@ -39,6 +39,10 @@ from .schemas import (
     AnnouncementItem,
     AnnouncementListResponse,
     AddProviderBalanceRequest,
+    AdminStorageCleanupExecuteResponse,
+    AdminStorageCleanupPreviewRequest,
+    AdminStorageCleanupPreviewResponse,
+    AdminStorageOverviewResponse,
     BatchPreviewRequest,
     BatchMetaRequest,
     ChangePasswordRequest,
@@ -63,12 +67,15 @@ from .schemas import (
     TurnstileVerifyRequest,
     UpdateAnnouncementRequest,
     UpdateProviderRequest,
+    UpdateStorageRetentionPolicyRequest,
+    UpdateStorageRetentionPolicyResponse,
     UpdateSystemPolicyRequest,
     UpdateUserRequest,
 )
 from .safe_session import SafeSessionMiddleware
 from .security import validate_image_id, validate_job_id
 from .storage import storage
+from .storage_retention import storage_retention_service
 from .time_utils import now_local
 from .turnstile import verify_turnstile_token
 from .user_store import user_store, validate_username
@@ -112,6 +119,7 @@ def _startup() -> None:
     user_store.ensure_initialized()
     provider_store.ensure_initialized()
     announcement_store.ensure_initialized()
+    storage_retention_service.ensure_initialized()
     recovered_jobs = job_manager.fail_incomplete_jobs_on_startup()
     logger.info(
         "Backend startup: version=%s deployed_at=%s data_dir=%s recovered_jobs=%s",
@@ -121,10 +129,12 @@ def _startup() -> None:
         recovered_jobs,
     )
     job_manager.start()
+    storage_retention_service.start()
 
 
 @app.on_event("shutdown")
 def _shutdown() -> None:
+    storage_retention_service.stop()
     job_manager.stop()
     logger.info("Backend shutdown complete")
 
@@ -1936,6 +1946,50 @@ def _admin_overview_payload() -> dict[str, Any]:
 @app.get(f"{settings.api_prefix}/admin/overview")
 async def admin_overview(_: dict[str, Any] = Depends(get_admin_user)) -> dict[str, Any]:
     return _admin_overview_payload()
+
+
+@app.get(f"{settings.api_prefix}/admin/storage/overview", response_model=AdminStorageOverviewResponse)
+async def admin_storage_overview(_: dict[str, Any] = Depends(get_admin_user)) -> dict[str, Any]:
+    return storage_retention_service.get_overview()
+
+
+@app.post(f"{settings.api_prefix}/admin/storage/cleanup/preview", response_model=AdminStorageCleanupPreviewResponse)
+async def admin_storage_cleanup_preview(
+    payload: AdminStorageCleanupPreviewRequest,
+    _: dict[str, Any] = Depends(get_admin_user),
+) -> dict[str, Any]:
+    preview = storage_retention_service.preview_cleanup(payload.cutoff_date)
+    preview.pop("_matched_entries", None)
+    return preview
+
+
+@app.post(f"{settings.api_prefix}/admin/storage/cleanup/execute", response_model=AdminStorageCleanupExecuteResponse)
+async def admin_storage_cleanup_execute(
+    payload: AdminStorageCleanupPreviewRequest,
+    current_user: dict[str, Any] = Depends(get_admin_user),
+) -> dict[str, Any]:
+    result = storage_retention_service.execute_cleanup(
+        payload.cutoff_date,
+        trigger=f"manual:{current_user.get('user_id') or 'admin'}",
+    )
+    return result
+
+
+@app.patch(f"{settings.api_prefix}/admin/storage/retention", response_model=UpdateStorageRetentionPolicyResponse)
+async def admin_storage_retention_update(
+    payload: UpdateStorageRetentionPolicyRequest,
+    _: dict[str, Any] = Depends(get_admin_user),
+) -> dict[str, Any]:
+    patch = payload.model_dump(exclude_unset=True)
+    if patch.get("enabled") and patch.get("retention_days") is None:
+        current_policy = storage_retention_service.get_policy()
+        if current_policy.get("retention_days") is None:
+            raise api_error(ErrorCode.INVALID_INPUT, "retention_days is required when auto cleanup is enabled", http_status=422)
+    policy = storage_retention_service.update_policy(patch)
+    return {
+        "policy": policy,
+        "runtime": storage_retention_service.get_runtime(),
+    }
 
 
 @app.get(f"{settings.api_prefix}/admin/announcements", response_model=AnnouncementListResponse)

@@ -547,6 +547,68 @@ type AdminOverviewResponse = {
   providers: ProviderSummary;
 };
 
+type StorageRetentionPolicy = {
+  enabled: boolean;
+  retention_days?: number | null;
+};
+
+type StorageRetentionRuntime = {
+  last_run_at?: string | null;
+  last_cutoff_date?: string | null;
+  last_deleted_jobs: number;
+  last_freed_bytes: number;
+  last_error?: string | null;
+};
+
+type AdminStorageBucket = {
+  job_date: string;
+  job_count: number;
+  total_bytes: number;
+  cumulative_jobs: number;
+  cumulative_bytes: number;
+};
+
+type AdminStorageSuggestion = {
+  retention_days: number;
+  cutoff_date: string;
+  matched_jobs: number;
+  estimated_freed_bytes: number;
+  estimated_freed_ratio_of_jobs: number;
+};
+
+type AdminStorageOverviewResponse = {
+  data_total_bytes: number;
+  jobs_total_bytes: number;
+  non_job_bytes: number;
+  deletable_jobs: number;
+  deletable_bytes: number;
+  oldest_job_date?: string | null;
+  newest_job_date?: string | null;
+  buckets: AdminStorageBucket[];
+  suggestions: AdminStorageSuggestion[];
+  recommended_suggestion?: AdminStorageSuggestion | null;
+  policy: StorageRetentionPolicy;
+  runtime: StorageRetentionRuntime;
+};
+
+type AdminStorageCleanupPreviewResponse = {
+  cutoff_date: string;
+  matched_jobs: number;
+  estimated_freed_bytes: number;
+  earliest_job_date?: string | null;
+  latest_job_date?: string | null;
+  active_jobs_skipped: number;
+};
+
+type AdminStorageCleanupExecuteResponse = {
+  cutoff_date: string;
+  deleted_jobs: number;
+  freed_bytes: number;
+  earliest_job_date?: string | null;
+  latest_job_date?: string | null;
+  active_jobs_skipped: number;
+};
+
 type ProviderCallSample = {
   ts: string;
   success: boolean;
@@ -798,6 +860,11 @@ function daysAgoISO(n: number) {
   return d.toISOString();
 }
 
+function dateInputValue(date: Date) {
+  const shifted = new Date(date.getTime() - date.getTimezoneOffset() * 60_000);
+  return shifted.toISOString().slice(0, 10);
+}
+
 function formatLocal(ts?: string) {
   if (!ts) return "-";
   const d = new Date(ts);
@@ -847,6 +914,19 @@ function numberish(n?: number) {
   if (n === undefined || n === null || Number.isNaN(n)) return "-";
   if (Math.abs(n) >= 1000) return n.toLocaleString();
   return String(n);
+}
+
+function formatBytes(n?: number | null) {
+  if (n === undefined || n === null || Number.isNaN(n) || n < 0) return "-";
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let value = n;
+  let unitIndex = 0;
+  while (value >= 1024 && unitIndex < units.length - 1) {
+    value /= 1024;
+    unitIndex += 1;
+  }
+  const digits = value < 10 && unitIndex > 0 ? 1 : 0;
+  return `${value.toFixed(digits)} ${units[unitIndex]}`;
 }
 
 function formatDurationMs(ms?: number | null) {
@@ -1098,19 +1178,6 @@ function downloadJson(filename: string, data: unknown) {
   a.click();
   a.remove();
   URL.revokeObjectURL(url);
-}
-
-function formatBytes(bytes?: number | null) {
-  if (typeof bytes !== "number" || !Number.isFinite(bytes) || bytes < 0) return "-";
-  if (bytes < 1024) return `${bytes} B`;
-  const units = ["KB", "MB", "GB", "TB"];
-  let value = bytes / 1024;
-  let idx = 0;
-  while (value >= 1024 && idx < units.length - 1) {
-    value /= 1024;
-    idx += 1;
-  }
-  return `${value.toFixed(value >= 10 ? 1 : 2)} ${units[idx]}`;
 }
 
 function base64ToBlob(base64: string, mime: string) {
@@ -3855,6 +3922,37 @@ class ApiClient {
   // Admin
   adminOverview(signal?: AbortSignal) {
     return this.request<AdminOverviewResponse>("/admin/overview", { method: "GET", signal });
+  }
+
+  adminStorageOverview(signal?: AbortSignal) {
+    return this.request<AdminStorageOverviewResponse>("/admin/storage/overview", { method: "GET", signal });
+  }
+
+  adminStorageCleanupPreview(payload: { cutoff_date: string }, signal?: AbortSignal) {
+    return this.request<AdminStorageCleanupPreviewResponse>("/admin/storage/cleanup/preview", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+      signal,
+    });
+  }
+
+  adminStorageCleanupExecute(payload: { cutoff_date: string }, signal?: AbortSignal) {
+    return this.request<AdminStorageCleanupExecuteResponse>("/admin/storage/cleanup/execute", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+      signal,
+    });
+  }
+
+  adminUpdateStorageRetention(payload: { enabled?: boolean; retention_days?: number | null }, signal?: AbortSignal) {
+    return this.request<{ policy: StorageRetentionPolicy; runtime: StorageRetentionRuntime }>("/admin/storage/retention", {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+      signal,
+    });
   }
 
   adminListAnnouncements(signal?: AbortSignal) {
@@ -6650,6 +6748,15 @@ function AdminPageLegacy() {
     return Math.max(0, Number(parsed.toFixed(4)));
   };
 
+  const parsePositiveInt = (value: string) => {
+    const raw = value.trim();
+    if (!raw) return null;
+    const parsed = Number(raw);
+    if (!Number.isFinite(parsed)) return null;
+    const rounded = Math.round(parsed);
+    return rounded > 0 ? rounded : null;
+  };
+
   const loadAdminData = async ({ silent = false }: { silent?: boolean } = {}) => {
     if (!silent) setLoading(true);
     setRefreshing(true);
@@ -6678,10 +6785,76 @@ function AdminPageLegacy() {
     }
   };
 
+  const syncStorageDrafts = (payload: AdminStorageOverviewResponse, preserveCutoff = false) => {
+    setRetentionEnabledDraft(Boolean(payload.policy.enabled));
+    setRetentionDaysDraft(payload.policy.retention_days == null ? "" : String(payload.policy.retention_days));
+    const fallbackCutoff =
+      payload.recommended_suggestion?.cutoff_date
+      || payload.suggestions[0]?.cutoff_date
+      || dateInputValue(new Date());
+    setStorageCutoffDate((current) => (preserveCutoff && current ? current : fallbackCutoff));
+    setStoragePreview((current) => {
+      if (preserveCutoff && current?.cutoff_date === storageCutoffDate) return current;
+      if (fallbackCutoff === payload.recommended_suggestion?.cutoff_date && payload.recommended_suggestion) {
+        return {
+          cutoff_date: payload.recommended_suggestion.cutoff_date,
+          matched_jobs: payload.recommended_suggestion.matched_jobs,
+          estimated_freed_bytes: payload.recommended_suggestion.estimated_freed_bytes,
+          earliest_job_date: payload.oldest_job_date ?? null,
+          latest_job_date: payload.newest_job_date ?? null,
+          active_jobs_skipped: 0,
+        };
+      }
+      return current;
+    });
+  };
+
+  const loadStorageOverview = async ({ silent = false, preserveCutoff = false }: { silent?: boolean; preserveCutoff?: boolean } = {}) => {
+    if (!silent) setStorageLoading(true);
+    setStorageRefreshing(true);
+    try {
+      const payload = await client.adminStorageOverview();
+      setStorageOverview(payload);
+      syncStorageDrafts(payload, preserveCutoff);
+    } catch (e: any) {
+      push({ kind: "error", title: "存储数据加载失败", message: getApiErrorMessage(e, "请检查后端状态") });
+    } finally {
+      setStorageLoading(false);
+      setStorageRefreshing(false);
+    }
+  };
+
+  const loadStoragePreview = async (cutoffDate: string) => {
+    if (!cutoffDate) {
+      setStoragePreview(null);
+      return;
+    }
+    const requestSeq = ++storagePreviewSeqRef.current;
+    setStoragePreviewLoading(true);
+    try {
+      const payload = await client.adminStorageCleanupPreview({ cutoff_date: cutoffDate });
+      if (requestSeq !== storagePreviewSeqRef.current) return;
+      setStoragePreview(payload);
+    } catch (e: any) {
+      if (requestSeq !== storagePreviewSeqRef.current) return;
+      push({ kind: "error", title: "清理预估失败", message: getApiErrorMessage(e, "请检查日期") });
+      setStoragePreview(null);
+    } finally {
+      if (requestSeq === storagePreviewSeqRef.current) setStoragePreviewLoading(false);
+    }
+  };
+
   useEffect(() => {
     loadAdminData();
+    loadStorageOverview();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  useEffect(() => {
+    if (!storageCutoffDate) return;
+    loadStoragePreview(storageCutoffDate);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [storageCutoffDate]);
 
   const selectedUser = useMemo(
     () => users.find((item) => item.user_id === selectedUserId) || null,
@@ -6734,6 +6907,58 @@ function AdminPageLegacy() {
       push({ kind: "error", title: "策略更新失败", message: getApiErrorMessage(e, "请检查输入") });
     } finally {
       setSavingPolicy(false);
+    }
+  };
+
+  const saveStorageRetentionPolicy = async () => {
+    const retentionDays = parsePositiveInt(retentionDaysDraft);
+    if (retentionEnabledDraft && retentionDays == null) {
+      push({ kind: "error", title: "自动删除配置无效", message: "开启自动删除时，保留天数必须为大于 0 的整数" });
+      return;
+    }
+    setSavingRetentionPolicy(true);
+    try {
+      const updated = await client.adminUpdateStorageRetention({
+        enabled: retentionEnabledDraft,
+        retention_days: retentionEnabledDraft ? retentionDays : retentionDays,
+      });
+      setRetentionEnabledDraft(Boolean(updated.policy.enabled));
+      setRetentionDaysDraft(updated.policy.retention_days == null ? "" : String(updated.policy.retention_days));
+      await loadStorageOverview({ silent: true, preserveCutoff: true });
+      push({ kind: "success", title: retentionEnabledDraft ? "自动删除已更新" : "已切换为永久保存" });
+    } catch (e: any) {
+      push({ kind: "error", title: "自动删除保存失败", message: getApiErrorMessage(e, "请检查输入") });
+    } finally {
+      setSavingRetentionPolicy(false);
+    }
+  };
+
+  const executeStorageCleanup = async () => {
+    if (!storageCutoffDate || !storagePreview) {
+      push({ kind: "error", title: "请先选择有效日期并等待预估完成" });
+      return;
+    }
+    const confirmMessage = [
+      `将删除 ${storageCutoffDate} 之前的 ${storagePreview.matched_jobs} 个已结束任务。`,
+      `预计释放空间：${formatBytes(storagePreview.estimated_freed_bytes)}。`,
+      storagePreview.active_jobs_skipped > 0 ? `会跳过 ${storagePreview.active_jobs_skipped} 个运行中/排队任务。` : "运行中/排队任务不会删除。",
+      "是否继续？",
+    ].join("\n");
+    if (!confirm(confirmMessage)) return;
+    setExecutingStorageCleanup(true);
+    try {
+      const result = await client.adminStorageCleanupExecute({ cutoff_date: storageCutoffDate });
+      await loadStorageOverview({ silent: true, preserveCutoff: true });
+      await loadStoragePreview(storageCutoffDate);
+      push({
+        kind: "success",
+        title: "存储清理已完成",
+        message: `已删除 ${result.deleted_jobs} 个任务，释放 ${formatBytes(result.freed_bytes)}`,
+      });
+    } catch (e: any) {
+      push({ kind: "error", title: "存储清理失败", message: getApiErrorMessage(e, "请稍后重试") });
+    } finally {
+      setExecutingStorageCleanup(false);
     }
   };
 
@@ -7324,6 +7549,17 @@ function AdminPage() {
   const [taskNextCursor, setTaskNextCursor] = useState<string | null>(null);
   const [selectedTask, setSelectedTask] = useState<AdminUserJobSummary | null>(null);
   const taskRequestSeqRef = useRef(0);
+  const [storageOverview, setStorageOverview] = useState<AdminStorageOverviewResponse | null>(null);
+  const [storageLoading, setStorageLoading] = useState(true);
+  const [storageRefreshing, setStorageRefreshing] = useState(false);
+  const [storagePreview, setStoragePreview] = useState<AdminStorageCleanupPreviewResponse | null>(null);
+  const [storagePreviewLoading, setStoragePreviewLoading] = useState(false);
+  const [storageCutoffDate, setStorageCutoffDate] = useState(dateInputValue(new Date()));
+  const [savingRetentionPolicy, setSavingRetentionPolicy] = useState(false);
+  const [retentionEnabledDraft, setRetentionEnabledDraft] = useState(false);
+  const [retentionDaysDraft, setRetentionDaysDraft] = useState("");
+  const [executingStorageCleanup, setExecutingStorageCleanup] = useState(false);
+  const storagePreviewSeqRef = useRef(0);
 
   const debouncedUserSearch = useDebounced(userSearch, 150);
   const debouncedTaskSearch = useDebounced(taskSearch, 180);
@@ -7342,6 +7578,15 @@ function AdminPage() {
     const parsed = Number(raw);
     if (!Number.isFinite(parsed)) return null;
     return Math.max(0, Number(parsed.toFixed(4)));
+  };
+
+  const parsePositiveInt = (value: string) => {
+    const raw = value.trim();
+    if (!raw) return null;
+    const parsed = Number(raw);
+    if (!Number.isFinite(parsed)) return null;
+    const rounded = Math.round(parsed);
+    return rounded > 0 ? rounded : null;
   };
 
   const clearOverrideDrafts = () => {
@@ -7412,10 +7657,76 @@ function AdminPage() {
     }
   };
 
+  const syncStorageDrafts = (payload: AdminStorageOverviewResponse, preserveCutoff = false) => {
+    setRetentionEnabledDraft(Boolean(payload.policy.enabled));
+    setRetentionDaysDraft(payload.policy.retention_days == null ? "" : String(payload.policy.retention_days));
+    const fallbackCutoff =
+      payload.recommended_suggestion?.cutoff_date
+      || payload.suggestions[0]?.cutoff_date
+      || dateInputValue(new Date());
+    setStorageCutoffDate((current) => (preserveCutoff && current ? current : fallbackCutoff));
+    setStoragePreview((current) => {
+      if (preserveCutoff && current?.cutoff_date === storageCutoffDate) return current;
+      if (fallbackCutoff === payload.recommended_suggestion?.cutoff_date && payload.recommended_suggestion) {
+        return {
+          cutoff_date: payload.recommended_suggestion.cutoff_date,
+          matched_jobs: payload.recommended_suggestion.matched_jobs,
+          estimated_freed_bytes: payload.recommended_suggestion.estimated_freed_bytes,
+          earliest_job_date: payload.oldest_job_date ?? null,
+          latest_job_date: payload.newest_job_date ?? null,
+          active_jobs_skipped: 0,
+        };
+      }
+      return current;
+    });
+  };
+
+  const loadStorageOverview = async ({ silent = false, preserveCutoff = false }: { silent?: boolean; preserveCutoff?: boolean } = {}) => {
+    if (!silent) setStorageLoading(true);
+    setStorageRefreshing(true);
+    try {
+      const payload = await client.adminStorageOverview();
+      setStorageOverview(payload);
+      syncStorageDrafts(payload, preserveCutoff);
+    } catch (e: any) {
+      push({ kind: "error", title: "存储数据加载失败", message: getApiErrorMessage(e, "请检查后端状态") });
+    } finally {
+      setStorageLoading(false);
+      setStorageRefreshing(false);
+    }
+  };
+
+  const loadStoragePreview = async (cutoffDate: string) => {
+    if (!cutoffDate) {
+      setStoragePreview(null);
+      return;
+    }
+    const requestSeq = ++storagePreviewSeqRef.current;
+    setStoragePreviewLoading(true);
+    try {
+      const payload = await client.adminStorageCleanupPreview({ cutoff_date: cutoffDate });
+      if (requestSeq !== storagePreviewSeqRef.current) return;
+      setStoragePreview(payload);
+    } catch (e: any) {
+      if (requestSeq !== storagePreviewSeqRef.current) return;
+      push({ kind: "error", title: "清理预估失败", message: getApiErrorMessage(e, "请检查日期") });
+      setStoragePreview(null);
+    } finally {
+      if (requestSeq === storagePreviewSeqRef.current) setStoragePreviewLoading(false);
+    }
+  };
+
   useEffect(() => {
     loadAdminData();
+    loadStorageOverview();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  useEffect(() => {
+    if (!storageCutoffDate) return;
+    loadStoragePreview(storageCutoffDate);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [storageCutoffDate]);
 
   const filteredUsers = useMemo(() => {
     const query = debouncedUserSearch.trim().toLowerCase();
@@ -7476,6 +7787,58 @@ function AdminPage() {
       push({ kind: "error", title: "策略更新失败", message: getApiErrorMessage(e, "请检查输入") });
     } finally {
       setSavingPolicy(false);
+    }
+  };
+
+  const saveStorageRetentionPolicy = async () => {
+    const retentionDays = parsePositiveInt(retentionDaysDraft);
+    if (retentionEnabledDraft && retentionDays == null) {
+      push({ kind: "error", title: "自动删除配置无效", message: "开启自动删除时，保留天数必须为大于 0 的整数" });
+      return;
+    }
+    setSavingRetentionPolicy(true);
+    try {
+      const updated = await client.adminUpdateStorageRetention({
+        enabled: retentionEnabledDraft,
+        retention_days: retentionEnabledDraft ? retentionDays : retentionDays,
+      });
+      setRetentionEnabledDraft(Boolean(updated.policy.enabled));
+      setRetentionDaysDraft(updated.policy.retention_days == null ? "" : String(updated.policy.retention_days));
+      await loadStorageOverview({ silent: true, preserveCutoff: true });
+      push({ kind: "success", title: retentionEnabledDraft ? "自动删除已更新" : "已切换为永久保存" });
+    } catch (e: any) {
+      push({ kind: "error", title: "自动删除保存失败", message: getApiErrorMessage(e, "请检查输入") });
+    } finally {
+      setSavingRetentionPolicy(false);
+    }
+  };
+
+  const executeStorageCleanup = async () => {
+    if (!storageCutoffDate || !storagePreview) {
+      push({ kind: "error", title: "请先选择有效日期并等待预估完成" });
+      return;
+    }
+    const confirmMessage = [
+      `将删除 ${storageCutoffDate} 之前的 ${storagePreview.matched_jobs} 个已结束任务。`,
+      `预计释放空间：${formatBytes(storagePreview.estimated_freed_bytes)}。`,
+      storagePreview.active_jobs_skipped > 0 ? `会跳过 ${storagePreview.active_jobs_skipped} 个运行中/排队任务。` : "运行中/排队任务不会删除。",
+      "是否继续？",
+    ].join("\n");
+    if (!confirm(confirmMessage)) return;
+    setExecutingStorageCleanup(true);
+    try {
+      const result = await client.adminStorageCleanupExecute({ cutoff_date: storageCutoffDate });
+      await loadStorageOverview({ silent: true, preserveCutoff: true });
+      await loadStoragePreview(storageCutoffDate);
+      push({
+        kind: "success",
+        title: "存储清理已完成",
+        message: `已删除 ${result.deleted_jobs} 个任务，释放 ${formatBytes(result.freed_bytes)}`,
+      });
+    } catch (e: any) {
+      push({ kind: "error", title: "存储清理失败", message: getApiErrorMessage(e, "请稍后重试") });
+    } finally {
+      setExecutingStorageCleanup(false);
     }
   };
 
@@ -7738,6 +8101,11 @@ function AdminPage() {
     if (updated) setSelectedTask(updated);
   }, [selectedTask, taskItems]);
 
+  const storageRecommendation = storageOverview?.recommended_suggestion || null;
+  const activeStorageSuggestion = useMemo(
+    () => storageOverview?.suggestions.find((item) => item.cutoff_date === storageCutoffDate) || null,
+    [storageCutoffDate, storageOverview]
+  );
   const selectedUserTags = selectedUser ? adminUserRiskTags(selectedUser) : [];
   const taskPreviewMap = useAdminTaskPreviewMap(taskItems, selectedUser?.user_id || "");
   const effectivePolicyRows = selectedUser
@@ -7784,7 +8152,18 @@ function AdminPage() {
       <PageTitle
         title="Admin"
         subtitle="双栏用户工作台：左边筛人，右边做审查、风控和任务级强操作。"
-        right={<Button variant="secondary" onClick={() => loadAdminData({ silent: true })} disabled={refreshing}>{refreshing ? "刷新中…" : "刷新"}</Button>}
+        right={
+          <Button
+            variant="secondary"
+            onClick={() => {
+              loadAdminData({ silent: true });
+              loadStorageOverview({ silent: true, preserveCutoff: true });
+            }}
+            disabled={refreshing || storageRefreshing}
+          >
+            {refreshing || storageRefreshing ? "刷新中…" : "刷新"}
+          </Button>
+        }
       />
 
       <Card hover={false} className="rounded-[28px] px-4 py-3">
@@ -7798,6 +8177,205 @@ function AdminPage() {
           <span className="rounded-full border border-zinc-200 bg-white px-3 py-1 dark:border-white/10 dark:bg-zinc-950/40">Failed Today {overview?.system.failed_today ?? "-"}</span>
           <span className="rounded-full border border-zinc-200 bg-white px-3 py-1 dark:border-white/10 dark:bg-zinc-950/40">Provider Healthy {overview?.providers.providers_healthy ?? "-"}</span>
         </div>
+      </Card>
+
+      <Card hover={false} className="mt-4 overflow-hidden rounded-[30px] border-zinc-300/70 bg-gradient-to-br from-white via-emerald-50/60 to-sky-50/60 dark:border-white/10 dark:from-zinc-950 dark:via-emerald-950/10 dark:to-sky-950/10">
+        <div className="flex flex-wrap items-start justify-between gap-3">
+          <div>
+            <div className="text-xs font-semibold uppercase tracking-[0.2em] text-zinc-500 dark:text-zinc-400">Storage</div>
+            <div className="mt-1 text-xl font-bold text-zinc-900 dark:text-zinc-50">数据存储 / 保留策略</div>
+            <div className="mt-1 text-sm text-zinc-600 dark:text-zinc-300">查看 data 占用、预估释放空间，并手动或自动清理历史任务。</div>
+          </div>
+          <Button variant="secondary" onClick={() => loadStorageOverview({ silent: true, preserveCutoff: true })} disabled={storageRefreshing}>
+            {storageRefreshing ? "刷新中…" : "刷新存储"}
+          </Button>
+        </div>
+
+        {storageLoading && !storageOverview ? (
+          <div className="mt-4 space-y-4">
+            <div className="grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-4">
+              {Array.from({ length: 4 }).map((_, idx) => <Skeleton key={idx} className="h-24 w-full rounded-3xl" />)}
+            </div>
+            <Skeleton className="h-72 w-full rounded-3xl" />
+          </div>
+        ) : !storageOverview ? (
+          <div className="mt-4"><EmptyHint text="存储概览暂不可用" /></div>
+        ) : (
+          <>
+            <div className="mt-4 grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-4">
+              <Card hover={false} className="border-white/70 bg-white/80 p-4 dark:border-white/10 dark:bg-zinc-950/40">
+                <div className="text-xs font-semibold uppercase tracking-[0.18em] text-zinc-500 dark:text-zinc-400">data 总占用</div>
+                <div className="mt-2 text-2xl font-black text-zinc-900 dark:text-zinc-50">{formatBytes(storageOverview.data_total_bytes)}</div>
+              </Card>
+              <Card hover={false} className="border-white/70 bg-white/80 p-4 dark:border-white/10 dark:bg-zinc-950/40">
+                <div className="text-xs font-semibold uppercase tracking-[0.18em] text-zinc-500 dark:text-zinc-400">jobs 占用</div>
+                <div className="mt-2 text-2xl font-black text-zinc-900 dark:text-zinc-50">{formatBytes(storageOverview.jobs_total_bytes)}</div>
+                <div className="mt-1 text-xs text-zinc-500 dark:text-zinc-400">{storageOverview.deletable_jobs} 个已结束任务可参与清理</div>
+              </Card>
+              <Card hover={false} className="border-white/70 bg-white/80 p-4 dark:border-white/10 dark:bg-zinc-950/40">
+                <div className="text-xs font-semibold uppercase tracking-[0.18em] text-zinc-500 dark:text-zinc-400">非任务占用</div>
+                <div className="mt-2 text-2xl font-black text-zinc-900 dark:text-zinc-50">{formatBytes(storageOverview.non_job_bytes)}</div>
+                <div className="mt-1 text-xs text-zinc-500 dark:text-zinc-400">auth / providers / 公告 / 日志等目录</div>
+              </Card>
+              <Card hover={false} className="border-emerald-200 bg-emerald-50/90 p-4 dark:border-emerald-500/20 dark:bg-emerald-950/20">
+                <div className="text-xs font-semibold uppercase tracking-[0.18em] text-emerald-700 dark:text-emerald-200">当前推荐可释放</div>
+                <div className="mt-2 text-2xl font-black text-emerald-800 dark:text-emerald-100">{formatBytes(storageRecommendation?.estimated_freed_bytes ?? 0)}</div>
+                <div className="mt-1 text-xs text-emerald-700/80 dark:text-emerald-200/80">
+                  {storageRecommendation ? `建议删除 ${storageRecommendation.retention_days} 天前任务` : "当前暂无推荐删除方案"}
+                </div>
+              </Card>
+            </div>
+
+            <div className="mt-4 grid grid-cols-1 gap-4 xl:grid-cols-[1.15fr_0.85fr]">
+              <div className="space-y-4">
+                <Card hover={false} className="border-zinc-200/80 bg-white/80 dark:border-white/10 dark:bg-zinc-950/35">
+                  <div className="flex flex-wrap items-start justify-between gap-3">
+                    <div>
+                      <div className="text-sm font-bold text-zinc-900 dark:text-zinc-50">推荐方案</div>
+                      <div className="text-xs text-zinc-600 dark:text-zinc-300">平衡推荐会优先找出“释放效果明显，但保留天数最短”的方案。</div>
+                    </div>
+                    {storageRecommendation ? (
+                      <Button variant="secondary" onClick={() => setStorageCutoffDate(storageRecommendation.cutoff_date)}>采用推荐日期</Button>
+                    ) : null}
+                  </div>
+                  {storageRecommendation ? (
+                    <div className="mt-4 rounded-3xl border border-emerald-200 bg-emerald-50/90 p-4 dark:border-emerald-500/20 dark:bg-emerald-950/20">
+                      <div className="text-lg font-bold text-emerald-900 dark:text-emerald-100">
+                        建议删除 {storageRecommendation.retention_days} 天前任务，预计释放 {formatBytes(storageRecommendation.estimated_freed_bytes)}
+                      </div>
+                      <div className="mt-2 text-sm text-emerald-800 dark:text-emerald-200">
+                        截止日期：{storageRecommendation.cutoff_date} · 涉及 {storageRecommendation.matched_jobs} 个任务 · 约占可清理空间 {Math.round(storageRecommendation.estimated_freed_ratio_of_jobs * 100)}%
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="mt-4 rounded-3xl border border-dashed border-zinc-300 bg-white/70 p-4 text-sm text-zinc-500 dark:border-white/10 dark:bg-zinc-950/30 dark:text-zinc-400">
+                      当前没有可清理的已结束任务，系统保持永久保存即可。
+                    </div>
+                  )}
+
+                  <div className="mt-4">
+                    <div className="text-xs font-semibold uppercase tracking-[0.18em] text-zinc-500 dark:text-zinc-400">常用候选</div>
+                    <div className="mt-3 flex flex-wrap gap-2">
+                      {storageOverview.suggestions.length ? storageOverview.suggestions.map((item) => (
+                        <button
+                          key={item.retention_days}
+                          type="button"
+                          onClick={() => setStorageCutoffDate(item.cutoff_date)}
+                          className={cn(
+                            "rounded-2xl border px-3 py-2 text-left text-sm transition",
+                            storageCutoffDate === item.cutoff_date
+                              ? "border-zinc-900 bg-zinc-900 text-white dark:border-white dark:bg-white dark:text-zinc-900"
+                              : "border-zinc-200 bg-white/80 text-zinc-800 hover:border-zinc-400 dark:border-white/10 dark:bg-zinc-950/30 dark:text-zinc-200"
+                          )}
+                        >
+                          <div className="font-semibold">{item.retention_days} 天前</div>
+                          <div className="text-[11px] opacity-80">{formatBytes(item.estimated_freed_bytes)} · {item.matched_jobs} 任务</div>
+                        </button>
+                      )) : <span className="text-sm text-zinc-500 dark:text-zinc-400">暂无可用候选</span>}
+                    </div>
+                  </div>
+                </Card>
+
+                <Card hover={false} className="border-zinc-200/80 bg-white/80 dark:border-white/10 dark:bg-zinc-950/35">
+                  <div className="flex flex-wrap items-start justify-between gap-3">
+                    <div>
+                      <div className="text-sm font-bold text-zinc-900 dark:text-zinc-50">手动删除预估</div>
+                      <div className="text-xs text-zinc-600 dark:text-zinc-300">删除整个 job 目录，包括原图、预览图、输入引用、请求响应与日志。</div>
+                    </div>
+                    {activeStorageSuggestion ? (
+                      <span className="rounded-full border border-amber-200 bg-amber-50 px-3 py-1 text-xs font-semibold text-amber-700 dark:border-amber-500/20 dark:bg-amber-950/20 dark:text-amber-200">
+                        当前是 {activeStorageSuggestion.retention_days} 天候选
+                      </span>
+                    ) : null}
+                  </div>
+
+                  <div className="mt-4 grid grid-cols-1 gap-4 md:grid-cols-[220px_minmax(0,1fr)]">
+                    <Field label="截止日期">
+                      <Input value={storageCutoffDate} onChange={setStorageCutoffDate} type="date" />
+                    </Field>
+                    <div className="grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-4">
+                      <Card hover={false} className="p-3"><KeyValue k="预计释放" v={storagePreviewLoading ? "..." : formatBytes(storagePreview?.estimated_freed_bytes)} /></Card>
+                      <Card hover={false} className="p-3"><KeyValue k="命中任务" v={storagePreviewLoading ? "..." : String(storagePreview?.matched_jobs ?? 0)} /></Card>
+                      <Card hover={false} className="p-3"><KeyValue k="最早任务日" v={storagePreview?.earliest_job_date || "-"} /></Card>
+                      <Card hover={false} className="p-3"><KeyValue k="最近命中日" v={storagePreview?.latest_job_date || "-"} /></Card>
+                    </div>
+                  </div>
+
+                  <div className="mt-4 rounded-3xl border border-zinc-200 bg-zinc-50/90 p-4 dark:border-white/10 dark:bg-zinc-950/30">
+                    <div className="flex flex-wrap items-center justify-between gap-3">
+                      <div className="space-y-1">
+                        <div className="text-sm font-semibold text-zinc-900 dark:text-zinc-50">
+                          {storagePreview?.matched_jobs
+                            ? `${storageCutoffDate} 之前预计删除 ${storagePreview.matched_jobs} 个任务，释放 ${formatBytes(storagePreview.estimated_freed_bytes)}`
+                            : "当前日期之前没有可删除的已结束任务"}
+                        </div>
+                        <div className="text-xs text-zinc-600 dark:text-zinc-300">
+                          {storagePreview?.active_jobs_skipped
+                            ? `会自动跳过 ${storagePreview.active_jobs_skipped} 个运行中/排队任务。`
+                            : "运行中/排队任务不会删除。"}
+                        </div>
+                      </div>
+                      <Button
+                        variant="primary"
+                        onClick={executeStorageCleanup}
+                        disabled={executingStorageCleanup || storagePreviewLoading || !storagePreview?.matched_jobs}
+                      >
+                        {executingStorageCleanup ? "删除中…" : "删除这些任务"}
+                      </Button>
+                    </div>
+                  </div>
+                </Card>
+              </div>
+
+              <Card hover={false} className="border-zinc-200/80 bg-white/80 dark:border-white/10 dark:bg-zinc-950/35">
+                <div className="text-sm font-bold text-zinc-900 dark:text-zinc-50">自动删除</div>
+                <div className="mt-1 text-xs text-zinc-600 dark:text-zinc-300">默认关闭。开启后，后端每天本地时间 03:00 后自动删除 X 天前的已结束任务。</div>
+
+                <div className="mt-4 grid grid-cols-1 gap-4">
+                  <Field label="开启自动删除">
+                    <div className="flex h-[42px] items-center">
+                      <Switch value={retentionEnabledDraft} onChange={setRetentionEnabledDraft} />
+                    </div>
+                  </Field>
+                  <Field label="保留天数">
+                    <Input
+                      value={retentionDaysDraft}
+                      onChange={setRetentionDaysDraft}
+                      placeholder={retentionEnabledDraft ? "例如 90" : "关闭时可留空"}
+                    />
+                  </Field>
+                  <div className="flex justify-end">
+                    <Button variant="primary" onClick={saveStorageRetentionPolicy} disabled={savingRetentionPolicy}>
+                      {savingRetentionPolicy ? "保存中…" : "保存自动删除"}
+                    </Button>
+                  </div>
+                </div>
+
+                <Divider />
+
+                <div className="space-y-3">
+                  <div className="text-xs font-semibold uppercase tracking-[0.18em] text-zinc-500 dark:text-zinc-400">最近一次自动清理</div>
+                  <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
+                    <Card hover={false} className="p-3"><KeyValue k="last_run_at" v={formatLocal(storageOverview.runtime.last_run_at || undefined)} /></Card>
+                    <Card hover={false} className="p-3"><KeyValue k="last_cutoff_date" v={storageOverview.runtime.last_cutoff_date || "-"} /></Card>
+                    <Card hover={false} className="p-3"><KeyValue k="deleted_jobs" v={String(storageOverview.runtime.last_deleted_jobs ?? 0)} /></Card>
+                    <Card hover={false} className="p-3"><KeyValue k="freed_bytes" v={formatBytes(storageOverview.runtime.last_freed_bytes)} /></Card>
+                  </div>
+                  <div className="rounded-2xl border border-zinc-200 bg-zinc-50/80 px-3 py-3 text-sm text-zinc-700 dark:border-white/10 dark:bg-zinc-950/30 dark:text-zinc-200">
+                    {storageOverview.runtime.last_error
+                      ? `最近一次自动清理报错：${storageOverview.runtime.last_error}`
+                      : retentionEnabledDraft
+                        ? "自动删除已启用，系统会在每天凌晨检查是否需要清理。"
+                        : "自动删除当前关闭，系统保持永久保存，仅支持管理员手动释放。"}
+                  </div>
+                  <div className="text-xs text-zinc-500 dark:text-zinc-400">
+                    可删除时间范围：{storageOverview.oldest_job_date || "-"} 至 {storageOverview.newest_job_date || "-"} · 累计可释放 {formatBytes(storageOverview.deletable_bytes)}
+                  </div>
+                </div>
+              </Card>
+            </div>
+          </>
+        )}
       </Card>
 
       <div className="mt-4 grid grid-cols-1 gap-4 xl:grid-cols-[340px_minmax(0,1fr)]">
