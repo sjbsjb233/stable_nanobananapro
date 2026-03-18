@@ -1905,19 +1905,31 @@ async function mapLimit<T, R>(items: T[], limit: number, fn: (t: T, i: number) =
   return out;
 }
 
+function shouldTreatApiErrorAsOffline(error: any) {
+  const rawCode = String(error?.error?.code || "").trim().toUpperCase();
+  if (rawCode === "NETWORK_ERROR") return true;
+  const statusCode = Number(rawCode);
+  return Number.isFinite(statusCode) && statusCode >= 500;
+}
+
 function useOnlineStatus() {
-  const [online, setOnline] = useState(typeof navigator !== "undefined" ? navigator.onLine : true);
+  const browserOnline = useBackendConnectivityStore((s) => s.browserOnline);
+  const backendReachable = useBackendConnectivityStore((s) => s.backendReachable);
+  const setBrowserOnline = useBackendConnectivityStore((s) => s.setBrowserOnline);
+
   useEffect(() => {
-    const on = () => setOnline(true);
-    const off = () => setOnline(false);
+    setBrowserOnline(typeof navigator !== "undefined" ? navigator.onLine : true);
+    const on = () => setBrowserOnline(true);
+    const off = () => setBrowserOnline(false);
     window.addEventListener("online", on);
     window.addEventListener("offline", off);
     return () => {
       window.removeEventListener("online", on);
       window.removeEventListener("offline", off);
     };
-  }, []);
-  return online;
+  }, [setBrowserOnline]);
+
+  return browserOnline && backendReachable;
 }
 
 function useDebounced<T>(value: T, ms: number) {
@@ -2212,6 +2224,22 @@ const useAuthStore = create<AuthStore>((set) => ({
   setLoading: (loading) => set({ loading }),
   setSession: (session) => set({ session, loading: false }),
   clearSession: () => set({ session: null, loading: false }),
+}));
+
+type BackendConnectivityStore = {
+  browserOnline: boolean;
+  backendReachable: boolean;
+  setBrowserOnline: (browserOnline: boolean) => void;
+  markBackendReachable: () => void;
+  markBackendUnreachable: () => void;
+};
+
+const useBackendConnectivityStore = create<BackendConnectivityStore>((set) => ({
+  browserOnline: typeof navigator !== "undefined" ? navigator.onLine : true,
+  backendReachable: true,
+  setBrowserOnline: (browserOnline) => set({ browserOnline }),
+  markBackendReachable: () => set({ backendReachable: true }),
+  markBackendUnreachable: () => set({ backendReachable: false }),
 }));
 
 type JobsStore = {
@@ -3367,11 +3395,13 @@ function ToastProvider({ children }: { children: React.ReactNode }) {
 function AnnouncementAutoModal() {
   const client = useApiClient();
   const { user, isAdmin } = useAuthSession();
+  const markBackendReachable = useBackendConnectivityStore((s) => s.markBackendReachable);
+  const markBackendUnreachable = useBackendConnectivityStore((s) => s.markBackendUnreachable);
   const [modalState, setModalState] = useState<AnnouncementModalState>({ open: false, items: [] });
   const [dismissingIds, setDismissingIds] = useState<Record<string, boolean>>({});
 
   useEffect(() => {
-    if (!user || isAdmin) {
+    if (!user) {
       setModalState({ open: false, items: [] });
       setDismissingIds({});
       return;
@@ -3384,13 +3414,19 @@ function AnnouncementAutoModal() {
       try {
         const payload = await client.listActiveAnnouncements();
         if (stopped) return;
-        const items = Array.isArray(payload?.items) ? payload.items : [];
+        markBackendReachable();
+        const items = !isAdmin && Array.isArray(payload?.items) ? payload.items : [];
         setModalState({
           open: items.length > 0,
           items,
         });
       } catch (error: any) {
         if (stopped) return;
+        if (shouldTreatApiErrorAsOffline(error)) {
+          markBackendUnreachable();
+        } else {
+          markBackendReachable();
+        }
         logWarn("announcement", "active announcement fetch failed", {
           user_id: user.user_id,
           message: error?.error?.message || error?.message || "request failed",
@@ -3400,12 +3436,14 @@ function AnnouncementAutoModal() {
 
     load();
     intervalId = window.setInterval(load, 60_000);
+    window.addEventListener("online", load);
 
     return () => {
       stopped = true;
       if (intervalId != null) window.clearInterval(intervalId);
+      window.removeEventListener("online", load);
     };
-  }, [client, isAdmin, user?.user_id]);
+  }, [client, isAdmin, markBackendReachable, markBackendUnreachable, user?.user_id]);
 
   const dismissAnnouncement = async (announcementId: string) => {
     if (!announcementId || dismissingIds[announcementId]) return;
