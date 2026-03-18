@@ -29,6 +29,7 @@ class JobStatus(str, Enum):
 class ErrorCode(str, Enum):
     AUTH_REQUIRED = "AUTH_REQUIRED"
     FORBIDDEN = "FORBIDDEN"
+    MAINTENANCE = "MAINTENANCE"
     INVALID_INPUT = "INVALID_INPUT"
     INVALID_CREDENTIALS = "INVALID_CREDENTIALS"
     JOB_NOT_FOUND = "JOB_NOT_FOUND"
@@ -49,6 +50,13 @@ class ErrorCode(str, Enum):
 class UserRole(str, Enum):
     ADMIN = "ADMIN"
     USER = "USER"
+
+
+class EmergencySwitchKey(str, Enum):
+    PAUSE_GENERATION = "pause_generation"
+    BLOCK_NEW_MEMBER_LOGIN = "block_new_member_login"
+    LOCK_MEMBER_BACKEND = "lock_member_backend"
+    PAUSE_IMAGE_ACCESS = "pause_image_access"
 
 
 class AnnouncementKind(str, Enum):
@@ -377,6 +385,32 @@ class UpdateSystemPolicyRequest(BaseModel):
     default_user_daily_image_access_limit: int | None = Field(default=None, ge=0)
     default_user_image_access_turnstile_bonus_quota: int | None = Field(default=None, ge=0)
     default_user_daily_image_access_hard_limit: int | None = Field(default=None, ge=0)
+
+
+class EmergencyState(BaseModel):
+    active_switches: list[EmergencySwitchKey] = Field(default_factory=list)
+    operator_reason: str = Field(default="")
+    public_message: str = Field(default="")
+    updated_at: datetime | None = None
+    updated_by_user_id: str | None = None
+    updated_by_username: str | None = None
+
+
+class EmergencyStateUpdateRequest(BaseModel):
+    active_switches: list[EmergencySwitchKey] = Field(default_factory=list)
+    operator_reason: str = Field(min_length=1, max_length=500)
+    public_message: str = Field(default="", max_length=2000)
+
+
+class EmergencyStateSummary(BaseModel):
+    active_switches: list[EmergencySwitchKey] = Field(default_factory=list)
+    operator_reason: str = Field(default="")
+    public_message: str = Field(default="")
+    updated_at: datetime | None = None
+    updated_by_user_id: str | None = None
+    updated_by_username: str | None = None
+    locked_for_current_user: bool = False
+    banner_message: str | None = None
 
 
 class StorageRetentionPolicy(BaseModel):

@@ -10,4 +10,5 @@ test("boots with admin bypass and navigates core pages", async ({ page }) => {
 
   await page.getByTestId("nav-admin").click();
   await expect(page.getByTestId("admin-user-search")).toBeVisible();
+  await expect(page.getByTestId("admin-danger-zone")).toBeVisible();
 });

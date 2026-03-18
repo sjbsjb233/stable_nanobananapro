@@ -13,6 +13,7 @@ from fastapi.testclient import TestClient
 from PIL import Image
 
 from app.config import settings
+from app.emergency_state_store import emergency_state_store
 from app.gemini_client import GeminiError, gemini_client
 from app.job_manager import job_manager
 from app.main import app
@@ -269,6 +270,201 @@ def test_change_password_updates_hash_and_keeps_session(client: TestClient) -> N
     )
     assert new_login.status_code == 200
     assert new_login.json()["authenticated"] is True
+
+
+def test_admin_can_read_and_update_emergency_state(client: TestClient) -> None:
+    login(client)
+
+    initial = client.get("/v1/admin/emergency")
+    assert initial.status_code == 200
+    assert initial.json()["active_switches"] == []
+
+    updated = client.patch(
+        "/v1/admin/emergency",
+        json={
+            "active_switches": ["pause_generation", "lock_member_backend"],
+            "operator_reason": "incident handling",
+            "public_message": "系统正在执行临时限制。",
+        },
+    )
+    assert updated.status_code == 200
+    body = updated.json()
+    assert set(body["active_switches"]) == {"pause_generation", "lock_member_backend"}
+    assert body["operator_reason"] == "incident handling"
+    assert body["updated_by_username"] == "admin"
+
+    overview = client.get("/v1/admin/overview")
+    assert overview.status_code == 200
+    assert set(overview.json()["emergency"]["active_switches"]) == {"pause_generation", "lock_member_backend"}
+
+
+def test_emergency_can_block_new_member_login(client: TestClient) -> None:
+    login(client)
+    created = client.post(
+        "/v1/admin/users",
+        json={
+            "username": "alice",
+            "password": "alice123456",
+            "role": "USER",
+            "enabled": True,
+            "policy_overrides": {},
+        },
+    )
+    assert created.status_code == 201
+
+    emergency_state_store.update_state(
+        active_switches=["block_new_member_login"],
+        operator_reason="incident",
+        public_message="login blocked",
+        updated_by_user_id="admin",
+        updated_by_username="admin",
+    )
+
+    client.post("/v1/auth/logout")
+    denied = client.post(
+        "/v1/auth/login",
+        json={
+            "username": "alice",
+            "password": "alice123456",
+            "turnstile_token": "turnstile-ok",
+        },
+    )
+    assert denied.status_code == 503
+    assert denied.json()["error"]["code"] == "MAINTENANCE"
+
+
+def test_emergency_lock_member_backend_keeps_auth_me_but_blocks_member_business_access(client: TestClient) -> None:
+    login(client)
+    created = client.post(
+        "/v1/admin/users",
+        json={
+            "username": "alice",
+            "password": "alice123456",
+            "role": "USER",
+            "enabled": True,
+            "policy_overrides": {},
+        },
+    )
+    assert created.status_code == 201
+
+    client.post("/v1/auth/logout")
+    login(client, "alice", "alice123456")
+
+    emergency_state_store.update_state(
+        active_switches=["lock_member_backend"],
+        operator_reason="incident",
+        public_message="backend locked",
+        updated_by_user_id="admin",
+        updated_by_username="admin",
+    )
+
+    me = client.get("/v1/auth/me")
+    assert me.status_code == 200
+    assert me.json()["emergency"]["locked_for_current_user"] is True
+
+    denied = client.get("/v1/models")
+    assert denied.status_code == 503
+    assert denied.json()["error"]["code"] == "MAINTENANCE"
+
+
+def test_emergency_pause_generation_blocks_create_and_retry(client: TestClient) -> None:
+    login(client)
+
+    emergency_state_store.update_state(
+        active_switches=["pause_generation"],
+        operator_reason="incident",
+        public_message="generation paused",
+        updated_by_user_id="admin",
+        updated_by_username="admin",
+    )
+
+    create_resp = client.post(
+        "/v1/jobs",
+        json={
+            "prompt": "hello",
+            "model": "gemini-3.1-flash-image-preview",
+            "mode": "IMAGE_ONLY",
+            "params": {"aspect_ratio": "1:1", "image_size": "1K", "temperature": 0.7, "timeout_sec": 60, "max_retries": 0},
+        },
+    )
+    assert create_resp.status_code == 503
+    assert create_resp.json()["error"]["code"] == "MAINTENANCE"
+
+    create_storage_job(
+        "a" * 32,
+        status="FAILED",
+        created_at=iso_at(timedelta(days=-1)),
+        owner_user_id=user_store.get_user_by_username("admin")["user_id"],  # type: ignore[index]
+        result_size=1,
+        preview_size=1,
+        input_size=1,
+    )
+    retry_resp = client.post(f"/v1/jobs/{'a' * 32}/retry", json={"override_params": None})
+    assert retry_resp.status_code == 503
+    assert retry_resp.json()["error"]["code"] == "MAINTENANCE"
+
+
+def test_emergency_pause_image_access_blocks_member_image_reads(client: TestClient) -> None:
+    login(client)
+    created = client.post(
+        "/v1/admin/users",
+        json={
+            "username": "alice",
+            "password": "alice123456",
+            "role": "USER",
+            "enabled": True,
+            "policy_overrides": {},
+        },
+    )
+    assert created.status_code == 201
+    alice = created.json()
+
+    create_storage_job(
+        "b" * 32,
+        status="SUCCEEDED",
+        created_at=iso_at(timedelta(days=-1)),
+        owner_user_id=alice["user_id"],
+        result_size=16,
+        preview_size=16,
+        input_size=16,
+    )
+
+    client.post("/v1/auth/logout")
+    login(client, "alice", "alice123456")
+
+    emergency_state_store.update_state(
+        active_switches=["pause_image_access"],
+        operator_reason="incident",
+        public_message="image access paused",
+        updated_by_user_id="admin",
+        updated_by_username="admin",
+    )
+
+    denied = client.get(f"/v1/jobs/{'b' * 32}/images/image_0")
+    assert denied.status_code == 503
+    assert denied.json()["error"]["code"] == "MAINTENANCE"
+
+
+def test_admin_endpoints_remain_available_during_emergency_lockdown(client: TestClient) -> None:
+    login(client)
+
+    emergency_state_store.update_state(
+        active_switches=[
+            "pause_generation",
+            "block_new_member_login",
+            "lock_member_backend",
+            "pause_image_access",
+        ],
+        operator_reason="full incident",
+        public_message="system locked",
+        updated_by_user_id="admin",
+        updated_by_username="admin",
+    )
+
+    providers = client.get("/v1/admin/providers")
+    assert providers.status_code == 200
+    emergency = client.get("/v1/admin/emergency")
+    assert emergency.status_code == 200
 
 
 def test_change_password_rejects_invalid_current_password(client: TestClient) -> None:
