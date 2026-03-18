@@ -335,6 +335,24 @@ class UserStore:
             self._save_locked(doc)
             return self.sanitize_user(user)
 
+    def change_password(self, user_id: str, *, current_password: str, new_password: str) -> dict[str, Any] | None:
+        with self._lock:
+            doc = self._load_locked()
+            user = self._find_user_locked(doc, user_id=user_id)
+            if not user:
+                return None
+
+            current_hash = str(user.get("password_hash") or "")
+            if not verify_password(current_password, current_hash):
+                raise ValueError("INVALID_CREDENTIALS")
+            if verify_password(new_password, current_hash):
+                raise ValueError("PASSWORD_UNCHANGED")
+
+            user["password_hash"] = _hash_password(new_password)
+            user["updated_at"] = now_local().isoformat()
+            self._save_locked(doc)
+            return self.sanitize_user(user)
+
     def create_user(
         self,
         *,

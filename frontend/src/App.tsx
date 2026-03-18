@@ -3629,6 +3629,15 @@ class ApiClient {
     return this.request<AuthSession>("/auth/me", { method: "GET", signal });
   }
 
+  changePassword(payload: { current_password: string; new_password: string }, signal?: AbortSignal) {
+    return this.request<AuthSession>("/auth/password", {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+      signal,
+    });
+  }
+
   verifyGenerationTurnstile(turnstileToken: string, requestedJobCount?: number, signal?: AbortSignal) {
     return this.request<AuthSession>("/auth/turnstile/generation", {
       method: "POST",
@@ -15538,6 +15547,7 @@ function SettingsPage() {
   const catalog = useModelCatalog();
   const nav = useNavigate();
   const { user, isAdmin } = useAuthSession();
+  const setSession = useAuthStore((s) => s.setSession);
   const settings = useSettingsStore((s) => s.settings);
   const setSettings = useSettingsStore((s) => s.setSettings);
   const resetSettings = useSettingsStore((s) => s.resetSettings);
@@ -15571,6 +15581,10 @@ function SettingsPage() {
   const [resolveUrgencyWeight, setResolveUrgencyWeight] = useState(settings.pickerScheduler.resolveUrgencyWeight);
   const [polishRatingWeight, setPolishRatingWeight] = useState(settings.pickerScheduler.polishRatingWeight);
   const [cacheStatsState, setCacheStatsState] = useState<ImageCacheStats>({ count: 0, size: 0 });
+  const [currentPassword, setCurrentPassword] = useState("");
+  const [newPassword, setNewPassword] = useState("");
+  const [confirmNewPassword, setConfirmNewPassword] = useState("");
+  const [passwordSubmitting, setPasswordSubmitting] = useState(false);
 
   useEffect(() => {
     setDefaultModel(settings.defaultModel || catalog.default_model);
@@ -15689,6 +15703,43 @@ function SettingsPage() {
     input.click();
   };
 
+  const handleChangePassword = async () => {
+    if (!currentPassword || !newPassword || !confirmNewPassword) {
+      push({ kind: "error", title: "修改密码失败", message: "请填写当前密码、新密码和确认新密码" });
+      return;
+    }
+    if (newPassword.length < 8 || newPassword.length > 128) {
+      push({ kind: "error", title: "修改密码失败", message: "新密码长度必须为 8-128 位" });
+      return;
+    }
+    if (newPassword !== confirmNewPassword) {
+      push({ kind: "error", title: "修改密码失败", message: "确认新密码必须与新密码一致" });
+      return;
+    }
+    if (newPassword === currentPassword) {
+      push({ kind: "error", title: "修改密码失败", message: "新密码不能与当前密码相同" });
+      return;
+    }
+
+    setPasswordSubmitting(true);
+    try {
+      const session = await client.changePassword({
+        current_password: currentPassword,
+        new_password: newPassword,
+      });
+      useJobsStore.getState().scopeJobs(session.user.user_id);
+      setSession(session);
+      setCurrentPassword("");
+      setNewPassword("");
+      setConfirmNewPassword("");
+      push({ kind: "success", title: "密码已更新" });
+    } catch (e: any) {
+      push({ kind: "error", title: "修改密码失败", message: getApiErrorMessage(e, "请稍后重试") });
+    } finally {
+      setPasswordSubmitting(false);
+    }
+  };
+
   return (
     <PageContainer>
       <PageTitle title="Settings" subtitle="浏览器配置中心：baseUrl / 默认参数 / 轮询 / UI / 数据管理" right={<Button onClick={save}>保存</Button>} />
@@ -15794,6 +15845,45 @@ function SettingsPage() {
             ) : (
               <div className="mt-3 text-sm text-zinc-600 dark:text-zinc-300">当前未登录。</div>
             )}
+          </Card>
+        ) : null}
+
+        {user ? (
+          <Card className="lg:col-span-2" testId="settings-change-password-card">
+            <div className="flex flex-wrap items-start justify-between gap-3">
+              <div>
+                <div className="text-sm font-bold text-zinc-900 dark:text-zinc-50">修改密码</div>
+                <div className="mt-2 text-xs text-zinc-600 dark:text-zinc-300">
+                  当前账号 {user.username} 可在这里自助修改密码。修改成功后会保留当前登录态。
+                </div>
+              </div>
+              <div className="rounded-full border border-zinc-200 bg-white px-3 py-1 text-xs font-semibold text-zinc-600 dark:border-white/10 dark:bg-zinc-950/40 dark:text-zinc-300">
+                Session 保持有效
+              </div>
+            </div>
+            <div className="mt-3 grid grid-cols-1 gap-3 md:grid-cols-3">
+              <Field label="当前密码">
+                <Input testId="settings-current-password" value={currentPassword} onChange={setCurrentPassword} type="password" placeholder="请输入当前密码" />
+              </Field>
+              <Field label="新密码">
+                <Input testId="settings-new-password" value={newPassword} onChange={setNewPassword} type="password" placeholder="8-128 位新密码" />
+              </Field>
+              <Field label="确认新密码">
+                <Input
+                  testId="settings-confirm-new-password"
+                  value={confirmNewPassword}
+                  onChange={setConfirmNewPassword}
+                  type="password"
+                  placeholder="再次输入新密码"
+                />
+              </Field>
+            </div>
+            <div className="mt-3 flex flex-wrap items-center gap-2">
+              <Button testId="settings-change-password-submit" onClick={handleChangePassword} disabled={passwordSubmitting}>
+                {passwordSubmitting ? "提交中…" : "更新密码"}
+              </Button>
+              <div className="text-xs text-zinc-500 dark:text-zinc-400">后端会校验当前密码，新密码不能与旧密码相同。</div>
+            </div>
           </Card>
         ) : null}
 
