@@ -8,11 +8,12 @@
 当前仓库同时支持两套明确分离的流程：
 
 - Codex / worktree 开发流程：只用 `./scripts/worktree-dev.sh`
-- 手工本地仿真与生产发布流程：保留 Docker、`release.sh`、`srv_server/`
+- 手工本地仿真流程：保留 Docker 和 `srv_server/`，仅用于本地仿真或服务器模板维护
 
 默认原则：
 
-- 开发机负责改代码、跑测试、构建镜像、推送 Docker Hub
+- 开发机负责改代码、跑测试、合并到 `main`、创建 release tag 和 GitHub Release
+- GitHub Actions 负责构建镜像并推送 Docker Hub
 - 服务器负责拉镜像、启动容器、由 Watchtower 自动更新
 - 敏感配置通过 env 文件注入，不写进镜像
 - 生产默认继续跟踪 `latest`，正式发布 tag 用于审计和回滚
@@ -25,10 +26,8 @@ stable_nanobananapro/
   frontend/
   scripts/
     worktree-dev.sh
-    init-buildx.sh
     build-local-sim-images.sh
     make-release-tag.sh
-  release.sh
   .github/
     workflows/
       ci.yml
@@ -267,29 +266,7 @@ gh release create "$TAG" --verify-tag --generate-notes --title "$TAG"
 4. 推送 `${RELEASE_TAG}` 和 `latest`
 5. 生产机上的 Watchtower 检测到 `latest` 更新并自动拉取
 
-## 四、`release.sh` 的定位
-
-[`release.sh`](/Users/sjbsjb233/work/tools/stable_nanobananapro/release.sh) 继续保留，作为本地手工发布兜底路径：
-
-```bash
-./release.sh
-./release.sh v0.0.7-8f3a2c1
-PUSH_LATEST=0 ./release.sh v0.0.7-8f3a2c1
-```
-
-默认行为：
-
-- 默认 tag 为 `git rev-parse --short HEAD`
-- 默认目标平台为 `linux/amd64`
-- 默认同时推送正式 tag 和 `latest`
-
-使用建议：
-
-- 正常正式发布优先走 GitHub Release -> Actions
-- `release.sh` 用于 GitHub Actions 故障时的手工兜底
-- 也可用于开发机临时紧急构建
-
-## 五、生产服务器部署
+## 四、生产服务器部署
 
 推荐直接上传 [`srv_server/`](/Users/sjbsjb233/work/tools/stable_nanobananapro/srv_server) 到服务器，例如 `/srv/stable`。
 
@@ -346,7 +323,7 @@ DOCKER_CONFIG_PATH=/root/.docker/config.json
 
 `docker-compose.prod.yml` 已把这个文件挂载到 Watchtower 容器内的 `/config.json`，用于拉取私有镜像。
 
-## 六、回滚
+## 五、回滚
 
 正式版本回滚优先用固定 tag：
 
@@ -364,7 +341,7 @@ docker compose -f docker-compose.prod.yml up -d
 
 不建议把“回滚”做成重新覆盖 `latest` 的自动流程。
 
-## 七、故障排查
+## 六、故障排查
 
 ### 1. GitHub Release 发布后没有推镜像
 

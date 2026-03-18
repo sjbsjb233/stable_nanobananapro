@@ -11,9 +11,10 @@
 - 架构：
   - `backend/`：FastAPI 后端
   - `frontend/`：React + Vite 前端
-- 发布方式：Docker 镜像发布到 Docker Hub，生产机通过 Compose + Watchtower 更新
+- 发布方式：通过 Git tag + GitHub Release 触发 GitHub Actions 构建并发布 Docker Hub 镜像，生产机通过 Compose + Watchtower 更新
 - 核心原则：
-  - 开发机负责：改代码、跑测试、构建镜像、推送镜像
+  - 开发机负责：改代码、跑测试、提交到 `main`、创建正式 release tag
+  - GitHub Actions 负责：构建镜像并推送 Docker Hub
   - 生产机负责：拉镜像并运行容器
   - 数据目录持久化，不跟容器生命周期绑定
   - 密钥配置通过 `env_file` 注入，不写进镜像
@@ -253,7 +254,6 @@ srv/stable/
 
 - `scripts/build-local-sim-images.sh`
 - `scripts/deploy-local-sim.sh`
-- `scripts/init-buildx.sh`
 
 说明：
 
@@ -262,9 +262,17 @@ srv/stable/
 
 ## 7. 发布与生产更新
 
-- `release.sh` 只在用户明确要求发布时才允许执行
-- 平时开发不要频繁推送 Docker Hub
-- 生产机通过 Watchtower 自动更新 `latest`
+- 正式发布只允许走 Git tag + GitHub Release + GitHub Actions
+- 标准 tag 格式：`v<人类版本号>-<短hash>`
+- 标准顺序：
+  1. `git switch main && git pull`
+  2. `TAG="$(./scripts/make-release-tag.sh v0.0.x)"`
+  3. `git tag -a "$TAG" -m "Release $TAG"`
+  4. `git push origin "$TAG"`
+  5. `gh release create "$TAG" --verify-tag --generate-notes --title "$TAG"`
+- `push main` 只触发 CI，不推镜像
+- 只有 `Publish release` 才会触发镜像构建与推送
+- 生产机通过 Watchtower 自动跟踪 `latest`
 
 ## 8. Agent 执行约定
 
@@ -274,5 +282,5 @@ srv/stable/
 2. 默认用 `./scripts/worktree-dev.sh` 完成环境准备、启动、测试、Playwright 验证
 3. 不要为了测试方便而默认改代码
 4. 不要默认新增 e2e spec，除非用户明确要求
-5. 只有在用户明确要求时，才允许碰 Docker 发布链路或执行 `release.sh`
+5. 只有在用户明确要求时，才允许碰发布链路；正式发布只允许使用 Git tag + GitHub Release，不允许恢复旧的本地手工推镜像方案
 6. 涉及流程变更时同步更新 `README.md` 与本文件
