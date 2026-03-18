@@ -291,6 +291,11 @@ gh release create "$TAG" --verify-tag --generate-notes --title "$TAG"
 
 - 不要让 CLI 自动帮你创建 tag
 - 一律先 `git tag -a`，再 `git push origin <tag>`，最后才创建 Release
+- `Generate release notes` / `--generate-notes` 只能作为初稿，不能直接当最终发布正文
+- 发布前应人工检查 compare 区间、主要 PR、测试/CI 变化，并补齐本次版本真正的核心功能、修复和运维影响
+- Release 正文至少应覆盖：版本摘要、主要功能/修复、管理端或运维侧变化、测试/CI 改动、依赖或兼容性说明、Full Changelog 链接
+- 如果正文写错或自动生成内容漏了重点，优先使用 `gh release edit <tag>` 修正现有 Release；不要删除并重建 Release
+- 如果线上已经在跑该版本，而当前仅是描述问题，不要重新发布或重推镜像
 
 ### 6. 发布后会发生什么
 

@@ -323,6 +323,12 @@ srv/stable/
   3. `git tag -a "$TAG" -m "Release $TAG"`
   4. `git push origin "$TAG"`
   5. `gh release create "$TAG" --verify-tag --generate-notes --title "$TAG"`
+- Release 正文要求：
+  - `--generate-notes` 只能当草稿，不能把自动生成结果直接当最终正文
+  - 发布前必须检查 compare 区间、主要 PR、测试/CI 变化，人工补齐本次版本真正的核心功能与运维影响
+  - 正文至少应覆盖：本次版本摘要、主要功能/修复、管理端或运维侧变化、测试/CI 改动、依赖或兼容性说明、Full Changelog 链接
+  - 如果自动生成正文遗漏主要功能，应用 `gh release edit <tag>` 直接修正文案，不要删除并重建 release
+  - 如果生产环境已经在跑该版本，而当前问题只是 release 描述不准确，只允许编辑 release 正文，不要重新触发发布链路
 - `push main` 只触发 CI，不推镜像
 - 只有 `Publish release` 才会触发镜像构建与推送
 - 生产机通过 Watchtower 自动跟踪 `latest`
