@@ -1,5 +1,7 @@
 # Nano Banana Pro
 
+<!-- Temporary no-op comment for PR CI validation branch. -->
+
 `stable_nanobananapro` 由两个服务组成：
 
 - `backend/`：FastAPI 后端
