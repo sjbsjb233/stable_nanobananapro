@@ -2231,7 +2231,7 @@ def test_admin_user_jobs_list_filters_and_retry_preserves_owner(
         json={"username": "bob_jobs", "password": "bobpass123", "role": "USER", "enabled": True},
     )
     assert bob_resp.status_code == 201
-    bob = bob_resp.json()
+    bob_resp.json()
 
     client.post("/v1/auth/logout")
     login(client, username="alice_jobs", password="alicepass123")
