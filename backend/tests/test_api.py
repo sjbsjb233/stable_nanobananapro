@@ -169,6 +169,106 @@ def test_test_env_admin_bypass_login_ignores_credentials_and_turnstile(
     assert body["user"]["role"] == "ADMIN"
 
 
+def test_change_password_updates_hash_and_keeps_session(client: TestClient) -> None:
+    login(client)
+
+    resp = client.patch(
+        "/v1/auth/password",
+        json={
+            "current_password": "admin123456",
+            "new_password": "admin654321",
+        },
+    )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["authenticated"] is True
+    assert body["user"]["username"] == "admin"
+
+    me = client.get("/v1/auth/me")
+    assert me.status_code == 200
+    assert me.json()["authenticated"] is True
+
+    client.post("/v1/auth/logout")
+
+    old_login = client.post(
+        "/v1/auth/login",
+        json={
+            "username": "admin",
+            "password": "admin123456",
+            "turnstile_token": "turnstile-ok",
+        },
+    )
+    assert old_login.status_code == 401
+    assert old_login.json()["error"]["code"] == "INVALID_CREDENTIALS"
+
+    new_login = client.post(
+        "/v1/auth/login",
+        json={
+            "username": "admin",
+            "password": "admin654321",
+            "turnstile_token": "turnstile-ok",
+        },
+    )
+    assert new_login.status_code == 200
+    assert new_login.json()["authenticated"] is True
+
+
+def test_change_password_rejects_invalid_current_password(client: TestClient) -> None:
+    login(client)
+
+    resp = client.patch(
+        "/v1/auth/password",
+        json={
+            "current_password": "wrongpass123",
+            "new_password": "admin654321",
+        },
+    )
+
+    assert resp.status_code == 401
+    assert resp.json()["error"]["code"] == "INVALID_CREDENTIALS"
+
+    client.post("/v1/auth/logout")
+    relogin = client.post(
+        "/v1/auth/login",
+        json={
+            "username": "admin",
+            "password": "admin123456",
+            "turnstile_token": "turnstile-ok",
+        },
+    )
+    assert relogin.status_code == 200
+    assert relogin.json()["authenticated"] is True
+
+
+def test_change_password_requires_auth(client: TestClient) -> None:
+    resp = client.patch(
+        "/v1/auth/password",
+        json={
+            "current_password": "admin123456",
+            "new_password": "admin654321",
+        },
+    )
+
+    assert resp.status_code == 401
+    assert resp.json()["error"]["code"] == "AUTH_REQUIRED"
+
+
+def test_change_password_rejects_same_password(client: TestClient) -> None:
+    login(client)
+
+    resp = client.patch(
+        "/v1/auth/password",
+        json={
+            "current_password": "admin123456",
+            "new_password": "admin123456",
+        },
+    )
+
+    assert resp.status_code == 400
+    assert resp.json()["error"]["code"] == "INVALID_INPUT"
+
+
 def test_cors_preflight_allows_patch_for_admin_endpoints(client: TestClient) -> None:
     resp = client.options(
         "/v1/admin/policy",

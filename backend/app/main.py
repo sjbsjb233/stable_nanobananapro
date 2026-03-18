@@ -41,6 +41,7 @@ from .schemas import (
     AddProviderBalanceRequest,
     BatchPreviewRequest,
     BatchMetaRequest,
+    ChangePasswordRequest,
     CreateJobRequest,
     CreateJobResponse,
     CreateAnnouncementRequest,
@@ -818,6 +819,31 @@ async def logout(request: Request, _: dict[str, Any] = Depends(get_current_user)
 @app.get(f"{settings.api_prefix}/auth/me")
 async def auth_me(request: Request, current_user: dict[str, Any] = Depends(get_current_user)) -> dict[str, Any]:
     return _session_payload(request, current_user)
+
+
+@app.patch(f"{settings.api_prefix}/auth/password")
+async def change_password(
+    payload: ChangePasswordRequest,
+    request: Request,
+    current_user: dict[str, Any] = Depends(get_current_user),
+) -> dict[str, Any]:
+    try:
+        updated_user = user_store.change_password(
+            str(current_user["user_id"]),
+            current_password=payload.current_password,
+            new_password=payload.new_password,
+        )
+    except ValueError as exc:
+        if str(exc) == "INVALID_CREDENTIALS":
+            raise api_error(ErrorCode.INVALID_CREDENTIALS, "Invalid username or password", http_status=401) from exc
+        if str(exc) == "PASSWORD_UNCHANGED":
+            raise api_error(ErrorCode.INVALID_INPUT, "New password must be different from current password", http_status=400) from exc
+        raise
+
+    if not updated_user:
+        raise api_error(ErrorCode.AUTH_REQUIRED, "Authentication required", http_status=401)
+    request.state.current_user = updated_user
+    return _session_payload(request, updated_user)
 
 
 @app.get(f"{settings.api_prefix}/announcements/active", response_model=AnnouncementListResponse)
