@@ -20,6 +20,7 @@ from app.announcement_store import announcement_store
 from app.provider_store import provider_store
 from app.rate_limiter import InMemoryRateLimiter
 from app.storage import storage
+from app.storage_retention import storage_retention_service, storage_retention_store
 from app.user_store import user_store
 
 
@@ -73,6 +74,7 @@ def client(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> TestClient:
     user_store.path = tmp_path / "auth" / "users.json"
     provider_store.path = tmp_path / "providers.json"
     announcement_store.path = tmp_path / "announcements.json"
+    storage_retention_store.path = tmp_path / "storage_retention.json"
     provider_store.reset_runtime_state()
 
     async def fake_turnstile(token: str, remote_ip: str | None = None):
@@ -110,6 +112,59 @@ def wait_for_job_terminal(client: TestClient, job_id: str, *, job_token: str | N
         time.sleep(0.1)
     assert meta is not None
     return meta
+
+
+def create_storage_job(
+    job_id: str,
+    *,
+    status: str,
+    created_at: str,
+    updated_at: str | None = None,
+    owner_user_id: str = "admin",
+    result_size: int = 0,
+    preview_size: int = 0,
+    input_size: int = 0,
+) -> None:
+    storage.create_job_dirs(job_id)
+    if result_size > 0:
+        (storage.job_dir(job_id) / "result" / "image_0.png").write_bytes(b"r" * result_size)
+    if preview_size > 0:
+        (storage.job_dir(job_id) / "preview" / "image_0.webp").write_bytes(b"p" * preview_size)
+    if input_size > 0:
+        (storage.job_dir(job_id) / "input" / "reference_0.png").write_bytes(b"i" * input_size)
+    storage.save_request(job_id, {"prompt": f"prompt {job_id}", "reference_images": []})
+    storage.save_response(job_id, {"latency_ms": 10})
+    storage.save_meta(
+        job_id,
+        {
+            "job_id": job_id,
+            "created_at": created_at,
+            "updated_at": updated_at or created_at,
+            "status": status,
+            "model": "gemini-3.1-flash-image-preview",
+            "mode": "IMAGE_ONLY",
+            "params": {
+                "aspect_ratio": "1:1",
+                "image_size": "1K",
+                "temperature": 0.7,
+                "timeout_sec": 60,
+                "max_retries": 0,
+            },
+            "timing": {},
+            "result": {
+                "images": [{"image_id": "image_0"}] if status == "SUCCEEDED" else []
+            },
+            "usage": {},
+            "billing": {},
+            "response": {},
+            "error": None,
+            "owner": {"user_id": owner_user_id, "username": owner_user_id, "role": "ADMIN" if owner_user_id == "admin" else "USER"},
+        },
+    )
+
+
+def job_dir_bytes(job_id: str) -> int:
+    return sum(path.stat().st_size for path in storage.job_dir(job_id).rglob("*") if path.is_file())
 
 
 def test_auth_required_and_login(client: TestClient) -> None:
@@ -2295,3 +2350,115 @@ def test_admin_user_jobs_endpoint_requires_admin(client: TestClient, monkeypatch
     denied = client.get(f"/v1/admin/users/{viewer['user_id']}/jobs")
     assert denied.status_code == 403
     assert denied.json()["error"]["code"] == "FORBIDDEN"
+
+
+def test_admin_storage_overview_and_preview(client: TestClient) -> None:
+    login(client)
+    create_storage_job(
+        "11111111111111111111111111111111",
+        status="SUCCEEDED",
+        created_at=iso_at(timedelta(days=-120)),
+        result_size=64,
+        preview_size=24,
+        input_size=16,
+    )
+    create_storage_job(
+        "22222222222222222222222222222222",
+        status="FAILED",
+        created_at=iso_at(timedelta(days=-40)),
+        result_size=32,
+        preview_size=12,
+    )
+    create_storage_job(
+        "33333333333333333333333333333333",
+        status="RUNNING",
+        created_at=iso_at(timedelta(days=-150)),
+        result_size=48,
+    )
+    (storage.data_dir / "auth" / "users.json").parent.mkdir(parents=True, exist_ok=True)
+    (storage.data_dir / "logs").mkdir(parents=True, exist_ok=True)
+    (storage.data_dir / "logs" / "app.log").write_bytes(b"log-data")
+    (storage.jobs_dir / "broken-job").mkdir(parents=True, exist_ok=True)
+    (storage.jobs_dir / "broken-job" / "meta.json").write_text("{broken", encoding="utf-8")
+
+    older_job_bytes = job_dir_bytes("11111111111111111111111111111111")
+    preview_cutoff = (datetime.now(UTC_PLUS_8).date() - timedelta(days=90)).isoformat()
+
+    overview = client.get("/v1/admin/storage/overview")
+    assert overview.status_code == 200
+    body = overview.json()
+    assert body["data_total_bytes"] >= body["jobs_total_bytes"] > 0
+    assert body["non_job_bytes"] >= len(b"log-data")
+    assert body["deletable_jobs"] == 2
+    assert body["deletable_bytes"] >= older_job_bytes
+    assert body["recommended_suggestion"] is not None
+    assert any(item["retention_days"] == 90 for item in body["suggestions"])
+
+    preview = client.post("/v1/admin/storage/cleanup/preview", json={"cutoff_date": preview_cutoff})
+    assert preview.status_code == 200
+    preview_body = preview.json()
+    assert preview_body["cutoff_date"] == preview_cutoff
+    assert preview_body["matched_jobs"] == 1
+    assert preview_body["estimated_freed_bytes"] == older_job_bytes
+    assert preview_body["active_jobs_skipped"] == 1
+
+
+def test_admin_storage_cleanup_execute_removes_only_finished_jobs(client: TestClient) -> None:
+    login(client)
+    old_success = "44444444444444444444444444444444"
+    old_failed = "55555555555555555555555555555555"
+    old_running = "66666666666666666666666666666666"
+    fresh_success = "77777777777777777777777777777777"
+    create_storage_job(old_success, status="SUCCEEDED", created_at=iso_at(timedelta(days=-120)), result_size=80)
+    create_storage_job(old_failed, status="FAILED", created_at=iso_at(timedelta(days=-120)), result_size=40)
+    create_storage_job(old_running, status="RUNNING", created_at=iso_at(timedelta(days=-120)), result_size=20)
+    create_storage_job(fresh_success, status="SUCCEEDED", created_at=iso_at(timedelta(days=-5)), result_size=20)
+
+    expected_freed = job_dir_bytes(old_success) + job_dir_bytes(old_failed)
+    cutoff_date = (datetime.now(UTC_PLUS_8).date() - timedelta(days=90)).isoformat()
+
+    executed = client.post("/v1/admin/storage/cleanup/execute", json={"cutoff_date": cutoff_date})
+    assert executed.status_code == 200
+    payload = executed.json()
+    assert payload["deleted_jobs"] == 2
+    assert payload["freed_bytes"] == expected_freed
+    assert payload["active_jobs_skipped"] == 1
+    assert not storage.job_dir(old_success).exists()
+    assert not storage.job_dir(old_failed).exists()
+    assert storage.job_dir(old_running).exists()
+    assert storage.job_dir(fresh_success).exists()
+
+
+def test_storage_retention_policy_and_automatic_cleanup_runs_once_per_day(client: TestClient) -> None:
+    login(client)
+    target_job = "88888888888888888888888888888888"
+    kept_job = "99999999999999999999999999999999"
+    create_storage_job(target_job, status="CANCELLED", created_at="2026-03-01T08:00:00+08:00", result_size=50)
+    create_storage_job(kept_job, status="SUCCEEDED", created_at="2026-03-17T08:00:00+08:00", result_size=50)
+
+    updated = client.patch("/v1/admin/storage/retention", json={"enabled": True, "retention_days": 10})
+    assert updated.status_code == 200
+    assert updated.json()["policy"]["enabled"] is True
+    assert updated.json()["policy"]["retention_days"] == 10
+
+    before_window = datetime(2026, 3, 18, 2, 30, tzinfo=UTC_PLUS_8)
+    assert storage_retention_service.run_automatic_cleanup_if_due(now=before_window) is None
+    assert storage.job_dir(target_job).exists()
+
+    run_time = datetime(2026, 3, 18, 4, 0, tzinfo=UTC_PLUS_8)
+    result = storage_retention_service.run_automatic_cleanup_if_due(now=run_time)
+    assert result is not None
+    assert result["deleted_jobs"] == 1
+    assert not storage.job_dir(target_job).exists()
+    assert storage.job_dir(kept_job).exists()
+
+    second = storage_retention_service.run_automatic_cleanup_if_due(now=run_time + timedelta(hours=2))
+    assert second is None
+
+    overview = client.get("/v1/admin/storage/overview")
+    assert overview.status_code == 200
+    runtime = overview.json()["runtime"]
+    assert runtime["last_cutoff_date"] == "2026-03-08"
+    assert runtime["last_deleted_jobs"] == 1
+    assert runtime["last_freed_bytes"] > 0
+    assert runtime["last_error"] is None
