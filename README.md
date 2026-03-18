@@ -26,11 +26,12 @@ stable_nanobananapro/
   frontend/
   scripts/
     worktree-dev.sh
+    ci-remote-check.sh
     build-local-sim-images.sh
     make-release-tag.sh
   .github/
     workflows/
-      ci.yml
+      ci-full.yml
       release-images.yml
     release.yml
   srv_server/
@@ -91,12 +92,14 @@ eval "$(./scripts/worktree-dev.sh shellenv)"
 ```bash
 ./scripts/worktree-dev.sh test backend
 ./scripts/worktree-dev.sh test e2e
+cd frontend && npm run lint && npm run test -- --run && npm run build
 ```
 
 说明：
 
 - `test backend` 在当前实例环境中执行 `pytest -q`
 - `test e2e` 默认把 `PW_BASE_URL` 指向当前实例 `NBP_FRONTEND_URL`
+- 前端本地预检查固定为 `lint + vitest + build`
 - 若没有 e2e spec，不会切到 Docker 流程
 
 ### 4. Playwright CLI
@@ -158,9 +161,13 @@ docker compose -f docker-compose.prod.yml ps
 
 本次仓库改造后，发布链路职责固定如下：
 
-- `.github/workflows/ci.yml`
+- `.github/workflows/ci-full.yml`
   - 在 `pull_request` 和 `main` 上运行
-  - 只做后端测试与前端构建检查
+  - 每个 PR 全量运行 `backend-full` / `frontend-full` / `e2e-full` / `docker-build`
+  - 后端执行 `ruff + pytest --cov`
+  - 前端执行 `eslint + vitest + build`
+  - e2e 以 `TEST_ENV_ADMIN_BYPASS=true` 与 `TEST_FAKE_GENERATOR=true` 启动真实前后端，再跑 Playwright
+  - Docker 镜像只做构建校验，不推镜像
   - 不推镜像
 - `.github/workflows/release-images.yml`
   - 只在 GitHub Release `published` 时运行
@@ -169,7 +176,29 @@ docker compose -f docker-compose.prod.yml ps
 - `.github/release.yml`
   - 给 GitHub 自动生成 Release Notes 做分类
 
-### 1. 版本命名
+### 1. 本地预检查与远程 CI 验证
+
+建议顺序：
+
+```bash
+./scripts/worktree-dev.sh test backend
+cd frontend && npm run lint && npm run test -- --run && npm run build
+./scripts/worktree-dev.sh up all
+./scripts/worktree-dev.sh test e2e
+./scripts/worktree-dev.sh down
+./scripts/ci-remote-check.sh
+```
+
+如果只想手动触发远端 workflow，也可以直接：
+
+```bash
+gh workflow run ci-full.yml --ref <branch>
+gh run list --workflow ci-full.yml --branch <branch> --limit 1
+gh run watch <run-id> --exit-status
+gh run view <run-id> --log-failed
+```
+
+### 2. 版本命名
 
 正式发布统一使用：
 
@@ -188,7 +217,7 @@ v<人类版本号>-<短hash>
 - GitHub Release：正式发布记录
 - Docker 镜像 tag：回滚和审计用版本号
 
-### 2. Docker Hub 镜像 tag 约定
+### 3. Docker Hub 镜像 tag 约定
 
 每次正式发布会自动推送：
 
@@ -202,7 +231,7 @@ v<人类版本号>-<短hash>
 - 正式 tag 用于回滚和问题定位
 - `latest` 保持给当前 Watchtower 自动更新链路使用
 
-### 3. GitHub 仓库需要配置
+### 4. GitHub 仓库需要配置
 
 Repository Secrets：
 
@@ -214,7 +243,14 @@ Repository Variables：
 - `DOCKERHUB_NAMESPACE`
 - `APP_NAME`
 
-### 4. 标准正式发布流程
+Branch Protection / Required Checks 建议更新为：
+
+- `backend-full`
+- `frontend-full`
+- `e2e-full`
+- `docker-build`
+
+### 5. 标准正式发布流程
 
 先切到最新主分支：
 
@@ -256,7 +292,7 @@ gh release create "$TAG" --verify-tag --generate-notes --title "$TAG"
 - 不要让 CLI 自动帮你创建 tag
 - 一律先 `git tag -a`，再 `git push origin <tag>`，最后才创建 Release
 
-### 5. 发布后会发生什么
+### 6. 发布后会发生什么
 
 当 GitHub Release 发布后：
 

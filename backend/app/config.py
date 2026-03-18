@@ -63,6 +63,8 @@ class Settings(BaseSettings):
     session_max_age_sec: int = Field(default=7 * 24 * 3600, alias="SESSION_MAX_AGE_SEC")
     session_https_only: bool = Field(default=False, alias="SESSION_HTTPS_ONLY")
     test_env_admin_bypass: bool = Field(default=False, alias="TEST_ENV_ADMIN_BYPASS")
+    test_fake_generator: bool = Field(default=False, alias="TEST_FAKE_GENERATOR")
+    test_fake_generator_latency_ms: int = Field(default=120, alias="TEST_FAKE_GENERATOR_LATENCY_MS")
 
     bootstrap_admin_username: str = Field(default="admin", alias="BOOTSTRAP_ADMIN_USERNAME")
     bootstrap_admin_password: str = Field(default="admin123456", alias="BOOTSTRAP_ADMIN_PASSWORD")

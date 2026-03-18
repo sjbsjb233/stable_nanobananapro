@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import base64
+import hashlib
+import io
 import re
 import time
 from dataclasses import dataclass
 from typing import Any
 
 import httpx
+from PIL import Image, ImageDraw
 
 from .config import settings
 from .logging_setup import get_logger
@@ -23,6 +26,7 @@ logger = get_logger("gemini_client")
 
 _URL_RE = re.compile(r"https?://[^)\s]+")
 _DATA_URI_RE = re.compile(r"data:(image/[^;]+);base64,([A-Za-z0-9+/=]+)")
+_CI_SLOW_PREFIX_RE = re.compile(r"^\[ci:slow(?::(?P<ms>\d+))?\]")
 _TRANSIENT_CODES = {
     "UPSTREAM_TIMEOUT",
     "UPSTREAM_HTTP",
@@ -78,6 +82,15 @@ class GeminiClient:
         spec = get_model_spec(model)
         if not spec:
             raise GeminiError(code="INVALID_MODEL", message=f"Unsupported model: {model}", retryable=False, retry_other_providers=False)
+        if settings.test_fake_generator:
+            return self._generate_test_fake_image(
+                prompt=prompt,
+                model=model,
+                mode=mode,
+                params=params,
+                reference_images=reference_images,
+                deadline_monotonic=deadline_monotonic,
+            )
 
         requested_provider_id = str(params.get("provider_id") or "").strip() or None
         if requested_provider_id:
@@ -215,6 +228,102 @@ class GeminiClient:
             payload={**last_error.payload, "attempts": attempts},
             retry_other_providers=last_error.retry_other_providers,
         )
+
+    def _generate_test_fake_image(
+        self,
+        *,
+        prompt: str,
+        model: str,
+        mode: str,
+        params: dict[str, Any],
+        reference_images: list[ReferenceImage],
+        deadline_monotonic: float | None = None,
+    ) -> dict[str, Any]:
+        stripped_prompt = prompt.lstrip()
+        if stripped_prompt.startswith("[ci:fail]"):
+            raise GeminiError(
+                code="UPSTREAM_ERROR",
+                message="CI fake generator requested a deterministic failure",
+                retryable=False,
+                retry_other_providers=False,
+            )
+
+        slow_match = _CI_SLOW_PREFIX_RE.match(stripped_prompt)
+        if slow_match:
+            requested_ms = int(slow_match.group("ms") or 1500)
+            if deadline_monotonic is not None and deadline_monotonic <= time.monotonic():
+                raise GeminiError(
+                    code="UPSTREAM_TIMEOUT",
+                    message="CI fake generator timed out before work started",
+                    retryable=True,
+                )
+            time.sleep(max(requested_ms, 0) / 1000)
+
+        started = time.perf_counter()
+        digest = hashlib.sha256(f"{prompt}|{model}|{mode}|{len(reference_images)}".encode("utf-8")).digest()
+        background = tuple(64 + (value % 128) for value in digest[:3])
+        accent = tuple(96 + (value % 96) for value in digest[3:6])
+
+        image = Image.new("RGB", (512, 512), background)
+        draw = ImageDraw.Draw(image)
+        draw.rectangle((48, 48, 464, 464), outline=accent, width=18)
+        draw.rectangle((96, 96, 416, 176), fill=accent)
+        for idx in range(max(1, len(reference_images))):
+            top = 228 + idx * 46
+            draw.rectangle((96, top, 416, top + 20), fill=accent[::-1])
+
+        buf = io.BytesIO()
+        image.save(buf, format="PNG")
+        image_bytes = buf.getvalue()
+        inline_data = base64.b64encode(image_bytes).decode("ascii")
+
+        requested_provider_id = str(params.get("provider_id") or "").strip() or None
+        latency_ms = max(int(settings.test_fake_generator_latency_ms), int((time.perf_counter() - started) * 1000))
+        prompt_token_count = max(8, len(prompt.strip()) // 2)
+        reference_token_count = len(reference_images) * 12
+        total_token_count = prompt_token_count + reference_token_count + 24
+
+        return {
+            "raw": {
+                "candidates": [
+                    {
+                        "content": {
+                            "parts": [
+                                {
+                                    "inlineData": {
+                                        "mimeType": "image/png",
+                                        "data": inline_data,
+                                    }
+                                }
+                            ]
+                        }
+                    }
+                ]
+            },
+            "images": [{"mime": "image/png", "bytes": image_bytes}],
+            "usage_metadata": {
+                "promptTokenCount": prompt_token_count,
+                "cachedContentTokenCount": 0,
+                "candidatesTokenCount": 12,
+                "thoughtsTokenCount": reference_token_count,
+                "totalTokenCount": total_token_count,
+            },
+            "finish_reason": "STOP",
+            "safety_ratings": [],
+            "latency_ms": latency_ms,
+            "provider": {
+                "provider_id": requested_provider_id or "ci-fake",
+                "label": "CI Fake Generator",
+                "adapter_type": "ci_fake",
+                "base_url": "test://ci-fake-generator",
+                "cost_per_image_cny": 0.0,
+                "selection_mode": "admin_override" if requested_provider_id else "test_fake_generator",
+                "forced_activation": bool(requested_provider_id),
+            },
+            "provider_attempts": [],
+            "upstream_model": f"ci-fake::{model}",
+            "upstream_response_model": f"ci-fake::{model}",
+        }
 
     def _call_provider(
         self,

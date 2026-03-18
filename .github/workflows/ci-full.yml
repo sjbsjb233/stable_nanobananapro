@@ -1,0 +1,223 @@
+name: CI Full
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: ci-full-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CI: "true"
+  PYTHON_VERSION: "3.11"
+  NODE_VERSION: "20"
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+
+jobs:
+  backend-full:
+    name: backend-full
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: |
+            backend/requirements.txt
+            backend/requirements.runtime.txt
+            backend/requirements.dev.txt
+
+      - name: Install backend dependencies
+        run: pip install -r requirements.dev.txt
+
+      - name: Lint backend
+        run: ruff check app tests
+
+      - name: Run backend tests
+        run: pytest tests --cov=app --cov-report=term-missing --cov-report=xml -q
+
+      - name: Upload backend coverage
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-coverage
+          path: backend/coverage.xml
+          if-no-files-found: ignore
+
+  frontend-full:
+    name: frontend-full
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install frontend dependencies
+        run: npm ci --no-audit --no-fund
+
+      - name: Lint frontend
+        run: npm run lint
+
+      - name: Run frontend tests
+        run: npm run test -- --run --coverage
+
+      - name: Build frontend
+        run: npm run build
+
+      - name: Upload frontend artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-artifacts
+          path: |
+            frontend/coverage
+            frontend/dist
+          if-no-files-found: ignore
+
+  e2e-full:
+    name: e2e-full
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs:
+      - backend-full
+      - frontend-full
+    env:
+      TEST_ENV_ADMIN_BYPASS: "true"
+      TEST_FAKE_GENERATOR: "true"
+      TEST_FAKE_GENERATOR_LATENCY_MS: "25"
+      SESSION_SECRET_KEY: "ci-session-secret"
+      BOOTSTRAP_ADMIN_USERNAME: "admin"
+      BOOTSTRAP_ADMIN_PASSWORD: "admin123456"
+      TURNSTILE_SITE_KEY: "test-site-key"
+      TURNSTILE_SECRET_KEY: "test-secret"
+      DATA_DIR: ${{ github.workspace }}/.ci/runtime/backend-data
+      LOG_DIR: ${{ github.workspace }}/.ci/runtime/backend-logs
+      CORS_ALLOW_ORIGINS: "http://127.0.0.1:18001"
+      VITE_API_BASE_URL: "http://127.0.0.1:18000"
+      VITE_TURNSTILE_SITE_KEY: "test-site-key"
+      PW_BASE_URL: "http://127.0.0.1:18001"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: |
+            backend/requirements.txt
+            backend/requirements.runtime.txt
+            backend/requirements.dev.txt
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: |
+            frontend/package-lock.json
+            tools/playwright/package-lock.json
+
+      - name: Install backend dependencies
+        working-directory: backend
+        run: pip install -r requirements.dev.txt
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci --no-audit --no-fund
+
+      - name: Install Playwright dependencies
+        working-directory: tools/playwright
+        run: npm ci --no-audit --no-fund
+
+      - name: Install Playwright Chromium
+        working-directory: tools/playwright
+        run: PLAYWRIGHT_BROWSERS_PATH=./.playwright-browsers npx playwright install --with-deps chromium
+
+      - name: Build frontend
+        working-directory: frontend
+        run: npm run build
+
+      - name: Start backend
+        working-directory: backend
+        run: |
+          mkdir -p "$DATA_DIR" "$LOG_DIR"
+          nohup python -m uvicorn app.main:app --host 127.0.0.1 --port 18000 >"$RUNNER_TEMP/backend.log" 2>&1 &
+          echo $! >"$RUNNER_TEMP/backend.pid"
+
+      - name: Start frontend
+        working-directory: frontend
+        run: |
+          nohup npm run preview -- --host 127.0.0.1 --port 18001 >"$RUNNER_TEMP/frontend.log" 2>&1 &
+          echo $! >"$RUNNER_TEMP/frontend.pid"
+
+      - name: Wait for services
+        run: |
+          curl --fail --retry 30 --retry-delay 1 --retry-connrefused http://127.0.0.1:18000/v1/health
+          curl --fail --retry 30 --retry-delay 1 --retry-connrefused http://127.0.0.1:18001/runtime-config.js
+
+      - name: Run Playwright e2e
+        working-directory: tools/playwright
+        run: npm run test:e2e:ci
+
+      - name: Stop services
+        if: always()
+        run: |
+          if [[ -f "$RUNNER_TEMP/frontend.pid" ]]; then
+            kill "$(cat "$RUNNER_TEMP/frontend.pid")" 2>/dev/null || true
+          fi
+          if [[ -f "$RUNNER_TEMP/backend.pid" ]]; then
+            kill "$(cat "$RUNNER_TEMP/backend.pid")" 2>/dev/null || true
+          fi
+
+      - name: Upload Playwright artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-artifacts
+          path: |
+            tools/playwright/output/playwright/report
+            tools/playwright/test-results
+            ${{ runner.temp }}/backend.log
+            ${{ runner.temp }}/frontend.log
+          if-no-files-found: ignore
+
+  docker-build:
+    name: docker-build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build backend image
+        run: docker build -f backend/Dockerfile backend
+
+      - name: Build frontend image
+        run: docker build -f frontend/Dockerfile frontend

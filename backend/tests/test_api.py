@@ -67,6 +67,8 @@ def client(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> TestClient:
     monkeypatch.setattr(settings, "turnstile_site_key", "test-site-key")
     monkeypatch.setattr(settings, "session_secret_key", "test-session-secret")
     monkeypatch.setattr(settings, "test_env_admin_bypass", False)
+    monkeypatch.setattr(settings, "test_fake_generator", False)
+    monkeypatch.setattr(settings, "test_fake_generator_latency_ms", 120)
 
     storage.data_dir = tmp_path
     storage.jobs_dir = tmp_path / "jobs"
@@ -2462,3 +2464,58 @@ def test_storage_retention_policy_and_automatic_cleanup_runs_once_per_day(client
     assert runtime["last_deleted_jobs"] == 1
     assert runtime["last_freed_bytes"] > 0
     assert runtime["last_error"] is None
+
+
+@pytest.mark.integration
+def test_ci_fake_generator_succeeds_when_enabled(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(settings, "test_fake_generator", True)
+    login(client)
+
+    created = client.post(
+        "/v1/jobs",
+        json={
+            "prompt": "ci fake image",
+            "params": {
+                "aspect_ratio": "1:1",
+                "image_size": "1K",
+                "temperature": 0.7,
+                "timeout_sec": 60,
+                "max_retries": 1,
+            },
+            "mode": "IMAGE_ONLY",
+        },
+    )
+    assert created.status_code == 201
+
+    meta = wait_for_job_terminal(client, created.json()["job_id"])
+    assert meta["status"] == "SUCCEEDED"
+    assert meta["result"]["images"]
+    assert meta["response"]["provider"]["provider_id"] == "ci-fake"
+    assert meta["response"]["provider"]["selection_mode"] == "test_fake_generator"
+
+
+@pytest.mark.integration
+def test_ci_fake_generator_can_force_failure(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(settings, "test_fake_generator", True)
+    login(client)
+
+    created = client.post(
+        "/v1/jobs",
+        json={
+            "prompt": "[ci:fail] deterministic upstream failure",
+            "params": {
+                "aspect_ratio": "1:1",
+                "image_size": "1K",
+                "temperature": 0.7,
+                "timeout_sec": 60,
+                "max_retries": 1,
+            },
+            "mode": "IMAGE_ONLY",
+        },
+    )
+    assert created.status_code == 201
+
+    meta = wait_for_job_terminal(client, created.json()["job_id"])
+    assert meta["status"] == "FAILED"
+    assert meta["error"]["code"] == "UPSTREAM_ERROR"
+    assert "CI fake generator requested a deterministic failure" in meta["error"]["message"]

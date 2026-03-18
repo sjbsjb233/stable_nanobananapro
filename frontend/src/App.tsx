@@ -4711,13 +4711,13 @@ function TopNav() {
         </div>
 
         <div className="flex items-center gap-2">
-          <NavButton to="/" label="Dashboard" />
-          <NavButton to="/create" label="Create" />
-          <NavButton to="/batch" label="Batch" />
-          <NavButton to="/history" label="History" />
-          <NavButton to="/picker" label="Picker" />
-          {isAdmin ? <NavButton to="/admin" label="Admin" /> : null}
-          <NavButton to="/settings" label="Settings" />
+          <NavButton to="/" label="Dashboard" testId="nav-dashboard" />
+          <NavButton to="/create" label="Create" testId="nav-create" />
+          <NavButton to="/batch" label="Batch" testId="nav-batch" />
+          <NavButton to="/history" label="History" testId="nav-history" />
+          <NavButton to="/picker" label="Picker" testId="nav-picker" />
+          {isAdmin ? <NavButton to="/admin" label="Admin" testId="nav-admin" /> : null}
+          <NavButton to="/settings" label="Settings" testId="nav-settings" />
           <Button variant="primary" onClick={() => navigate("/create")} className="ml-1">
             + 快速创建
           </Button>
@@ -4728,10 +4728,11 @@ function TopNav() {
   );
 }
 
-function NavButton({ to, label }: { to: string; label: string }) {
+function NavButton({ to, label, testId }: { to: string; label: string; testId?: string }) {
   return (
     <NavLink
       to={to}
+      data-testid={testId}
       className={({ isActive }) =>
         cn(
           "rounded-xl px-3 py-2 text-sm font-semibold transition",
@@ -11342,6 +11343,7 @@ function CreateJobPage() {
                 </div>
 
                 <Button
+                  testId="create-submit"
                   variant="primary"
                   disabled={loading}
                   onClick={onSubmit}
@@ -16358,7 +16360,7 @@ function SettingsPage() {
 
   return (
     <PageContainer>
-      <PageTitle title="Settings" subtitle="浏览器配置中心：baseUrl / 默认参数 / 轮询 / UI / 数据管理" right={<Button onClick={save}>保存</Button>} />
+      <PageTitle title="Settings" subtitle="浏览器配置中心：baseUrl / 默认参数 / 轮询 / UI / 数据管理" right={<Button testId="settings-save" onClick={save}>保存</Button>} />
 
       <div className="grid grid-cols-1 gap-3 lg:grid-cols-3">
         <Card className="lg:col-span-2">

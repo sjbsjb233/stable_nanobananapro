@@ -194,6 +194,12 @@ eval "$(./scripts/worktree-dev.sh shellenv)"
 ./scripts/worktree-dev.sh test backend
 ```
 
+补充：
+
+- 后端 dev 依赖入口为 `backend/requirements.dev.txt`
+- CI 后端检查固定包含 `ruff check app tests`
+- pytest 默认跑全量，并输出 coverage artifact
+
 ### 5.2 Playwright e2e
 
 ```bash
@@ -203,9 +209,29 @@ eval "$(./scripts/worktree-dev.sh shellenv)"
 说明：
 
 - `test e2e` 默认把 `PW_BASE_URL` 指向当前实例 `NBP_FRONTEND_URL`
+- 当前仓库已经有真实 spec，默认会执行 `tools/playwright/tests/e2e/*.spec.ts`
 - 如果没有 e2e spec，脚本会直接返回，不会改走 Docker
+- CI e2e 默认要求：
+  - `TEST_ENV_ADMIN_BYPASS=true`
+  - `TEST_FAKE_GENERATOR=true`
+  - 不访问真实 Gemini / Turnstile
 
-### 5.3 浏览器 CLI 使用约定
+### 5.3 前端本地测试基线
+
+```bash
+cd frontend
+npm run lint
+npm run test -- --run
+npm run build
+```
+
+说明：
+
+- 前端 CI 现在不再是仅 build
+- 默认基线为 `eslint + vitest + build`
+- 当前 `react-hooks/exhaustive-deps` 在 `frontend/src/App.tsx` 里仍有历史 warning；CI 暂按 warning 处理，后续重构后再收紧
+
+### 5.4 浏览器 CLI 使用约定
 
 如果用户明确要求“用 Playwright / 浏览器自动化测试”，统一使用本地 Playwright CLI：
 
@@ -236,6 +262,33 @@ eval "$(./scripts/worktree-dev.sh shellenv)"
 - 控制台是否有 error / warning
 - 是否做了真实写操作
 - 临时服务和 Playwright 会话是否已清理
+
+### 5.5 远程 GitHub Actions 验证
+
+主入口：
+
+```bash
+./scripts/ci-remote-check.sh
+```
+
+等价手动命令：
+
+```bash
+gh workflow run ci-full.yml --ref <branch>
+gh run list --workflow ci-full.yml --branch <branch> --limit 1
+gh run watch <run-id> --exit-status
+gh run view <run-id> --log-failed
+```
+
+规则：
+
+- PR / `push main` / `workflow_dispatch` 都走 `.github/workflows/ci-full.yml`
+- 全量 CI job 固定为：
+  - `backend-full`
+  - `frontend-full`
+  - `e2e-full`
+  - `docker-build`
+- Agent 本地不要调用 Docker；`docker-build` 只在 GitHub Actions 上验证
 
 ## 6. 手工本地仿真 Docker 流程
 
