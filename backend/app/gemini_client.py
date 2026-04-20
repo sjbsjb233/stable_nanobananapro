@@ -366,6 +366,16 @@ class GeminiClient:
                 reference_images=reference_images,
                 deadline_monotonic=deadline_monotonic,
             )
+        if config.adapter_type == "novart_gemini_image":
+            return self._call_novart_gemini_image(
+                config=config,
+                prompt=prompt,
+                model=model,
+                mode=mode,
+                params=params,
+                reference_images=reference_images,
+                deadline_monotonic=deadline_monotonic,
+            )
         raise GeminiError(
             code="UNSUPPORTED_ADAPTER",
             message=f"Unsupported adapter_type '{config.adapter_type}' for provider '{config.provider_id}'",
@@ -512,6 +522,145 @@ class GeminiClient:
             "safety_ratings": safety_ratings,
             "latency_ms": latency_ms,
             "upstream_model": upstream_model,
+        }
+
+    def _call_novart_gemini_image(
+        self,
+        *,
+        config: Any,
+        prompt: str,
+        model: str,
+        mode: str,
+        params: dict[str, Any],
+        reference_images: list[ReferenceImage],
+        deadline_monotonic: float | None = None,
+    ) -> dict[str, Any]:
+        upstream_model = self._resolve_novart_upstream_model(model)
+        if upstream_model is None:
+            raise GeminiError(
+                code="UPSTREAM_MODEL_UNAVAILABLE",
+                message=f"Provider '{config.provider_id}' does not support model '{model}'",
+                retryable=False,
+            )
+
+        parts: list[dict[str, Any]] = [{"text": prompt}]
+        for ref in reference_images:
+            parts.append(
+                {
+                    "inlineData": {
+                        "mimeType": ref.mime_type,
+                        "data": base64.b64encode(ref.data).decode("utf-8"),
+                    }
+                }
+            )
+
+        payload = {
+            "contents": [{"role": "user", "parts": parts}],
+            "generationConfig": {
+                # NOVART documents TEXT+IMAGE even for image generation and returns
+                # a short text part before inlineData.
+                "responseModalities": ["TEXT", "IMAGE"],
+                "imageConfig": {
+                    "aspectRatio": params["aspect_ratio"],
+                    "novartResolution": self._novart_resolution(params.get("image_size")),
+                },
+                "novart": {"includeResultUrls": True},
+            },
+        }
+
+        timeout, deadline_capped = self._effective_timeout_sec(
+            params["timeout_sec"],
+            deadline_monotonic=deadline_monotonic,
+            configured_timeout_sec=params.get("timeout_sec"),
+            provider_id=config.provider_id,
+        )
+        url = f"{self._novart_v1beta_base_url(config.base_url)}/models/{upstream_model}:generateContent"
+        start = time.perf_counter()
+        try:
+            with httpx.Client(**self._http_client_kwargs(timeout)) as client:
+                resp = client.post(
+                    url,
+                    headers={
+                        "x-goog-api-key": config.api_key,
+                        "Content-Type": "application/json",
+                    },
+                    json=payload,
+                )
+        except httpx.TimeoutException as exc:
+            if deadline_capped:
+                raise GeminiError(
+                    code="WORKER_WATCHDOG_TIMEOUT",
+                    message="Job exceeded maximum runtime while waiting for NOVART upstream response",
+                    retryable=False,
+                    payload={
+                        "provider_id": config.provider_id,
+                        "configured_timeout_sec": int(params.get("timeout_sec", settings.job_timeout_sec_default)),
+                        "effective_timeout_sec": round(timeout, 3),
+                    },
+                    retry_other_providers=False,
+                ) from exc
+            raise GeminiError(code="UPSTREAM_TIMEOUT", message="NOVART upstream timeout", retryable=True) from exc
+        except httpx.HTTPError as exc:
+            raise GeminiError(code="UPSTREAM_HTTP", message=f"NOVART HTTP error: {exc}", retryable=True) from exc
+        except Exception as exc:  # noqa: BLE001
+            raise GeminiError(
+                code="UPSTREAM_CLIENT_EXCEPTION",
+                message=f"Unexpected NOVART client error: {type(exc).__name__}: {exc}",
+                retryable=True,
+                payload={"exception_type": type(exc).__name__, "exception": str(exc)},
+            ) from exc
+
+        latency_ms = int((time.perf_counter() - start) * 1000)
+        data = self._safe_json_response(resp, provider_id=config.provider_id, model=upstream_model)
+        self._raise_for_status(
+            status_code=resp.status_code,
+            body=data,
+            provider_id=config.provider_id,
+            upstream_model=upstream_model,
+        )
+
+        candidates = data.get("candidates", [])
+        image_parts: list[dict[str, Any]] = []
+        finish_reason = None
+        safety_ratings: list[dict[str, Any]] = []
+
+        for cand in candidates:
+            finish_reason = finish_reason or cand.get("finishReason") or cand.get("finish_reason")
+            if cand.get("safetyRatings"):
+                safety_ratings.extend(cand["safetyRatings"])
+            if cand.get("safety_ratings"):
+                safety_ratings.extend(cand["safety_ratings"])
+            content = cand.get("content", {})
+            for part in content.get("parts", []):
+                inline = part.get("inlineData") or part.get("inline_data")
+                if inline and inline.get("data"):
+                    image_parts.append(inline)
+
+        if not image_parts:
+            raise GeminiError(
+                code="NO_IMAGE_PART",
+                message="NOVART response has no inline image part",
+                retryable=False,
+                payload={"response": data},
+            )
+
+        images = [
+            {
+                "mime": item.get("mimeType") or item.get("mime_type") or "image/png",
+                "bytes": base64.b64decode(item["data"]),
+            }
+            for item in image_parts[: settings.max_images_per_job]
+        ]
+
+        return {
+            "raw": data,
+            "images": images,
+            "usage_metadata": data.get("usageMetadata") or data.get("usage_metadata") or {},
+            "finish_reason": finish_reason or "OTHER",
+            "safety_ratings": safety_ratings,
+            "latency_ms": latency_ms,
+            "upstream_model": upstream_model,
+            "upstream_response_model": data.get("modelVersion") or data.get("model_version"),
         }
 
     def _call_openai_chat_image(
@@ -827,6 +976,9 @@ class GeminiClient:
     def _extract_error_message(self, body: dict[str, Any], fallback: str) -> str:
         error = body.get("error") if isinstance(body.get("error"), dict) else {}
         message = error.get("message") or body.get("message")
+        code = error.get("code") or body.get("code")
+        if code and message:
+            return f"{message} ({code})"
         return str(message or fallback)
 
     def _looks_like_no_quota(self, message: str) -> bool:
@@ -835,7 +987,10 @@ class GeminiClient:
 
     def _looks_like_model_unavailable(self, message: str) -> bool:
         upper = message.upper()
-        return any(token in upper for token in ("MODEL_NOT_FOUND", "NO AVAILABLE CHANNEL", "UNSUPPORTED MODEL", "MODEL NOT FOUND"))
+        return any(
+            token in upper
+            for token in ("MODEL_NOT_FOUND", "NO AVAILABLE CHANNEL", "UNSUPPORTED MODEL", "MODEL NOT FOUND", "无可用渠道", "模型不存在")
+        )
 
     def _resolve_gemini_upstream_model(self, canonical_model: str) -> str | None:
         if canonical_model == MODEL_GEMINI_3_PRO_IMAGE:
@@ -845,6 +1000,27 @@ class GeminiClient:
         if canonical_model == MODEL_GEMINI_3_1_FLASH_IMAGE:
             return "gemini-3.1-flash-image-preview"
         return None
+
+    def _resolve_novart_upstream_model(self, canonical_model: str) -> str | None:
+        if canonical_model == MODEL_GEMINI_3_PRO_IMAGE:
+            return "nova-image-pro"
+        if canonical_model in {MODEL_GEMINI_2_5_FLASH_IMAGE, MODEL_GEMINI_3_1_FLASH_IMAGE}:
+            return "nova-image-2"
+        return None
+
+    def _novart_resolution(self, image_size: Any) -> str:
+        normalized = str(image_size or "").strip().upper()
+        if normalized == "4K":
+            return "4k"
+        if normalized == "2K":
+            return "2k"
+        return "1k"
+
+    def _novart_v1beta_base_url(self, base_url: str) -> str:
+        trimmed = base_url.rstrip("/")
+        if trimmed.endswith("/v1beta"):
+            return trimmed
+        return f"{trimmed}/v1beta"
 
     def _resolve_openai_upstream_model(
         self,

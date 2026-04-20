@@ -18,7 +18,7 @@ from app.gemini_client import GeminiError, gemini_client
 from app.job_manager import job_manager
 from app.main import app
 from app.announcement_store import announcement_store
-from app.provider_store import provider_store
+from app.provider_store import ProviderConfig, provider_store
 from app.rate_limiter import InMemoryRateLimiter
 from app.storage import storage
 from app.storage_retention import storage_retention_service, storage_retention_store
@@ -977,6 +977,120 @@ def test_multi_provider_prefers_cheaper_then_falls_back(client: TestClient, monk
     backup = next(item for item in payload["providers"] if item["provider_id"] == "mmw-backup")
     assert cheap["fail_count"] >= 1
     assert backup["success_count"] >= 1
+
+
+def test_novart_adapter_uses_documented_payload_and_parses_response(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict = {}
+
+    class FakeResponse:
+        status_code = 200
+        headers = {"content-type": "application/json; charset=utf-8"}
+        text = ""
+
+        def json(self) -> dict:
+            return {
+                "candidates": [
+                    {
+                        "finishReason": "STOP",
+                        "content": {
+                            "parts": [
+                                {"text": "Generated 1 image."},
+                                {
+                                    "inlineData": {
+                                        "mimeType": "image/png",
+                                        "data": base64.b64encode(PNG_1X1).decode("ascii"),
+                                    }
+                                },
+                            ]
+                        },
+                    }
+                ],
+                "modelVersion": "nova-image-pro",
+                "novart": {
+                    "task_id": 123,
+                    "results": [
+                        {
+                            "index": 0,
+                            "mime_type": "image/png",
+                            "download_url": "https://www.novartspace.art/v1/files/images/123/results/0/content",
+                        }
+                    ],
+                },
+                "usageMetadata": {"totalTokenCount": 0},
+            }
+
+    class FakeClient:
+        def __init__(self, **kwargs) -> None:
+            captured["client_kwargs"] = kwargs
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback) -> None:
+            return None
+
+        def post(self, url: str, *, headers: dict | None = None, json: dict | None = None) -> FakeResponse:
+            captured["url"] = url
+            captured["headers"] = headers
+            captured["json"] = json
+            return FakeResponse()
+
+    monkeypatch.setattr("app.gemini_client.httpx.Client", FakeClient)
+
+    config = ProviderConfig(
+        provider_id="novart",
+        label="NOVART",
+        adapter_type="novart_gemini_image",
+        base_url="https://www.novartspace.art",
+        api_key="nova-test-key",
+        cost_per_image_cny=0.1,
+        initial_balance_cny=10,
+        enabled_by_default=True,
+        note="",
+        supported_models=("gemini-3-pro-image-preview",),
+        max_concurrency=1,
+    )
+
+    result = gemini_client._call_novart_gemini_image(
+        config=config,
+        prompt="Generate a red apple.",
+        model="gemini-3-pro-image-preview",
+        mode="IMAGE_ONLY",
+        params={
+            "aspect_ratio": "1:1",
+            "image_size": "4K",
+            "temperature": 0.7,
+            "timeout_sec": 60,
+        },
+        reference_images=[],
+    )
+
+    assert captured["url"] == "https://www.novartspace.art/v1beta/models/nova-image-pro:generateContent"
+    assert captured["headers"] == {
+        "x-goog-api-key": "nova-test-key",
+        "Content-Type": "application/json",
+    }
+    assert captured["json"]["generationConfig"] == {
+        "responseModalities": ["TEXT", "IMAGE"],
+        "imageConfig": {
+            "aspectRatio": "1:1",
+            "novartResolution": "4k",
+        },
+        "novart": {"includeResultUrls": True},
+    }
+    assert "imageSize" not in captured["json"]["generationConfig"]["imageConfig"]
+    assert result["upstream_model"] == "nova-image-pro"
+    assert result["upstream_response_model"] == "nova-image-pro"
+    assert result["finish_reason"] == "STOP"
+    assert result["images"] == [{"mime": "image/png", "bytes": PNG_1X1}]
+    assert result["raw"]["novart"]["results"][0]["download_url"].endswith("/content")
+
+
+def test_novart_adapter_maps_flash_models_to_nova_image_2() -> None:
+    assert gemini_client._resolve_novart_upstream_model("gemini-3.1-flash-image-preview") == "nova-image-2"
+    assert gemini_client._resolve_novart_upstream_model("gemini-2.5-flash-image") == "nova-image-2"
+    assert gemini_client._novart_resolution("2K") == "2k"
+    assert gemini_client._novart_resolution("AUTO") == "1k"
 
 
 def test_provider_chain_forces_cooldown_provider_when_no_standard_provider_is_available(
