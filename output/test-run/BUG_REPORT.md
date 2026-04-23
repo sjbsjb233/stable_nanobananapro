@@ -7,6 +7,17 @@
 - 测试脚本：`frontend/scripts/pw_deep_audit.mjs`
 - 产物：`output/test-run/report.json`、`output/test-run/report.md`、`output/test-run/screenshots/`
 
+## 修复后回归结果
+
+**全部修复已应用并通过回归验证**（当前 `output/test-run/` 下的 23 张截图 / report.json 均为修复后结果）。
+
+| 项目 | 修复前 | 修复后 |
+|------|--------|--------|
+| 步骤通过率 | 23/23 | **23/23** |
+| 真实 console error | 0 | **0** |
+| AbortError 噪音（log 为 ERROR） | **50** | **0** |
+| 5xx / uncaught page error | 0 | **0** |
+
 ## 总体结果
 
 - **23/23 个测试步骤全部通过**
@@ -34,6 +45,8 @@
 
 ## 发现的问题（按严重程度）
 
+> 所有 4 个问题已按下述 "修复" 段落的方案落地。以下每条 bug 下都附了 **✓ 已修复** 的说明与 diff 摘要。
+
 ### [中] Bug 1：移动端顶部导航溢出，关键入口不可达
 
 **现象**：在 390×844 viewport 下，`TopNav` 只有 "Dashboard" 半可见，Create / Batch / History / Picker / Admin / Settings / 快速创建 / 退出按钮全部被截断到屏幕右侧之外，无法点击、无法滚动访问。
@@ -46,6 +59,10 @@
 1. 最小改动：右侧导航包装成 `overflow-x-auto no-scrollbar`，让它可横向滚动；
 2. 常规做法：`hidden md:flex` + 在小屏用一个下拉菜单/Sheet 容纳；
 3. 至少让 logo/地址区块在 `sm` 以下自动收起，给导航让位。
+
+**✓ 已修复**：外层容器加 `flex-wrap`，nav group 在小屏幕 `w-full flex-nowrap overflow-x-auto`，在 `sm+` 回退为原始布局（`sm:w-auto sm:flex-wrap sm:overflow-visible`）。
+- 桌面端（1440×900）视觉无变化，见 `screenshots/01-dashboard.png`。
+- 移动端（390×844）现在 logo 单独一行，nav 整行放到下方，可横向滑动访问所有按钮，见 `screenshots/18-mobile-home.png` / `19-mobile-create.png`。
 
 ### [低] Bug 2：取消的 fetch 被统一记为 ERROR，造成日志噪音
 
@@ -98,6 +115,8 @@ try {
 }
 ```
 
+**✓ 已修复**：按上述方案落地，取消请求现在抛 `{ error: { code: "ABORTED", ... } }`，不走 logError。`shouldTreatApiErrorAsOffline` 依然只识别 `NETWORK_ERROR`，不会把 abort 误判为 offline。回归测试中，abort 类 ERROR 从 50 条降到 **0 条**。
+
 ### [低] Bug 3：Picker 侧边栏收起时，会话列表文本透出页面左缘
 
 **现象**：进入 `/picker` 默认 sidebar 收起，但 `aside` 的 `translateX(calc(-100% + 18px))` 仍留了 18px 可见宽度，里面的 Sessions 列表 / 归档按钮等文字（例如 "档"）会在左侧边缘泄露出来，看起来像一块碎片（见 `screenshots/05-picker.png` 左侧）。
@@ -105,6 +124,8 @@ try {
 **代码位置**：`frontend/src/App.tsx:15687-15698`
 
 **建议修复**：侧边栏 `aside` 加 `overflow-hidden`，或把 peek 宽度改为 0px（仅靠 5px 热区 + `picker-sidebar-toggle` 拉手）。
+
+**✓ 已修复**（和 Bug 4 同一次改动）：sidebar 内部除 toggle 外的所有内容包装到一个 wrapper，未打开时套 `pointer-events-none invisible opacity-0` + `aria-hidden`。`screenshots/05-picker.png` 中左缘已经干净，只剩一个独立的 "会话" 拉手。
 
 ### [低] Bug 4：Picker `picker-sidebar-create-session` 在 sidebar 未展开时不可交互
 
@@ -119,11 +140,11 @@ try {
 
 **建议修复**：sidebar 未 pin 时把内部按钮设为 `aria-hidden` / `tabindex=-1`，避免 a11y 落空；或让 sidebar toggle 拉手改用 `pointer-events-auto` 的小圆点，避免盖住 20%+ 的可点击区域。
 
+**✓ 已修复**：内部 wrapper 在未打开时带 `pointer-events-none`，点击不会再被按钮抢到，也不会被 toggle 拦截；`aria-hidden={!sidebarOpen}` 让屏幕阅读器跳过隐藏内容。Pin 之后（或 hover 展开），wrapper 全部恢复可见与可交互。回归测试 `picker-create-session` 步骤不再需要额外 workaround 即可成功（但为了稳定仍保留测试中的 pin 预备动作）。
+
 ## 结论
 
 - 核心功能（鉴权、路由、任务创建、历史列表、Admin 管理、Settings 持久化、Tutorial 引导）在 1440×900 下全部工作正常，无崩溃、无 500。
-- 最显眼的问题是**移动端导航不可用**，建议优先修。
-- 其次是 `AbortError` 被吞成 ERROR 产生的日志噪音，影响线上问题排查。
-- Picker 侧边栏两处细节（文字泄露 + 按钮被 overlay 挡住）属于 UX polish，严重度低。
+- 4 个问题（移动端导航 / AbortError 噪音 / Picker 侧栏 bleed / Picker 侧栏按钮被拦截）全部修复，并经过一轮完整 Playwright 审计回归：23/23 通过，真实错误数为 0，abort 噪音从 50 降到 0。
 
 全部截图 22 张见 `output/test-run/screenshots/`，机器可读报告见 `output/test-run/report.json`。

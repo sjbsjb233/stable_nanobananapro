@@ -3713,6 +3713,15 @@ class ApiClient {
     try {
       resp = await fetch(url, { ...init, headers, credentials: "include" });
     } catch (e: any) {
+      const signalAborted = Boolean(init.signal?.aborted);
+      const isAbortError =
+        signalAborted ||
+        e?.name === "AbortError" ||
+        /aborted/i.test(String(e?.message || ""));
+      if (isAbortError) {
+        const err: ApiError = { error: { code: "ABORTED", message: e?.message || "Aborted" } };
+        throw err;
+      }
       logError("api", "network request failed", {
         method,
         path,
@@ -4761,14 +4770,14 @@ function TopNav() {
 
   return (
     <div className="sticky top-0 z-40 border-b border-zinc-200/80 bg-white/70 backdrop-blur dark:border-white/10 dark:bg-zinc-950/60">
-      <div className="mx-auto flex max-w-6xl items-center justify-between gap-3 px-4 py-3">
-        <div className="flex items-center gap-3">
-          <div className="flex h-9 w-9 items-center justify-center rounded-2xl bg-zinc-900 text-white shadow-sm dark:bg-white dark:text-zinc-900">
+      <div className="mx-auto flex max-w-6xl flex-wrap items-center justify-between gap-x-3 gap-y-2 px-4 py-3">
+        <div className="flex min-w-0 items-center gap-3">
+          <div className="flex h-9 w-9 flex-shrink-0 items-center justify-center rounded-2xl bg-zinc-900 text-white shadow-sm dark:bg-white dark:text-zinc-900">
             NB
           </div>
-          <div className="leading-tight">
-            <div className="text-sm font-bold text-zinc-900 dark:text-zinc-50">Nano Banana Pro</div>
-            <div className="text-xs text-zinc-600 dark:text-zinc-300">
+          <div className="min-w-0 leading-tight">
+            <div className="truncate text-sm font-bold text-zinc-900 dark:text-zinc-50">Nano Banana Pro</div>
+            <div className="truncate text-xs text-zinc-600 dark:text-zinc-300">
               {settings.baseUrl}
               <span className="mx-2 text-zinc-300 dark:text-white/20">•</span>
               <span className={cn("font-semibold", online ? "text-emerald-600 dark:text-emerald-300" : "text-rose-600 dark:text-rose-300")}>
@@ -4780,7 +4789,7 @@ function TopNav() {
           </div>
         </div>
 
-        <div className="flex items-center gap-2">
+        <div className="-mx-1 flex w-full flex-nowrap items-center gap-2 overflow-x-auto px-1 pb-1 sm:w-auto sm:flex-wrap sm:overflow-visible sm:pb-0">
           <NavButton to="/" label="Dashboard" testId="nav-dashboard" />
           <NavButton to="/create" label="Create" testId="nav-create" />
           <NavButton to="/batch" label="Batch" testId="nav-batch" />
@@ -4788,10 +4797,10 @@ function TopNav() {
           <NavButton to="/picker" label="Picker" testId="nav-picker" />
           {isAdmin ? <NavButton to="/admin" label="Admin" testId="nav-admin" /> : null}
           <NavButton to="/settings" label="Settings" testId="nav-settings" />
-          <Button variant="primary" onClick={() => navigate("/create")} className="ml-1">
+          <Button variant="primary" onClick={() => navigate("/create")} className="ml-1 flex-shrink-0">
             + 快速创建
           </Button>
-          <Button variant="ghost" onClick={handleLogout}>退出</Button>
+          <Button variant="ghost" onClick={handleLogout} className="flex-shrink-0">退出</Button>
         </div>
       </div>
     </div>
@@ -15707,6 +15716,13 @@ function PickerPage() {
           </button>
         </div>
 
+        <div
+          aria-hidden={!sidebarOpen}
+          className={cn(
+            "flex h-full flex-col transition-opacity duration-200",
+            sidebarOpen ? "opacity-100" : "pointer-events-none invisible opacity-0"
+          )}
+        >
         <div className="mb-3 flex items-start justify-between gap-3">
           <div>
             <div className="text-sm font-bold text-zinc-900 dark:text-zinc-50">Sessions</div>
@@ -15848,6 +15864,7 @@ function PickerPage() {
               </Button>
             </div>
           ) : null}
+        </div>
         </div>
       </aside>
 
