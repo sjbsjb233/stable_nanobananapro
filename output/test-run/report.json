@@ -1,0 +1,475 @@
+{
+  "startedAt": "2026-04-23T15:27:06.367Z",
+  "frontendUrl": "http://127.0.0.1:5173",
+  "backendUrl": "http://127.0.0.1:8000",
+  "totalSteps": 23,
+  "passed": 23,
+  "failed": 0,
+  "steps": [
+    {
+      "name": "boot",
+      "ok": true,
+      "error": null,
+      "durationMs": 1959
+    },
+    {
+      "name": "dashboard",
+      "ok": true,
+      "error": null,
+      "durationMs": 549
+    },
+    {
+      "name": "nav-create",
+      "ok": true,
+      "error": null,
+      "durationMs": 418
+    },
+    {
+      "name": "nav-batch",
+      "ok": true,
+      "error": null,
+      "durationMs": 780
+    },
+    {
+      "name": "nav-history",
+      "ok": true,
+      "error": null,
+      "durationMs": 230
+    },
+    {
+      "name": "nav-picker",
+      "ok": true,
+      "error": null,
+      "durationMs": 577
+    },
+    {
+      "name": "nav-admin",
+      "ok": true,
+      "error": null,
+      "durationMs": 538
+    },
+    {
+      "name": "nav-settings",
+      "ok": true,
+      "error": null,
+      "durationMs": 346
+    },
+    {
+      "name": "settings-toggle-cache-persist",
+      "ok": true,
+      "error": null,
+      "durationMs": 1135
+    },
+    {
+      "name": "tutorial-auto-open",
+      "ok": true,
+      "error": null,
+      "durationMs": 1974
+    },
+    {
+      "name": "tutorial-manual-reopen",
+      "ok": true,
+      "error": null,
+      "durationMs": 488
+    },
+    {
+      "name": "create-submit-job",
+      "ok": true,
+      "error": null,
+      "durationMs": 1987
+    },
+    {
+      "name": "history-filters",
+      "ok": true,
+      "error": null,
+      "durationMs": 598
+    },
+    {
+      "name": "batch-render",
+      "ok": true,
+      "error": null,
+      "durationMs": 712
+    },
+    {
+      "name": "picker-render",
+      "ok": true,
+      "error": null,
+      "durationMs": 435
+    },
+    {
+      "name": "picker-create-session",
+      "ok": true,
+      "error": null,
+      "durationMs": 1648
+    },
+    {
+      "name": "admin-filters",
+      "ok": true,
+      "error": null,
+      "durationMs": 1346
+    },
+    {
+      "name": "not-found",
+      "ok": true,
+      "error": null,
+      "durationMs": 176
+    },
+    {
+      "name": "keyboard-tab-nav",
+      "ok": true,
+      "error": null,
+      "durationMs": 345
+    },
+    {
+      "name": "settings-password-validation",
+      "ok": true,
+      "error": null,
+      "durationMs": 1062
+    },
+    {
+      "name": "history-pagination",
+      "ok": true,
+      "error": null,
+      "durationMs": 452
+    },
+    {
+      "name": "topnav-visible-on-admin",
+      "ok": true,
+      "error": null,
+      "durationMs": 232
+    },
+    {
+      "name": "responsive-mobile",
+      "ok": true,
+      "error": null,
+      "durationMs": 650
+    }
+  ],
+  "findings": [],
+  "pageErrorsByStep": {
+    "boot": [],
+    "dashboard": [],
+    "nav-create": [],
+    "nav-batch": [],
+    "nav-history": [],
+    "nav-picker": [],
+    "nav-admin": [],
+    "nav-settings": [],
+    "settings-toggle-cache-persist": [],
+    "tutorial-auto-open": [],
+    "tutorial-manual-reopen": [],
+    "create-submit-job": [],
+    "history-filters": [],
+    "batch-render": [],
+    "picker-render": [],
+    "picker-create-session": [],
+    "admin-filters": [],
+    "not-found": [],
+    "keyboard-tab-nav": [],
+    "settings-password-validation": [],
+    "history-pagination": [],
+    "topnav-visible-on-admin": [],
+    "responsive-mobile": []
+  },
+  "consoleErrorsByStep": {
+    "boot": [],
+    "dashboard": [],
+    "nav-create": [],
+    "nav-batch": [],
+    "nav-history": [],
+    "nav-picker": [],
+    "nav-admin": [],
+    "nav-settings": [],
+    "settings-toggle-cache-persist": [],
+    "tutorial-auto-open": [],
+    "tutorial-manual-reopen": [],
+    "create-submit-job": [],
+    "history-filters": [],
+    "batch-render": [],
+    "picker-render": [],
+    "picker-create-session": [],
+    "admin-filters": [],
+    "not-found": [],
+    "keyboard-tab-nav": [],
+    "settings-password-validation": [],
+    "history-pagination": [],
+    "topnav-visible-on-admin": [],
+    "responsive-mobile": []
+  },
+  "failedRequestsByStep": {
+    "boot": [
+      {
+        "url": "http://127.0.0.1:8000/v1/auth/me",
+        "failure": "net::ERR_ABORTED",
+        "abort": true
+      }
+    ],
+    "dashboard": [
+      {
+        "url": "http://127.0.0.1:8000/v1/auth/me",
+        "failure": "net::ERR_ABORTED",
+        "abort": true
+      }
+    ],
+    "nav-create": [
+      {
+        "url": "http://127.0.0.1:8000/v1/models",
+        "failure": "net::ERR_ABORTED",
+        "abort": true
+      },
+      {
+        "url": "http://127.0.0.1:8000/v1/admin/providers",
+        "failure": "net::ERR_ABORTED",
+        "abort": true
+      }
+    ],
+    "nav-batch": [
+      {
+        "url": "http://127.0.0.1:8000/v1/models",
+        "failure": "net::ERR_ABORTED",
+        "abort": true
+      },
+      {
+        "url": "http://127.0.0.1:8000/v1/admin/providers",
+        "failure": "net::ERR_ABORTED",
+        "abort": true
+      }
+    ],
+    "nav-history": [
+      {
+        "url": "http://127.0.0.1:8000/v1/models",
+        "failure": "net::ERR_ABORTED",
+        "abort": true
+      }
+    ],
+    "nav-picker": [],
+    "nav-admin": [
+      {
+        "url": "http://127.0.0.1:8000/v1/models",
+        "failure": "net::ERR_ABORTED",
+        "abort": true
+      }
+    ],
+    "nav-settings": [
+      {
+        "url": "http://127.0.0.1:8000/v1/models",
+        "failure": "net::ERR_ABORTED",
+        "abort": true
+      }
+    ],
+    "settings-toggle-cache-persist": [
+      {
+        "url": "http://127.0.0.1:8000/v1/auth/me",
+        "failure": "net::ERR_ABORTED",
+        "abort": true
+      },
+      {
+        "url": "http://127.0.0.1:8000/v1/models",
+        "failure": "net::ERR_ABORTED",
+        "abort": true
+      },
+      {
+        "url": "http://127.0.0.1:8000/v1/auth/me",
+        "failure": "net::ERR_ABORTED",
+        "abort": true
+      },
+      {
+        "url": "http://127.0.0.1:8000/v1/models",
+        "failure": "net::ERR_ABORTED",
+        "abort": true
+      }
+    ],
+    "tutorial-auto-open": [],
+    "tutorial-manual-reopen": [
+      {
+        "url": "http://127.0.0.1:8000/v1/auth/me",
+        "failure": "net::ERR_ABORTED",
+        "abort": true
+      },
+      {
+        "url": "http://127.0.0.1:8000/v1/models",
+        "failure": "net::ERR_ABORTED",
+        "abort": true
+      },
+      {
+        "url": "http://127.0.0.1:8000/v1/admin/providers",
+        "failure": "net::ERR_ABORTED",
+        "abort": true
+      }
+    ],
+    "create-submit-job": [
+      {
+        "url": "http://127.0.0.1:8000/v1/auth/me",
+        "failure": "net::ERR_ABORTED",
+        "abort": true
+      },
+      {
+        "url": "http://127.0.0.1:8000/v1/models",
+        "failure": "net::ERR_ABORTED",
+        "abort": true
+      },
+      {
+        "url": "http://127.0.0.1:8000/v1/admin/providers",
+        "failure": "net::ERR_ABORTED",
+        "abort": true
+      },
+      {
+        "url": "http://127.0.0.1:8000/v1/models",
+        "failure": "net::ERR_ABORTED",
+        "abort": true
+      },
+      {
+        "url": "http://127.0.0.1:8000/v1/jobs/batch-meta",
+        "failure": "net::ERR_ABORTED",
+        "abort": true
+      },
+      {
+        "url": "http://127.0.0.1:8000/v1/jobs/active",
+        "failure": "net::ERR_ABORTED",
+        "abort": true
+      },
+      {
+        "url": "http://127.0.0.1:8000/v1/jobs/active",
+        "failure": "net::ERR_ABORTED",
+        "abort": true
+      }
+    ],
+    "history-filters": [
+      {
+        "url": "http://127.0.0.1:8000/v1/auth/me",
+        "failure": "net::ERR_ABORTED",
+        "abort": true
+      },
+      {
+        "url": "http://127.0.0.1:8000/v1/models",
+        "failure": "net::ERR_ABORTED",
+        "abort": true
+      },
+      {
+        "url": "http://127.0.0.1:8000/v1/jobs/batch-meta",
+        "failure": "net::ERR_ABORTED",
+        "abort": true
+      }
+    ],
+    "batch-render": [
+      {
+        "url": "http://127.0.0.1:8000/v1/auth/me",
+        "failure": "net::ERR_ABORTED",
+        "abort": true
+      },
+      {
+        "url": "http://127.0.0.1:8000/v1/models",
+        "failure": "net::ERR_ABORTED",
+        "abort": true
+      },
+      {
+        "url": "http://127.0.0.1:8000/v1/admin/providers",
+        "failure": "net::ERR_ABORTED",
+        "abort": true
+      }
+    ],
+    "picker-render": [
+      {
+        "url": "http://127.0.0.1:8000/v1/auth/me",
+        "failure": "net::ERR_ABORTED",
+        "abort": true
+      }
+    ],
+    "picker-create-session": [
+      {
+        "url": "http://127.0.0.1:8000/v1/auth/me",
+        "failure": "net::ERR_ABORTED",
+        "abort": true
+      }
+    ],
+    "admin-filters": [
+      {
+        "url": "http://127.0.0.1:8000/v1/auth/me",
+        "failure": "net::ERR_ABORTED",
+        "abort": true
+      },
+      {
+        "url": "http://127.0.0.1:8000/v1/models",
+        "failure": "net::ERR_ABORTED",
+        "abort": true
+      }
+    ],
+    "not-found": [
+      {
+        "url": "http://127.0.0.1:8000/v1/auth/me",
+        "failure": "net::ERR_ABORTED",
+        "abort": true
+      }
+    ],
+    "keyboard-tab-nav": [
+      {
+        "url": "http://127.0.0.1:8000/v1/auth/me",
+        "failure": "net::ERR_ABORTED",
+        "abort": true
+      }
+    ],
+    "settings-password-validation": [
+      {
+        "url": "http://127.0.0.1:8000/v1/auth/me",
+        "failure": "net::ERR_ABORTED",
+        "abort": true
+      },
+      {
+        "url": "http://127.0.0.1:8000/v1/models",
+        "failure": "net::ERR_ABORTED",
+        "abort": true
+      }
+    ],
+    "history-pagination": [
+      {
+        "url": "http://127.0.0.1:8000/v1/auth/me",
+        "failure": "net::ERR_ABORTED",
+        "abort": true
+      },
+      {
+        "url": "http://127.0.0.1:8000/v1/models",
+        "failure": "net::ERR_ABORTED",
+        "abort": true
+      },
+      {
+        "url": "http://127.0.0.1:8000/v1/jobs/batch-meta",
+        "failure": "net::ERR_ABORTED",
+        "abort": true
+      }
+    ],
+    "topnav-visible-on-admin": [
+      {
+        "url": "http://127.0.0.1:8000/v1/auth/me",
+        "failure": "net::ERR_ABORTED",
+        "abort": true
+      },
+      {
+        "url": "http://127.0.0.1:8000/v1/models",
+        "failure": "net::ERR_ABORTED",
+        "abort": true
+      }
+    ],
+    "responsive-mobile": [
+      {
+        "url": "http://127.0.0.1:8000/v1/auth/me",
+        "failure": "net::ERR_ABORTED",
+        "abort": true
+      },
+      {
+        "url": "http://127.0.0.1:8000/v1/auth/me",
+        "failure": "net::ERR_ABORTED",
+        "abort": true
+      },
+      {
+        "url": "http://127.0.0.1:8000/v1/models",
+        "failure": "net::ERR_ABORTED",
+        "abort": true
+      },
+      {
+        "url": "http://127.0.0.1:8000/v1/admin/providers",
+        "failure": "net::ERR_ABORTED",
+        "abort": true
+      }
+    ]
+  }
+}
