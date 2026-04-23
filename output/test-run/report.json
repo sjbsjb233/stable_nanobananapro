@@ -1,0 +1,696 @@
+{
+  "startedAt": "2026-04-23T14:56:30.227Z",
+  "frontendUrl": "http://127.0.0.1:5173",
+  "backendUrl": "http://127.0.0.1:8000",
+  "totalSteps": 23,
+  "passed": 23,
+  "failed": 0,
+  "steps": [
+    {
+      "name": "boot",
+      "ok": true,
+      "error": null,
+      "durationMs": 1167
+    },
+    {
+      "name": "dashboard",
+      "ok": true,
+      "error": null,
+      "durationMs": 408
+    },
+    {
+      "name": "nav-create",
+      "ok": true,
+      "error": null,
+      "durationMs": 355
+    },
+    {
+      "name": "nav-batch",
+      "ok": true,
+      "error": null,
+      "durationMs": 661
+    },
+    {
+      "name": "nav-history",
+      "ok": true,
+      "error": null,
+      "durationMs": 377
+    },
+    {
+      "name": "nav-picker",
+      "ok": true,
+      "error": null,
+      "durationMs": 398
+    },
+    {
+      "name": "nav-admin",
+      "ok": true,
+      "error": null,
+      "durationMs": 505
+    },
+    {
+      "name": "nav-settings",
+      "ok": true,
+      "error": null,
+      "durationMs": 286
+    },
+    {
+      "name": "settings-toggle-cache-persist",
+      "ok": true,
+      "error": null,
+      "durationMs": 1053
+    },
+    {
+      "name": "tutorial-auto-open",
+      "ok": true,
+      "error": null,
+      "durationMs": 1027
+    },
+    {
+      "name": "tutorial-manual-reopen",
+      "ok": true,
+      "error": null,
+      "durationMs": 413
+    },
+    {
+      "name": "create-submit-job",
+      "ok": true,
+      "error": null,
+      "durationMs": 1510
+    },
+    {
+      "name": "history-filters",
+      "ok": true,
+      "error": null,
+      "durationMs": 529
+    },
+    {
+      "name": "batch-render",
+      "ok": true,
+      "error": null,
+      "durationMs": 679
+    },
+    {
+      "name": "picker-render",
+      "ok": true,
+      "error": null,
+      "durationMs": 453
+    },
+    {
+      "name": "picker-create-session",
+      "ok": true,
+      "error": null,
+      "durationMs": 1618
+    },
+    {
+      "name": "admin-filters",
+      "ok": true,
+      "error": null,
+      "durationMs": 1485
+    },
+    {
+      "name": "not-found",
+      "ok": true,
+      "error": null,
+      "durationMs": 166
+    },
+    {
+      "name": "keyboard-tab-nav",
+      "ok": true,
+      "error": null,
+      "durationMs": 312
+    },
+    {
+      "name": "settings-password-validation",
+      "ok": true,
+      "error": null,
+      "durationMs": 1023
+    },
+    {
+      "name": "history-pagination",
+      "ok": true,
+      "error": null,
+      "durationMs": 445
+    },
+    {
+      "name": "topnav-visible-on-admin",
+      "ok": true,
+      "error": null,
+      "durationMs": 236
+    },
+    {
+      "name": "responsive-mobile",
+      "ok": true,
+      "error": null,
+      "durationMs": 653
+    }
+  ],
+  "findings": [],
+  "pageErrorsByStep": {
+    "boot": [],
+    "dashboard": [],
+    "nav-create": [],
+    "nav-batch": [],
+    "nav-history": [],
+    "nav-picker": [],
+    "nav-admin": [],
+    "nav-settings": [],
+    "settings-toggle-cache-persist": [],
+    "tutorial-auto-open": [],
+    "tutorial-manual-reopen": [],
+    "create-submit-job": [],
+    "history-filters": [],
+    "batch-render": [],
+    "picker-render": [],
+    "picker-create-session": [],
+    "admin-filters": [],
+    "not-found": [],
+    "keyboard-tab-nav": [],
+    "settings-password-validation": [],
+    "history-pagination": [],
+    "topnav-visible-on-admin": [],
+    "responsive-mobile": []
+  },
+  "consoleErrorsByStep": {
+    "boot": [
+      {
+        "text": "[abort] [2026-04-23T14:56:14.776Z] [ERROR] [api] network request failed {method: GET, path: /auth/me, url: http://127.0.0.1:8000/v1/auth/me, message: signal is aborted ",
+        "abort": true
+      }
+    ],
+    "dashboard": [
+      {
+        "text": "[abort] [2026-04-23T14:56:15.712Z] [ERROR] [api] network request failed {method: GET, path: /auth/me, url: http://127.0.0.1:8000/v1/auth/me, message: signal is aborted ",
+        "abort": true
+      }
+    ],
+    "nav-create": [
+      {
+        "text": "[abort] [2026-04-23T14:56:16.132Z] [ERROR] [api] network request failed {method: GET, path: /models, url: http://127.0.0.1:8000/v1/models, message: signal is aborted wi",
+        "abort": true
+      },
+      {
+        "text": "[abort] [2026-04-23T14:56:16.133Z] [ERROR] [api] network request failed {method: GET, path: /admin/providers, url: http://127.0.0.1:8000/v1/admin/providers, message: si",
+        "abort": true
+      }
+    ],
+    "nav-batch": [
+      {
+        "text": "[abort] [2026-04-23T14:56:16.493Z] [ERROR] [api] network request failed {method: GET, path: /models, url: http://127.0.0.1:8000/v1/models, message: signal is aborted wi",
+        "abort": true
+      },
+      {
+        "text": "[abort] [2026-04-23T14:56:16.493Z] [ERROR] [api] network request failed {method: GET, path: /admin/providers, url: http://127.0.0.1:8000/v1/admin/providers, message: si",
+        "abort": true
+      }
+    ],
+    "nav-history": [
+      {
+        "text": "[abort] [2026-04-23T14:56:17.124Z] [ERROR] [api] network request failed {method: GET, path: /models, url: http://127.0.0.1:8000/v1/models, message: signal is aborted wi",
+        "abort": true
+      }
+    ],
+    "nav-picker": [],
+    "nav-admin": [
+      {
+        "text": "[abort] [2026-04-23T14:56:17.956Z] [ERROR] [api] network request failed {method: GET, path: /models, url: http://127.0.0.1:8000/v1/models, message: signal is aborted wi",
+        "abort": true
+      }
+    ],
+    "nav-settings": [
+      {
+        "text": "[abort] [2026-04-23T14:56:18.410Z] [ERROR] [api] network request failed {method: GET, path: /models, url: http://127.0.0.1:8000/v1/models, message: signal is aborted wi",
+        "abort": true
+      }
+    ],
+    "settings-toggle-cache-persist": [
+      {
+        "text": "[abort] [2026-04-23T14:56:18.720Z] [ERROR] [api] network request failed {method: GET, path: /auth/me, url: http://127.0.0.1:8000/v1/auth/me, message: signal is aborted ",
+        "abort": true
+      },
+      {
+        "text": "[abort] [2026-04-23T14:56:18.750Z] [ERROR] [api] network request failed {method: GET, path: /models, url: http://127.0.0.1:8000/v1/models, message: signal is aborted wi",
+        "abort": true
+      },
+      {
+        "text": "[abort] [2026-04-23T14:56:19.210Z] [ERROR] [api] network request failed {method: GET, path: /auth/me, url: http://127.0.0.1:8000/v1/auth/me, message: signal is aborted ",
+        "abort": true
+      },
+      {
+        "text": "[abort] [2026-04-23T14:56:19.256Z] [ERROR] [api] network request failed {method: GET, path: /models, url: http://127.0.0.1:8000/v1/models, message: signal is aborted wi",
+        "abort": true
+      }
+    ],
+    "tutorial-auto-open": [],
+    "tutorial-manual-reopen": [
+      {
+        "text": "[abort] [2026-04-23T14:56:20.762Z] [ERROR] [api] network request failed {method: GET, path: /auth/me, url: http://127.0.0.1:8000/v1/auth/me, message: signal is aborted ",
+        "abort": true
+      },
+      {
+        "text": "[abort] [2026-04-23T14:56:20.790Z] [ERROR] [api] network request failed {method: GET, path: /models, url: http://127.0.0.1:8000/v1/models, message: signal is aborted wi",
+        "abort": true
+      },
+      {
+        "text": "[abort] [2026-04-23T14:56:20.791Z] [ERROR] [api] network request failed {method: GET, path: /admin/providers, url: http://127.0.0.1:8000/v1/admin/providers, message: si",
+        "abort": true
+      }
+    ],
+    "create-submit-job": [
+      {
+        "text": "[abort] [2026-04-23T14:56:21.175Z] [ERROR] [api] network request failed {method: GET, path: /auth/me, url: http://127.0.0.1:8000/v1/auth/me, message: signal is aborted ",
+        "abort": true
+      },
+      {
+        "text": "[abort] [2026-04-23T14:56:21.202Z] [ERROR] [api] network request failed {method: GET, path: /models, url: http://127.0.0.1:8000/v1/models, message: signal is aborted wi",
+        "abort": true
+      },
+      {
+        "text": "[abort] [2026-04-23T14:56:21.203Z] [ERROR] [api] network request failed {method: GET, path: /admin/providers, url: http://127.0.0.1:8000/v1/admin/providers, message: si",
+        "abort": true
+      },
+      {
+        "text": "[abort] [2026-04-23T14:56:21.698Z] [ERROR] [api] network request failed {method: GET, path: /models, url: http://127.0.0.1:8000/v1/models, message: signal is aborted wi",
+        "abort": true
+      },
+      {
+        "text": "[abort] [2026-04-23T14:56:21.699Z] [ERROR] [api] network request failed {method: POST, path: /jobs/batch-meta, url: http://127.0.0.1:8000/v1/jobs/batch-meta, message: s",
+        "abort": true
+      },
+      {
+        "text": "[abort] [2026-04-23T14:56:21.699Z] [ERROR] [api] network request failed {method: POST, path: /jobs/active, url: http://127.0.0.1:8000/v1/jobs/active, message: signal is",
+        "abort": true
+      },
+      {
+        "text": "[abort] [2026-04-23T14:56:21.700Z] [ERROR] [api] network request failed {method: POST, path: /jobs/batch-meta, url: http://127.0.0.1:8000/v1/jobs/batch-meta, message: s",
+        "abort": true
+      },
+      {
+        "text": "[abort] [2026-04-23T14:56:21.700Z] [ERROR] [api] network request failed {method: GET, path: /jobs/164d0af05d49ea16e1042b8f84fc80e4, url: http://127.0.0.1:8000/v1/jobs/1",
+        "abort": true
+      },
+      {
+        "text": "[abort] [2026-04-23T14:56:21.729Z] [ERROR] [api] network request failed {method: POST, path: /jobs/active, url: http://127.0.0.1:8000/v1/jobs/active, message: signal is",
+        "abort": true
+      },
+      {
+        "text": "[abort] [2026-04-23T14:56:21.730Z] [ERROR] [api] network request failed {method: POST, path: /jobs/batch-meta, url: http://127.0.0.1:8000/v1/jobs/batch-meta, message: s",
+        "abort": true
+      },
+      {
+        "text": "[abort] [2026-04-23T14:56:21.731Z] [ERROR] [api] network request failed {method: GET, path: /jobs/164d0af05d49ea16e1042b8f84fc80e4, url: http://127.0.0.1:8000/v1/jobs/1",
+        "abort": true
+      }
+    ],
+    "history-filters": [
+      {
+        "text": "[abort] [2026-04-23T14:56:22.688Z] [ERROR] [api] network request failed {method: GET, path: /auth/me, url: http://127.0.0.1:8000/v1/auth/me, message: signal is aborted ",
+        "abort": true
+      },
+      {
+        "text": "[abort] [2026-04-23T14:56:22.713Z] [ERROR] [api] network request failed {method: GET, path: /models, url: http://127.0.0.1:8000/v1/models, message: signal is aborted wi",
+        "abort": true
+      },
+      {
+        "text": "[abort] [2026-04-23T14:56:22.714Z] [ERROR] [api] network request failed {method: POST, path: /jobs/batch-meta, url: http://127.0.0.1:8000/v1/jobs/batch-meta, message: s",
+        "abort": true
+      }
+    ],
+    "batch-render": [
+      {
+        "text": "[abort] [2026-04-23T14:56:23.196Z] [ERROR] [api] network request failed {method: GET, path: /auth/me, url: http://127.0.0.1:8000/v1/auth/me, message: signal is aborted ",
+        "abort": true
+      },
+      {
+        "text": "[abort] [2026-04-23T14:56:23.222Z] [ERROR] [api] network request failed {method: GET, path: /models, url: http://127.0.0.1:8000/v1/models, message: signal is aborted wi",
+        "abort": true
+      },
+      {
+        "text": "[abort] [2026-04-23T14:56:23.223Z] [ERROR] [api] network request failed {method: GET, path: /admin/providers, url: http://127.0.0.1:8000/v1/admin/providers, message: si",
+        "abort": true
+      }
+    ],
+    "picker-render": [
+      {
+        "text": "[abort] [2026-04-23T14:56:23.883Z] [ERROR] [api] network request failed {method: GET, path: /auth/me, url: http://127.0.0.1:8000/v1/auth/me, message: signal is aborted ",
+        "abort": true
+      }
+    ],
+    "picker-create-session": [
+      {
+        "text": "[abort] [2026-04-23T14:56:24.336Z] [ERROR] [api] network request failed {method: GET, path: /auth/me, url: http://127.0.0.1:8000/v1/auth/me, message: signal is aborted ",
+        "abort": true
+      }
+    ],
+    "admin-filters": [
+      {
+        "text": "[abort] [2026-04-23T14:56:25.949Z] [ERROR] [api] network request failed {method: GET, path: /auth/me, url: http://127.0.0.1:8000/v1/auth/me, message: signal is aborted ",
+        "abort": true
+      },
+      {
+        "text": "[abort] [2026-04-23T14:56:25.983Z] [ERROR] [api] network request failed {method: GET, path: /models, url: http://127.0.0.1:8000/v1/models, message: signal is aborted wi",
+        "abort": true
+      }
+    ],
+    "not-found": [
+      {
+        "text": "[abort] [2026-04-23T14:56:27.437Z] [ERROR] [api] network request failed {method: GET, path: /auth/me, url: http://127.0.0.1:8000/v1/auth/me, message: signal is aborted ",
+        "abort": true
+      }
+    ],
+    "keyboard-tab-nav": [
+      {
+        "text": "[abort] [2026-04-23T14:56:27.606Z] [ERROR] [api] network request failed {method: GET, path: /auth/me, url: http://127.0.0.1:8000/v1/auth/me, message: signal is aborted ",
+        "abort": true
+      }
+    ],
+    "settings-password-validation": [
+      {
+        "text": "[abort] [2026-04-23T14:56:27.921Z] [ERROR] [api] network request failed {method: GET, path: /auth/me, url: http://127.0.0.1:8000/v1/auth/me, message: signal is aborted ",
+        "abort": true
+      },
+      {
+        "text": "[abort] [2026-04-23T14:56:27.950Z] [ERROR] [api] network request failed {method: GET, path: /models, url: http://127.0.0.1:8000/v1/models, message: signal is aborted wi",
+        "abort": true
+      }
+    ],
+    "history-pagination": [
+      {
+        "text": "[abort] [2026-04-23T14:56:28.943Z] [ERROR] [api] network request failed {method: GET, path: /auth/me, url: http://127.0.0.1:8000/v1/auth/me, message: signal is aborted ",
+        "abort": true
+      },
+      {
+        "text": "[abort] [2026-04-23T14:56:28.971Z] [ERROR] [api] network request failed {method: GET, path: /models, url: http://127.0.0.1:8000/v1/models, message: signal is aborted wi",
+        "abort": true
+      },
+      {
+        "text": "[abort] [2026-04-23T14:56:28.972Z] [ERROR] [api] network request failed {method: POST, path: /jobs/batch-meta, url: http://127.0.0.1:8000/v1/jobs/batch-meta, message: s",
+        "abort": true
+      }
+    ],
+    "topnav-visible-on-admin": [
+      {
+        "text": "[abort] [2026-04-23T14:56:29.387Z] [ERROR] [api] network request failed {method: GET, path: /auth/me, url: http://127.0.0.1:8000/v1/auth/me, message: signal is aborted ",
+        "abort": true
+      },
+      {
+        "text": "[abort] [2026-04-23T14:56:29.419Z] [ERROR] [api] network request failed {method: GET, path: /models, url: http://127.0.0.1:8000/v1/models, message: signal is aborted wi",
+        "abort": true
+      }
+    ],
+    "responsive-mobile": [
+      {
+        "text": "[abort] [2026-04-23T14:56:29.654Z] [ERROR] [api] network request failed {method: GET, path: /auth/me, url: http://127.0.0.1:8000/v1/auth/me, message: signal is aborted ",
+        "abort": true
+      },
+      {
+        "text": "[abort] [2026-04-23T14:56:30.044Z] [ERROR] [api] network request failed {method: GET, path: /auth/me, url: http://127.0.0.1:8000/v1/auth/me, message: signal is aborted ",
+        "abort": true
+      },
+      {
+        "text": "[abort] [2026-04-23T14:56:30.074Z] [ERROR] [api] network request failed {method: GET, path: /models, url: http://127.0.0.1:8000/v1/models, message: signal is aborted wi",
+        "abort": true
+      },
+      {
+        "text": "[abort] [2026-04-23T14:56:30.075Z] [ERROR] [api] network request failed {method: GET, path: /admin/providers, url: http://127.0.0.1:8000/v1/admin/providers, message: si",
+        "abort": true
+      }
+    ]
+  },
+  "failedRequestsByStep": {
+    "boot": [
+      {
+        "url": "http://127.0.0.1:8000/v1/auth/me",
+        "failure": "net::ERR_ABORTED",
+        "abort": true
+      }
+    ],
+    "dashboard": [
+      {
+        "url": "http://127.0.0.1:8000/v1/auth/me",
+        "failure": "net::ERR_ABORTED",
+        "abort": true
+      }
+    ],
+    "nav-create": [
+      {
+        "url": "http://127.0.0.1:8000/v1/models",
+        "failure": "net::ERR_ABORTED",
+        "abort": true
+      },
+      {
+        "url": "http://127.0.0.1:8000/v1/admin/providers",
+        "failure": "net::ERR_ABORTED",
+        "abort": true
+      }
+    ],
+    "nav-batch": [
+      {
+        "url": "http://127.0.0.1:8000/v1/models",
+        "failure": "net::ERR_ABORTED",
+        "abort": true
+      },
+      {
+        "url": "http://127.0.0.1:8000/v1/admin/providers",
+        "failure": "net::ERR_ABORTED",
+        "abort": true
+      }
+    ],
+    "nav-history": [
+      {
+        "url": "http://127.0.0.1:8000/v1/models",
+        "failure": "net::ERR_ABORTED",
+        "abort": true
+      }
+    ],
+    "nav-picker": [],
+    "nav-admin": [
+      {
+        "url": "http://127.0.0.1:8000/v1/models",
+        "failure": "net::ERR_ABORTED",
+        "abort": true
+      }
+    ],
+    "nav-settings": [
+      {
+        "url": "http://127.0.0.1:8000/v1/models",
+        "failure": "net::ERR_ABORTED",
+        "abort": true
+      }
+    ],
+    "settings-toggle-cache-persist": [
+      {
+        "url": "http://127.0.0.1:8000/v1/auth/me",
+        "failure": "net::ERR_ABORTED",
+        "abort": true
+      },
+      {
+        "url": "http://127.0.0.1:8000/v1/models",
+        "failure": "net::ERR_ABORTED",
+        "abort": true
+      },
+      {
+        "url": "http://127.0.0.1:8000/v1/auth/me",
+        "failure": "net::ERR_ABORTED",
+        "abort": true
+      },
+      {
+        "url": "http://127.0.0.1:8000/v1/models",
+        "failure": "net::ERR_ABORTED",
+        "abort": true
+      }
+    ],
+    "tutorial-auto-open": [],
+    "tutorial-manual-reopen": [
+      {
+        "url": "http://127.0.0.1:8000/v1/auth/me",
+        "failure": "net::ERR_ABORTED",
+        "abort": true
+      },
+      {
+        "url": "http://127.0.0.1:8000/v1/models",
+        "failure": "net::ERR_ABORTED",
+        "abort": true
+      },
+      {
+        "url": "http://127.0.0.1:8000/v1/admin/providers",
+        "failure": "net::ERR_ABORTED",
+        "abort": true
+      }
+    ],
+    "create-submit-job": [
+      {
+        "url": "http://127.0.0.1:8000/v1/auth/me",
+        "failure": "net::ERR_ABORTED",
+        "abort": true
+      },
+      {
+        "url": "http://127.0.0.1:8000/v1/models",
+        "failure": "net::ERR_ABORTED",
+        "abort": true
+      },
+      {
+        "url": "http://127.0.0.1:8000/v1/admin/providers",
+        "failure": "net::ERR_ABORTED",
+        "abort": true
+      },
+      {
+        "url": "http://127.0.0.1:8000/v1/models",
+        "failure": "net::ERR_ABORTED",
+        "abort": true
+      },
+      {
+        "url": "http://127.0.0.1:8000/v1/jobs/batch-meta",
+        "failure": "net::ERR_ABORTED",
+        "abort": true
+      },
+      {
+        "url": "http://127.0.0.1:8000/v1/jobs/active",
+        "failure": "net::ERR_ABORTED",
+        "abort": true
+      },
+      {
+        "url": "http://127.0.0.1:8000/v1/jobs/active",
+        "failure": "net::ERR_ABORTED",
+        "abort": true
+      }
+    ],
+    "history-filters": [
+      {
+        "url": "http://127.0.0.1:8000/v1/auth/me",
+        "failure": "net::ERR_ABORTED",
+        "abort": true
+      },
+      {
+        "url": "http://127.0.0.1:8000/v1/models",
+        "failure": "net::ERR_ABORTED",
+        "abort": true
+      },
+      {
+        "url": "http://127.0.0.1:8000/v1/jobs/batch-meta",
+        "failure": "net::ERR_ABORTED",
+        "abort": true
+      }
+    ],
+    "batch-render": [
+      {
+        "url": "http://127.0.0.1:8000/v1/auth/me",
+        "failure": "net::ERR_ABORTED",
+        "abort": true
+      },
+      {
+        "url": "http://127.0.0.1:8000/v1/models",
+        "failure": "net::ERR_ABORTED",
+        "abort": true
+      },
+      {
+        "url": "http://127.0.0.1:8000/v1/admin/providers",
+        "failure": "net::ERR_ABORTED",
+        "abort": true
+      }
+    ],
+    "picker-render": [
+      {
+        "url": "http://127.0.0.1:8000/v1/auth/me",
+        "failure": "net::ERR_ABORTED",
+        "abort": true
+      }
+    ],
+    "picker-create-session": [
+      {
+        "url": "http://127.0.0.1:8000/v1/auth/me",
+        "failure": "net::ERR_ABORTED",
+        "abort": true
+      }
+    ],
+    "admin-filters": [
+      {
+        "url": "http://127.0.0.1:8000/v1/auth/me",
+        "failure": "net::ERR_ABORTED",
+        "abort": true
+      },
+      {
+        "url": "http://127.0.0.1:8000/v1/models",
+        "failure": "net::ERR_ABORTED",
+        "abort": true
+      }
+    ],
+    "not-found": [
+      {
+        "url": "http://127.0.0.1:8000/v1/auth/me",
+        "failure": "net::ERR_ABORTED",
+        "abort": true
+      }
+    ],
+    "keyboard-tab-nav": [
+      {
+        "url": "http://127.0.0.1:8000/v1/auth/me",
+        "failure": "net::ERR_ABORTED",
+        "abort": true
+      }
+    ],
+    "settings-password-validation": [
+      {
+        "url": "http://127.0.0.1:8000/v1/auth/me",
+        "failure": "net::ERR_ABORTED",
+        "abort": true
+      },
+      {
+        "url": "http://127.0.0.1:8000/v1/models",
+        "failure": "net::ERR_ABORTED",
+        "abort": true
+      }
+    ],
+    "history-pagination": [
+      {
+        "url": "http://127.0.0.1:8000/v1/auth/me",
+        "failure": "net::ERR_ABORTED",
+        "abort": true
+      },
+      {
+        "url": "http://127.0.0.1:8000/v1/models",
+        "failure": "net::ERR_ABORTED",
+        "abort": true
+      },
+      {
+        "url": "http://127.0.0.1:8000/v1/jobs/batch-meta",
+        "failure": "net::ERR_ABORTED",
+        "abort": true
+      }
+    ],
+    "topnav-visible-on-admin": [
+      {
+        "url": "http://127.0.0.1:8000/v1/auth/me",
+        "failure": "net::ERR_ABORTED",
+        "abort": true
+      },
+      {
+        "url": "http://127.0.0.1:8000/v1/models",
+        "failure": "net::ERR_ABORTED",
+        "abort": true
+      }
+    ],
+    "responsive-mobile": [
+      {
+        "url": "http://127.0.0.1:8000/v1/auth/me",
+        "failure": "net::ERR_ABORTED",
+        "abort": true
+      },
+      {
+        "url": "http://127.0.0.1:8000/v1/auth/me",
+        "failure": "net::ERR_ABORTED",
+        "abort": true
+      },
+      {
+        "url": "http://127.0.0.1:8000/v1/models",
+        "failure": "net::ERR_ABORTED",
+        "abort": true
+      },
+      {
+        "url": "http://127.0.0.1:8000/v1/admin/providers",
+        "failure": "net::ERR_ABORTED",
+        "abort": true
+      }
+    ]
+  }
+}
