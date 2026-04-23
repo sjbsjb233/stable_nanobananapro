@@ -7,3 +7,26 @@ body,
 #root {
   min-height: 100%;
 }
+
+/* Tutorial widgets (ported from design handoff) */
+@keyframes nbp-tutorial-shimmer {
+  0% {
+    background-position: -200% 0;
+  }
+  100% {
+    background-position: 200% 0;
+  }
+}
+
+.nbp-tutorial-shimmer {
+  background: linear-gradient(90deg, #f4f4f5 25%, #e4e4e7 50%, #f4f4f5 75%);
+  background-size: 200% 100%;
+  animation: nbp-tutorial-shimmer 1.8s linear infinite;
+}
+
+.nbp-tutorial-picker-grid {
+  background-color: #f8f8f5;
+  background-image: linear-gradient(rgba(10, 10, 10, 0.04) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(10, 10, 10, 0.04) 1px, transparent 1px);
+  background-size: 28px 28px;
+}

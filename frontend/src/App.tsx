@@ -27,6 +27,7 @@ import {
 } from "recharts";
 import { create } from "zustand";
 import { logDebug, logError, logInfo, logWarn } from "./logger";
+import { TutorialTrigger } from "./Tutorial";
 
 // =========================================================
 // Nano Banana Pro - Single file demo (React + Tailwind + TS)
@@ -10165,6 +10166,7 @@ function BatchCreatePage() {
                   {user.role === "ADMIN" ? "Admin session" : "User session"}
                 </div>
               ) : null}
+              <TutorialTrigger page="Batch" />
               <Button
                 variant="secondary"
                 onClick={() => {
@@ -11367,6 +11369,7 @@ function CreateJobPage() {
                   工作区已连接
                 </div>
               ) : null}
+              <TutorialTrigger page="Create" />
               <Button variant="secondary" onClick={() => {
                 void clearCreateAutosave();
                 setPrompt("");
@@ -12838,6 +12841,7 @@ function HistoryPage() {
       <PageTitle
         title="History"
         subtitle="本地历史画廊。支持批次识别、全文搜索、筛选和 Notion 风格详情模态。"
+        right={<TutorialTrigger page="History" />}
       />
 
       <div className="grid grid-cols-1 gap-5 xl:grid-cols-[248px_minmax(0,1fr)_208px] 2xl:grid-cols-[260px_minmax(0,1fr)_220px]">
@@ -15856,6 +15860,7 @@ function PickerPage() {
               <span className="rounded-full border border-zinc-200 bg-white px-3 py-1 text-xs font-semibold text-zinc-600 dark:border-white/10 dark:bg-zinc-950/50 dark:text-zinc-300">
                 当前会话 · {currentSession.name}
               </span>
+              <TutorialTrigger page="Picker" />
               <Button variant="ghost" onClick={() => navigate("/history")}>返回 History</Button>
             </div>
           }
